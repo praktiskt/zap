@@ -261,12 +261,12 @@ mod tests {
 
         let mut r = PostingReader::new(&info, &blob);
         assert_eq!(r.docids().iter().collect::<Vec<_>>(), vec![2, 9, 1000]);
-        assert_eq!(r.next(), Some((2, 2)));
+        assert_eq!(r.advance(), Some((2, 2)));
         assert_eq!(r.positions(0), Some(vec![0, 7]));
-        assert_eq!(r.next(), Some((9, 1)));
+        assert_eq!(r.advance(), Some((9, 1)));
         assert_eq!(r.positions(1), Some(vec![3]));
-        assert_eq!(r.next(), Some((1000, 3)));
+        assert_eq!(r.advance(), Some((1000, 3)));
         assert_eq!(r.positions(2), Some(vec![1, 4, 9]));
-        assert_eq!(r.next(), None);
+        assert_eq!(r.advance(), None);
     }
 }
