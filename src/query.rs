@@ -159,10 +159,6 @@ fn split_fuzzy(s: &str) -> Option<(String, u8)> {
     Some((term.to_lowercase(), d))
 }
 
-fn d_max(n: u8) -> u8 {
-    n.min(3)
-}
-
 struct P {
     toks: Vec<Tk>,
     i: usize,
