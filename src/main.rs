@@ -86,7 +86,10 @@ fn collect_docs(args: &Args) -> Result<Vec<String>> {
         } else if md.is_dir() {
             let mut stack = vec![p.clone()];
             while let Some(d) = stack.pop() {
-                for e in std::fs::read_dir(&d).with_context(|| d.display().to_string())?.flatten() {
+                for e in std::fs::read_dir(&d)
+                    .with_context(|| d.display().to_string())?
+                    .flatten()
+                {
                     let ep = e.path();
                     if ep.is_dir() {
                         stack.push(ep);

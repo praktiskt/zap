@@ -170,10 +170,8 @@ impl P {
     }
 
     fn term_start(&self) -> bool {
-        if matches!(self.peek(), Some(Tk::LParen)) {
-            return true;
-        }
         match self.peek() {
+            Some(Tk::LParen) | Some(Tk::Not) => true,
             Some(Tk::Fielded(f, w)) => f.is_some() || !w.is_empty(),
             _ => false,
         }

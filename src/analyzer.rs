@@ -49,6 +49,14 @@ impl Analyzer {
         })
     }
 
+    /// stem one raw word through the same pipeline as docs
+    pub fn stem_word(&self, s: &str) -> String {
+        match (&self.stemmer, s.is_ascii()) {
+            (Some(st), true) => st.stem(s).into_owned(),
+            _ => s.to_string(),
+        }
+    }
+
     pub fn conf(&self) -> &AnalyzerConf {
         &self.conf
     }

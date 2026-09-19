@@ -70,6 +70,11 @@ impl Index {
         &self.schema
     }
 
+    /// read-only segment list snapshot (tests/debug)
+    pub fn segments_snapshot(&self) -> Vec<Arc<SegmentReader>> {
+        self.snap.load().segments.clone()
+    }
+
     pub fn analyzer(&self) -> &Analyzer {
         &self.analyzer
     }
@@ -161,6 +166,7 @@ impl Index {
                 schema: &self.schema,
                 stats: &snap.stats,
                 params: &params,
+                analyzer: &self.analyzer,
             };
             let ds = crate::search::exec::eval(&node, None, seg, &ctx);
             for (i, doc) in ds.ids.iter().enumerate() {

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use fst::automaton::{Automaton, Levenshtein};
 use roaring::RoaringBitmap;
 
+use crate::analyzer::Analyzer;
 use crate::posting::TermInfo;
 use crate::query::Node;
 use crate::schema::Schema;
@@ -48,6 +49,7 @@ pub struct Ctx<'a> {
     pub schema: &'a Schema,
     pub stats: &'a Stats,
     pub params: &'a Bm25Params,
+    pub analyzer: &'a Analyzer,
 }
 
 fn lev_match(lev: &Levenshtein, term: &str) -> bool {
@@ -97,19 +99,22 @@ pub fn eval(
     match node {
         Node::Term(t) => {
             let mut acc = DocScores::default();
+            let stems = stem_variants(ctx, t);
             for fid in scope_ids(scope, ctx) {
-                if let Some(info) = seg.term(fid, t) {
-                    let idf = bm25_idf(ctx.stats.df_of(fid, t, info.df), ctx.stats.total_docs);
-                    let ts = term_scores(
-                        &info,
-                        seg.blob(),
-                        idf,
-                        ctx.params,
-                        ctx.stats.avg_of(fid),
-                        1.0,
-                        seg.norms(fid),
-                    );
-                    acc = crate::search::union(&acc, &ts);
+                for st in &stems {
+                    if let Some(info) = seg.term(fid, st) {
+                        let idf = bm25_idf(ctx.stats.df_of(fid, st, info.df), ctx.stats.total_docs);
+                        let ts = term_scores(
+                            &info,
+                            seg.blob(),
+                            idf,
+                            ctx.params,
+                            ctx.stats.avg_of(fid),
+                            1.0,
+                            seg.norms(fid),
+                        );
+                        acc = crate::search::union(&acc, &ts);
+                    }
                 }
             }
             acc
@@ -220,6 +225,15 @@ pub fn eval(
             }
         }
     }
+}
+
+fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
+    let mut v = vec![t.to_string()];
+    let stemmed = ctx.analyzer.stem_word(t);
+    if !v.contains(&stemmed) {
+        v.insert(0, stemmed);
+    }
+    v
 }
 
 fn scope_ids(scope: Option<u32>, ctx: &Ctx) -> Vec<u32> {
