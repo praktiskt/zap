@@ -1,0 +1,27 @@
+[package]
+name = "zap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+charabia = "0.9"
+rust-stemmers = "1.2"
+roaring = "0.11"
+fst = "0.4"
+fst-levenshtein = "0.3"
+lz4_flex = "0.11"
+rayon = "1.10"
+arc-swap = "1.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+ctrlc = { version = "3", features = ["termination"] }
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+criterion = "0.7"
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
