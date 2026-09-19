@@ -25,7 +25,7 @@ pub struct Bm25Params {
 pub fn bm25_idf(df: u32, total_docs: u32) -> f32 {
     let n = total_docs.max(1) as f32;
     let d = df.max(1) as f32;
-    ((n - d + 0.5) / (d + 0.5)).max(1e-6).ln()
+    (1.0 + (n - d + 0.5) / (d + 0.5)).ln()
 }
 
 /// aligned docid / score series, ascending docid

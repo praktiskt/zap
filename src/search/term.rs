@@ -6,7 +6,7 @@ use crate::search::{Bm25Params, DocScores};
 pub fn bm25_idf(df: u32, total_docs: u32) -> f32 {
     let n = total_docs.max(1) as f32;
     let d = df.max(1) as f32;
-    ((n - d + 0.5) / (d + 0.5)).max(1e-6).ln()
+    (1.0 + (n - d + 0.5) / (d + 0.5)).ln()
 }
 
 pub fn norm_ratio(norms: Option<&[u16]>, doc: u32, avg_len: f32, b: f32) -> f32 {
