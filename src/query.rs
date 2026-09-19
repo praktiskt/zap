@@ -238,11 +238,12 @@ impl P {
             }
             Some(Tk::Phrase(raw, slop)) => {
                 let terms: Vec<String> = raw.split_whitespace().map(|t| t.to_lowercase()).collect();
+                let slop = *slop;
                 if terms.is_empty() {
                     return Err(ParseError::UnexpectedEnd);
                 }
                 self.i += 1;
-                Ok(Node::Phrase { terms, slop: *slop })
+                Ok(Node::Phrase { terms, slop })
             }
             Some(Tk::Fielded(field, rest)) => {
                 let field = field.clone();
