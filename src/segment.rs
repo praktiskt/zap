@@ -33,8 +33,8 @@ fn encode_store(doc: &Document, schema: &Schema) -> Result<Vec<u8>, String> {
     Ok(block)
 }
 
-pub struct SegmentBuilder<'a> {
-    schema: &'a Schema,
+pub struct SegmentBuilder {
+    schema: Arc<Schema>,
     analyzer: Arc<Analyzer>,
     pub num_docs: u32,
     /// field_id -> term -> postings; sorted terms feed the FST directly
@@ -45,8 +45,8 @@ pub struct SegmentBuilder<'a> {
     store_blocks: Vec<Box<[u8]>>,
 }
 
-impl<'a> SegmentBuilder<'a> {
-    pub fn new(schema: &'a Schema, analyzer: Arc<Analyzer>) -> Self {
+impl SegmentBuilder {
+    pub fn new(schema: Arc<Schema>, analyzer: Arc<Analyzer>) -> Self {
         let nf = schema.num_fields();
         let mut postings = Vec::with_capacity(nf);
         let mut field_norms = Vec::with_capacity(nf);
@@ -74,7 +74,7 @@ impl<'a> SegmentBuilder<'a> {
     /// index + store a document; allocates the segment-local docid
     pub fn add_document(&mut self, doc: &Document) -> Result<u32, String> {
         let docid = self.num_docs;
-        let block = encode_store(doc, self.schema)?;
+        let block = encode_store(doc, &self.schema)?;
         for (name, val) in &doc.fields {
             let fid = self
                 .schema
@@ -106,32 +106,12 @@ impl<'a> SegmentBuilder<'a> {
     }
 
     pub fn freeze(self) -> SegmentReader {
-        let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
-        let mut blob: Vec<u8> = Vec::new();
-        let mut infos: Vec<TermInfo> = Vec::new();
-        for (fid, terms) in self.postings.iter().enumerate() {
-            for (term, data) in terms {
-                let mut key = (fid as u32).to_be_bytes().to_vec();
-                key.extend_from_slice(term.as_bytes());
-                let info = data.freeze().encode_to(&mut blob);
-                let ordinal = infos.len() as u64;
-                map_builder.insert(key, ordinal).unwrap();
-                infos.push(info);
-            }
-        }
-        let field_norms: Vec<Box<[u16]>> = self
-            .field_norms
-            .into_iter()
-            .map(|v| v.into_boxed_slice())
-            .collect();
-        SegmentReader {
-            num_docs: self.num_docs,
-            fst: Map::new(map_builder.into_inner().unwrap()).unwrap(),
-            infos,
-            blob: blob.into_boxed_slice(),
-            field_norms,
-            store_blocks: self.store_blocks,
-        }
+        freeze_parts(
+            self.postings,
+            self.field_norms,
+            self.store_blocks,
+            self.num_docs,
+        )
     }
 }
 
@@ -144,7 +124,45 @@ pub struct SegmentReader {
     store_blocks: Vec<Box<[u8]>>,
 }
 
+/// shared by SegmentBuilder::freeze and segment merge
+pub fn freeze_parts(
+    postings: Vec<BTreeMap<String, crate::posting::PostingData>>,
+    field_norms: Vec<Vec<u16>>,
+    store_blocks: Vec<Box<[u8]>>,
+    num_docs: u32,
+) -> SegmentReader {
+    let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
+    let mut blob: Vec<u8> = Vec::new();
+    let mut infos: Vec<TermInfo> = Vec::new();
+    for (fid, terms) in postings.iter().enumerate() {
+        for (term, data) in terms {
+            let mut key = (fid as u32).to_be_bytes().to_vec();
+            key.extend_from_slice(term.as_bytes());
+            let info = data.freeze().encode_to(&mut blob);
+            let ordinal = infos.len() as u64;
+            map_builder.insert(key, ordinal).unwrap();
+            infos.push(info);
+        }
+    }
+    SegmentReader {
+        num_docs,
+        fst: Map::new(map_builder.into_inner().unwrap()).unwrap(),
+        infos,
+        blob: blob.into_boxed_slice(),
+        field_norms: field_norms
+            .into_iter()
+            .map(|v| v.into_boxed_slice())
+            .collect(),
+        store_blocks,
+    }
+}
+
 impl SegmentReader {
+    /// raw (still compressed) stored doc block
+    pub fn stored_raw(&self, docid: u32) -> Option<&[u8]> {
+        self.store_blocks.get(docid as usize).map(|b| b.as_ref())
+    }
+
     pub fn term(&self, fid: u32, term: &str) -> Option<TermInfo> {
         let mut key = fid.to_be_bytes().to_vec();
         key.extend_from_slice(term.as_bytes());

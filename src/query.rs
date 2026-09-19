@@ -284,10 +284,6 @@ pub fn parse(q: &str) -> Result<Node, ParseError> {
 mod tests {
     use super::*;
 
-    fn t(q: &str) -> Node {
-        parse(q).unwrap()
-    }
-
     #[test]
     fn bools() {
         assert_eq!(

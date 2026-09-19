@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use fst_levenshtein::Levenshtein;
+use fst::automaton::{Automaton, Levenshtein};
 use roaring::RoaringBitmap;
 
 use crate::posting::TermInfo;
@@ -33,7 +33,10 @@ impl Stats {
     }
 
     pub fn df_of(&self, fid: u32, term: &str, fallback: u32) -> u32 {
-        self.df.get(&(fid, term.to_string())).copied().unwrap_or(fallback)
+        self.df
+            .get(&(fid, term.to_string()))
+            .copied()
+            .unwrap_or(fallback)
     }
 
     pub fn avg_of(&self, fid: u32) -> f32 {
@@ -50,7 +53,7 @@ pub struct Ctx<'a> {
 fn lev_match(lev: &Levenshtein, term: &str) -> bool {
     let mut state = lev.start();
     for b in term.as_bytes() {
-        state = lev.accept(state, *b);
+        state = lev.accept(&state, *b);
         if state.is_none() {
             return false;
         }
@@ -113,7 +116,10 @@ pub fn eval(
         }
         Node::Fuzzy { term, distance } => {
             let dist = (*distance as u32).min(2);
-            let lev = Levenshtein::new(term, dist);
+            let lev = match Levenshtein::new(term, dist) {
+                Ok(l) => l,
+                Err(_) => return DocScores::default(),
+            };
             let mut acc = DocScores::default();
             for fid in scope_ids(scope, ctx) {
                 let pairs: Vec<(String, TermInfo)> = seg
@@ -157,7 +163,9 @@ pub fn eval(
                 let idf_sum: f32 = infos
                     .iter()
                     .zip(terms)
-                    .map(|(info, t)| bm25_idf(ctx.stats.df_of(fid, t, info.df), ctx.stats.total_docs))
+                    .map(|(info, t)| {
+                        bm25_idf(ctx.stats.df_of(fid, t, info.df), ctx.stats.total_docs)
+                    })
                     .sum();
                 let ps = phrase_scores(&infos, seg.blob(), idf_sum, *slop, 1.5);
                 acc = crate::search::union(&acc, &ps);
