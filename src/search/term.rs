@@ -1,77 +1,39 @@
-//! BM25 term scorer
+//! term -> DocScores (BM25)
 
 use crate::posting::{PostingReader, TermInfo};
-use crate::search::{Bm25Params, Scorer};
+use crate::search::{Bm25Params, DocScores};
 
-pub struct TermScorer<'a> {
-    r: PostingReader<'a>,
-    peeked: Option<(u32, u32)>,
+pub fn bm25_idf(df: u32, total_docs: u32) -> f32 {
+    let n = total_docs.max(1) as f32;
+    let d = df.max(1) as f32;
+    ((n - d + 0.5) / (d + 0.5)).max(1e-6).ln()
+}
+
+pub fn norm_ratio(norms: Option<&[u16]>, doc: u32, avg_len: f32, b: f32) -> f32 {
+    let avg = avg_len.max(1.0);
+    match norms.and_then(|n| n.get(doc as usize)) {
+        Some(len) => (1.0 - b) + b * (*len as f32 / avg),
+        None => 1.0,
+    }
+}
+
+pub fn term_scores(
+    info: &TermInfo,
+    blob: &[u8],
     idf: f32,
-    k1: f32,
-    b: f32,
+    params: &Bm25Params,
     avg_len: f32,
     boost: f32,
-    norms: Option<&'a [u16]>,
-}
-
-impl<'a> TermScorer<'a> {
-    pub fn new(
-        info: &crate::posting::TermInfo,
-        blob: &'a [u8],
-        idf: f32,
-        params: &Bm25Params,
-        avg_len: f32,
-        boost: f32,
-        norms: Option<&'a [u16]>,
-    ) -> Self {
-        let mut r = PostingReader::new(info, blob);
-        let peeked = r.advance();
-        Self {
-            r,
-            peeked,
-            idf,
-            k1: params.k1,
-            b: params.b,
-            avg_len: avg_len.max(1.0),
-            boost,
-            norms,
-        }
-    }
-
-    fn score(&self, doc: u32, tf: u32) -> f32 {
-        let len = self
-            .norms
-            .and_then(|n| n.get(doc as usize))
-            .map(|x| *x as f32);
+    norms: Option<&[u16]>,
+) -> DocScores {
+    let mut r = PostingReader::new(info, blob);
+    let mut out = DocScores::default();
+    while let Some((doc, tf)) = r.advance() {
         let tf = tf as f32;
-        let norm = match len {
-            Some(len) => (1.0 - self.b) + self.b * (len / self.avg_len),
-            None => 1.0,
-        };
-        self.boost * self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm)
+        let norm = norm_ratio(norms, doc, avg_len, params.b);
+        let w = idf * (tf * (params.k1 + 1.0)) / (tf + params.k1 * norm);
+        out.ids.push(doc);
+        out.scores.push(w * boost);
     }
-}
-
-impl Scorer for TermScorer<'_> {
-    fn peek(&self) -> Option<(u32, f32)> {
-        self.peeked.map(|(d, tf)| (d, self.score(d, tf)))
-    }
-
-    fn next(&mut self) -> Option<(u32, f32)> {
-        let cur = self.peeked.take()?;
-        let out = self.score(cur.0, cur.1);
-        self.peeked = self.r.advance();
-        Some((cur.0, out))
-    }
-
-    fn skip_to(&mut self, target: u32) -> Option<(u32, f32)> {
-        while let Some((d, tf)) = self.peeked {
-            if d >= target {
-                break;
-            }
-            self.peeked = self.r.advance();
-            let _ = tf;
-        }
-        self.peek()
-    }
+    out
 }
