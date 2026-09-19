@@ -4,7 +4,14 @@ fn main() {
     let mut b = TokenizerBuilder::default();
     let tokenizer = b.build();
     for tok in tokenizer.tokenize(text) {
-        let Token { lemma, byte_start, byte_end, kind, script, .. } = tok;
+        let Token {
+            lemma,
+            byte_start,
+            byte_end,
+            kind,
+            script,
+            ..
+        } = tok;
         println!("kind={kind:?} script={script:?} [{byte_start}..{byte_end}] lemma={lemma}");
     }
 }

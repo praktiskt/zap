@@ -192,7 +192,7 @@ impl<'a> PostingReader<'a> {
     }
 
     /// advance to next doc, returns (docid, tf)
-    pub fn next(&mut self) -> Option<(u32, u32)> {
+    pub fn advance(&mut self) -> Option<(u32, u32)> {
         if self.docidx >= self.doc_count {
             return None;
         }
@@ -209,7 +209,9 @@ impl<'a> PostingReader<'a> {
     pub fn positions(&self, docidx: usize) -> Option<Vec<u32>> {
         let offs = self.posoff_start + docidx * 4;
         let get = |i: usize| -> Option<u32> {
-            Some(u32::from_le_bytes(self.blob[offs + i * 4..offs + i * 4 + 4].try_into().ok()?))
+            Some(u32::from_le_bytes(
+                self.blob[offs + i * 4..offs + i * 4 + 4].try_into().ok()?,
+            ))
         };
         let s = get(0)? as usize;
         let e = get(1)? as usize;
