@@ -21,3 +21,4 @@ In-memory full-text search engine. Performance is the product: search-first, ing
 - phrase cursors: must use galloping `seek_to`, never linear re-decode
 - ingestion cost lands in `analyzer.tokenize` (charabia); parallelize per document lanes when possible
 - group-varint postings decode: perf-reject (R4, +57% term scan; branchy GV loses to plain varint at tested sizes 10k docs) — retry only with true fixed-width SIMD blocks
+- block-max WAND: implemented (streaming single-Term path + live threshold); skip anchors (16B: prev_docid/off/tf_max/len_min) power both galloping seek and block pruning; length tables are NOT term-local (field-level)

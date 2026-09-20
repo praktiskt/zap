@@ -53,17 +53,17 @@ Query loop command set: terms, flags `-k` top-k, `--k1/--b` BM25 params, `--no-s
 
 ## Benchmarks (release, criterion, current)
 
-Query latency (top-10, 10k doc corpus, 10 segments):
-- single hot term `fox`: **63 µs**
-- `fox AND dog`: 199 µs
-- 3-term OR: 247 µs
-- `"quick brown fox"` phrase: 247 µs
-- wildcard `f*zz*`: 55 µs
-- fuzzy `fox~1`: 151 µs
+Query latency (top-10, 10k doc corpus, 10 segments, block-max WAND):
+- single hot term `fox`: **48 µs** (was 131 µs pre-Opt)
+- `fox AND dog`: 94 µs
+- 3-term OR: 113 µs
+- `"quick brown fox"` phrase: 290 µs
+- wildcard `f*zz*`: 56 µs
+- fuzzy `fox~1`: ~150 µs
 - exact rare term: 0.65 µs
 
 Scale (term/phrase/AND, 100k docs): 1.34 ms / 4.5 ms / 1.33 ms.
-1M-doc corpus (8 lanes): built via `zap/examples/big.rs`, 1M-doc ingest ≈ 16.6 s, top-10 query 0.55 ms (df-smeared rare term).
+1M-doc corpus (8 lanes): built via `zap/examples/big.rs`, 1M-doc ingest ≈ 16.1 s, top-10 query 0.36 ms (block-max WAND, 1.8x faster than pre-WAND 0.65 ms); skew probe (`examples/wand.rs`): 90 ns @200k docs.
 
 Doc length (1k docs): ingest 100w 41 ms → 20kw 3.1 s (parallel lanes), rare-term query flat ~5 µs
 at every length; phrase scales with doc length (23 µs @100w → 2.2 ms @20kw).
