@@ -1,8 +1,6 @@
 //! T8: WAND block skipping must never reorder the true top-k:
 //! skewed tf outliers must always outrank tf-1 docs on the same term.
 
-use std::sync::Arc;
-
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
 use zap::schema::{Document, Schema};
