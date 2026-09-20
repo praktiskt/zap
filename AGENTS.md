@@ -17,6 +17,7 @@ In-memory full-text search engine. Performance is the product: search-first, ing
 
 ## Known perf sensitive spots (from history)
 - prefix/fuzzy: FST range/automaton paths (NOT dict scans — `stream_terms` full scans are perf-reject)
-- AND eval: bitmap-first intersect, smallest-df positive seeds
+- AND eval: smallest-df positive seeds + stream intersect; bitmap-first double-scan is perf-reject (R3)
 - phrase cursors: must use galloping `seek_to`, never linear re-decode
 - ingestion cost lands in `analyzer.tokenize` (charabia); parallelize per document lanes when possible
+- group-varint postings decode: perf-reject (R4, +57% term scan; branchy GV loses to plain varint at tested sizes 10k docs) — retry only with true fixed-width SIMD blocks
