@@ -71,11 +71,16 @@ fn collect_docs(args: &Args) -> Result<Vec<String>> {
         return Ok(docs);
     }
     if args.stdin_lines {
-        for line in std::io::stdin().lock().lines() {
+        // first blank line separates the doc block from the query block
+        let stdin = std::io::stdin();
+        let mut done = false;
+        for line in stdin.lock().lines() {
             let l = line?;
-            if !l.trim().is_empty() {
-                docs.push(l);
+            done |= l.trim().is_empty();
+            if done {
+                break;
             }
+            docs.push(l);
         }
         return Ok(docs);
     }
