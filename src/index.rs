@@ -1,6 +1,5 @@
 //! index: writer (add/commit/merge) + snapshot readers
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -291,15 +290,11 @@ impl Index {
 }
 
 /// concatenate segments into one (rebuild postings with remapped docids)
-fn merge_segments(segs: &[Arc<SegmentReader>], nf: usize) -> SegmentReader {
-    let mut postings: Vec<BTreeMap<String, PostingData>> =
-        (0..nf).map(|_| BTreeMap::new()).collect();
+pub(crate) fn merge_segments(segs: &[Arc<SegmentReader>], nf: usize) -> SegmentReader {
     let mut field_norms: Vec<Vec<u16>> = (0..nf).map(|_| Vec::new()).collect();
     let mut store_blocks: Vec<Box<[u8]>> = Vec::new();
     let mut total = 0u32;
     for s in segs {
-        let base = total;
-        total += s.num_docs;
         for (fid, norms) in s.field_norms.iter().enumerate() {
             field_norms[fid].extend(norms.iter().copied());
         }
@@ -308,20 +303,38 @@ fn merge_segments(segs: &[Arc<SegmentReader>], nf: usize) -> SegmentReader {
                 store_blocks.push(block.to_vec().into_boxed_slice());
             }
         }
-        for (fid, terms) in s.inner_postings() {
-            let map = &mut postings[fid as usize];
-            for (term, info) in terms {
-                let entry = map.entry(term.clone()).or_default();
-                let mut r = s.reader(&info);
-                let mut idx = 0usize;
-                while let Some((doc, tf)) = r.advance() {
-                    let pos = r.positions(idx).unwrap_or_default();
-                    idx += 1;
-                    entry.add(doc + base, tf, pos);
-                }
-            }
-        }
+        total += s.num_docs;
     }
+    // per-field parallel posting union (docid remap per segment)
+    let fields: Vec<usize> = (0..nf).collect();
+    let postings = {
+        use rayon::prelude::*;
+        fields
+            .par_iter()
+            .map(|fid| {
+                let mut m = std::collections::BTreeMap::<String, PostingData>::new();
+                let mut base = 0u64;
+                for s in segs {
+                    for (fid_s, terms) in s.inner_postings() {
+                        if fid_s == *fid as u32 {
+                            for (term, info) in terms {
+                                let entry = m.entry(term.clone()).or_default();
+                                let mut r = s.reader(&info);
+                                let mut idx = 0usize;
+                                while let Some((doc, tf)) = r.advance() {
+                                    let pos = r.positions(idx).unwrap_or_default();
+                                    idx += 1;
+                                    entry.add((doc as u64 + base) as u32, tf, pos);
+                                }
+                            }
+                        }
+                    }
+                    base += s.num_docs as u64;
+                }
+                m
+            })
+            .collect::<Vec<_>>()
+    };
     crate::segment::freeze_parts(postings, field_norms, store_blocks, total)
 }
 
