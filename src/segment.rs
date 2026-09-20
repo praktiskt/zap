@@ -14,6 +14,10 @@ use crate::posting::{PostingData, PostingReader, TermInfo};
 use crate::schema::{Document, Schema};
 use std::sync::Arc;
 
+/// doc-store size gate: below this, store raw instead of lz4 (frequent tiny docs)
+const RAW_STORE_THRESHOLD: usize = 4096;
+const STORE_RAW_TAG: u8 = 0x00;
+const STORE_COMP_TAG: u8 = 0x01;
 /// single doc store block: count + TLV(field_id, len, text bytes)
 fn encode_store(doc: &Document, schema: &Schema) -> Result<Vec<u8>, String> {
     let mut pairs: Vec<(u32, &String)> = doc
@@ -97,7 +101,19 @@ impl SegmentBuilder {
             }
             self.field_norms[fid as usize].push(pos as u16);
         }
-        self.store_blocks.push(compress_prepend_size(&block).into());
+        // small docs stay raw (marker 0x00) to skip lz4 costs; big docs compress (0x01)
+        let stored: Box<[u8]> = if block.len() <= RAW_STORE_THRESHOLD {
+            let mut raw = Vec::with_capacity(block.len() + 5);
+            raw.push(STORE_RAW_TAG);
+            raw.extend_from_slice(&(block.len() as u32).to_le_bytes());
+            raw.extend_from_slice(&block);
+            raw.into_boxed_slice()
+        } else {
+            let mut c = compress_prepend_size(&block);
+            c.insert(0, STORE_COMP_TAG);
+            c.into_boxed_slice()
+        };
+        self.store_blocks.push(stored);
         self.num_docs += 1;
         Ok(docid)
     }
@@ -274,7 +290,15 @@ impl SegmentReader {
 
 /// decompress one stored doc block: count + TLV(field_id, len, text bytes)
 pub fn read_stored(block: &[u8]) -> Option<Vec<(u32, String)>> {
-    let raw = decompress_size_prepended(block).ok()?;
+    let raw: std::borrow::Cow<[u8]> = match block.first() {
+        None => return None,
+        Some(&STORE_RAW_TAG) => {
+            // raw layout: tag + le-u32 length + bytes
+            let len = u32::from_le_bytes(block.get(1..5)?.try_into().ok()?) as usize;
+            std::borrow::Cow::Owned(block.get(5..5 + len)?.to_vec())
+        }
+        _ => std::borrow::Cow::Owned(decompress_size_prepended(&block[1..]).ok()?),
+    };
     let n = *raw.first()? as usize;
     let mut p = 1;
     let mut out = Vec::with_capacity(n);
