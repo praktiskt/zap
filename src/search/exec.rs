@@ -269,12 +269,8 @@ fn and_two_terms(
         }
         halves[i] = variant;
     }
-    let Some(first) = halves[0].clone() else {
-        return None;
-    };
-    let Some(second) = halves[1].clone() else {
-        return None;
-    };
+    let first = halves[0].clone()?;
+    let second = halves[1].clone()?;
 
     // caller prefilter: intersect child docids into a bitmap first if present
 
