@@ -164,17 +164,6 @@ fn dense_topk(
     col.into_sorted()
 }
 
-fn wand_topk(
-    node: &zap::query::Node,
-    seg: &zap::segment::SegmentReader,
-    ctx: &Ctx,
-    k: usize,
-) -> Vec<SearchHit> {
-    let mut col = TopK::new(k);
-    eval_term_stream(node, None, seg, ctx, &mut col);
-    col.into_sorted()
-}
-
 fn corpus_strategy() -> impl Strategy<Value = (Vec<String>, String, usize)> {
     (2usize..20, 1usize..6, 1usize..12).prop_flat_map(|(ndocs, hot_every, k)| {
         proptest::collection::vec(0u64..u64::MAX, ndocs * 8).prop_map(move |seeds| {
