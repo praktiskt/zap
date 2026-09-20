@@ -11,6 +11,7 @@ use crate::query::Node;
 use crate::schema::Schema;
 use crate::search::phrase::phrase_scores;
 use crate::search::term::{bm25_idf, term_scores};
+use crate::search::DocAddr;
 use crate::search::{Bm25Params, DocScores};
 
 pub const MAX_EXPANSIONS: usize = 512;
@@ -50,6 +51,25 @@ pub struct Ctx<'a> {
     pub stats: &'a Stats,
     pub params: &'a Bm25Params,
     pub analyzer: &'a Analyzer,
+    /// provider of the current top-k heap threshold (block-max WAND pruning)
+    pub threshold: &'a dyn Fn() -> f32,
+}
+
+impl Ctx<'_> {
+    pub fn thr(&self) -> f32 {
+        (self.threshold)()
+    }
+}
+
+/// caches a threshold provider pointee
+pub struct ThresholdRef<'a> {
+    closure: &'a dyn Fn() -> f32,
+}
+
+impl<'a> ThresholdRef<'a> {
+    pub fn new(closure: &'a dyn Fn() -> f32) -> Self {
+        Self { closure }
+    }
 }
 
 fn glob_match(term: &str, pat: &[char]) -> bool {
@@ -98,6 +118,76 @@ pub fn eval(
     ctx: &Ctx,
 ) -> DocScores {
     eval_allowed(node, scope, seg, ctx, None)
+}
+
+/// single-term streaming with live topk threshold (block-max WAND lite)
+/// returns true if the node was handled (plain Term); blog members pushed into `col`
+pub fn eval_term_stream(
+    node: &Node,
+    scope: Option<u32>,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    col: &mut crate::search::TopK,
+) -> bool {
+    let Node::Term(t) = node else {
+        return false;
+    };
+    for fid in scope_ids(scope, ctx) {
+        for st in stem_pair(ctx, t).into_iter().flatten() {
+            let Some(info) = seg.term(fid, &st) else {
+                continue;
+            };
+            let idf = bm25_idf(
+                ctx.stats.df_of(fid, st.as_str(), info.df),
+                ctx.stats.total_docs,
+            );
+            let mut r = seg.reader(&info);
+            let mut seen_block = usize::MAX;
+            let norms = seg.norms(fid);
+            while let Some((doc, tf)) = r.advance() {
+                let blk = r.cur_block();
+                if blk != seen_block {
+                    seen_block = blk;
+                    if let Some((_, _, tf_max, len_min)) = r.block_bounds() {
+                        let tfm = tf_max.max(tf) as f32;
+                        let norm_min = if len_min > 0 {
+                            (1.0 - ctx.params.b)
+                                + ctx.params.b * (len_min as f32 / ctx.stats.avg_of(fid).max(1.0))
+                        } else {
+                            1.0
+                        };
+                        let bound =
+                            idf * (tfm * (ctx.params.k1 + 1.0)) / (tfm + ctx.params.k1 * norm_min);
+                        if bound < ctx.thr() {
+                            match r.next_block_start() {
+                                Some(ns) => {
+                                    r.seek_to(ns);
+                                    continue;
+                                }
+                                None => continue,
+                            }
+                        }
+                    }
+                }
+                let tf = tf as f32;
+                let norm = crate::search::term::norm_ratio(
+                    norms,
+                    doc,
+                    ctx.stats.avg_of(fid),
+                    ctx.params.b,
+                );
+                let w = idf * (tf * (ctx.params.k1 + 1.0)) / (tf + ctx.params.k1 * norm);
+                col.push(
+                    DocAddr {
+                        segment: 0,
+                        docid: doc,
+                    },
+                    w,
+                );
+            }
+        }
+    }
+    true
 }
 
 pub fn eval_allowed(

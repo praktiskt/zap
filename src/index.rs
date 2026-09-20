@@ -1,5 +1,6 @@
 //! index: writer (add/commit/merge) + snapshot readers
 
+use crate::query::Node;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -220,48 +221,70 @@ impl Index {
             k1: self.k1,
             b: self.b,
         };
-        // parallel per-segment topk only pays when there is real work per thread
-        let collect_one = |si: usize, seg: &Arc<SegmentReader>, ctx: &crate::search::exec::Ctx| {
-            let ds = crate::search::exec::eval_allowed(&node, None, seg, ctx, None);
-            let mut collector = TopK::new(k);
-            for (i, doc) in ds.ids.iter().enumerate() {
-                collector.push(
-                    DocAddr {
-                        segment: si as u32,
-                        docid: *doc,
-                    },
-                    ds.scores[i],
-                );
-            }
-            collector.into_sorted()
-        };
-        let per_seg: Vec<Vec<SearchHit>> = if snap.segments.len() > 1000 {
+        // single Term: streaming walk with a live topk threshold (block-max WAND);
+        // generic nodes: dense arrays + collector push
+        let per_seg: Vec<Vec<SearchHit>> = {
             use rayon::prelude::*;
             snap.segments
                 .par_iter()
                 .enumerate()
                 .map(|(si, seg)| {
-                    let ctx = crate::search::exec::Ctx {
-                        schema: &self.schema,
-                        stats: &snap.stats,
-                        params: &params,
-                        analyzer: &self.analyzer,
-                    };
-                    collect_one(si, seg, &ctx)
-                })
-                .collect()
-        } else {
-            snap.segments
-                .iter()
-                .enumerate()
-                .map(|(si, seg)| {
-                    let ctx = crate::search::exec::Ctx {
-                        schema: &self.schema,
-                        stats: &snap.stats,
-                        params: &params,
-                        analyzer: &self.analyzer,
-                    };
-                    collect_one(si, seg, &ctx)
+                    let mut collector = TopK::new(k);
+                    // WAND-lite fast path needs a ctx closure bound to this collector;
+                    // for non-Term nodes fall back to dense array evaluation
+                    match &node {
+                        Node::Term(_) => {
+                            // the closure holds a shared view of the collector: threshold live
+                            let col: *mut TopK = &mut collector as *mut TopK;
+                            let thr = move || unsafe { (*col).threshold() };
+                            let ctx = crate::search::exec::Ctx {
+                                schema: &self.schema,
+                                stats: &snap.stats,
+                                params: &params,
+                                analyzer: &self.analyzer,
+                                threshold: &thr,
+                            };
+                            crate::search::exec::eval_term_stream(
+                                &node,
+                                None,
+                                seg,
+                                &ctx,
+                                &mut collector,
+                            );
+                        }
+                        _ => {
+                            let thr = || 0.0;
+                            let ctx = crate::search::exec::Ctx {
+                                schema: &self.schema,
+                                stats: &snap.stats,
+                                params: &params,
+                                analyzer: &self.analyzer,
+                                threshold: &thr,
+                            };
+                            let ds =
+                                crate::search::exec::eval_allowed(&node, None, seg, &ctx, None);
+                            for (i, doc) in ds.ids.iter().enumerate() {
+                                collector.push(
+                                    DocAddr {
+                                        segment: si as u32,
+                                        docid: *doc,
+                                    },
+                                    ds.scores[i],
+                                );
+                            }
+                        }
+                    }
+                    // term_stream pushes with segment=0; remap to this segment index
+                    let out = collector.into_sorted();
+                    out.into_iter()
+                        .map(|h| SearchHit {
+                            addr: DocAddr {
+                                segment: si as u32,
+                                ..h.addr
+                            },
+                            score: h.score,
+                        })
+                        .collect()
                 })
                 .collect()
         };

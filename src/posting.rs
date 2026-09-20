@@ -288,7 +288,7 @@ impl<'a> PostingReader<'a> {
         let tf_max = row(2);
         let len_min = row(3);
         // first doc of the next block: prev_docid of the following anchor + 1
-        let next_start = if b + 1 < n {
+        let _next_start = if b + 1 < n {
             let next_row = |field: usize| {
                 u32::from_le_bytes(
                     skips[(b + 1) * 16 + field * 4..(b + 1) * 16 + field * 4 + 4]
