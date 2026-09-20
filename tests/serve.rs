@@ -53,10 +53,6 @@ fn post_json(addr: SocketAddr, path: &str, body: &str) -> Value {
     v
 }
 
-fn opt_expect(v: &Value, key: &str) -> Value {
-    (v.get(key).expect(key)).clone()
-}
-
 fn start_serve() -> SocketAddr {
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
@@ -97,7 +93,7 @@ fn serve_rejects_bad_ingest() {
     let (code, b) = request_raw(addr, "POST", "/ingest", Some("{not json}"));
     assert_eq!(code, 400, "{b}");
     let v: Value = serde_json::from_str(&b).unwrap();
-    assert!(v["error"].as_str().unwrap_or("").len() > 0, "{v}");
+    assert!(!v["error"].as_str().unwrap_or_default().is_empty(), "{v}");
     // unknown path
     let (code, b) = request_raw(addr, "GET", "/nope", None);
     assert_eq!(code, 404, "BAD: {b:?}");
