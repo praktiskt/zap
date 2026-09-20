@@ -3,7 +3,7 @@
 //! term dictionary: one FST per field (term -> global-info ordinal), enabling
 //! DFA/range queries (prefix, fuzzy, glob) without dict scans.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use fst::automaton::Automaton;
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
@@ -46,7 +46,7 @@ pub struct SegmentBuilder {
     analyzer: Arc<Analyzer>,
     pub num_docs: u32,
     /// field_id -> term -> postings (textarea feed of sorted terms into each field FST)
-    postings: Vec<BTreeMap<String, PostingData>>,
+    postings: Vec<HashMap<String, PostingData>>,
     /// field_id -> doc -> token count
     field_norms: Vec<Vec<u16>>,
     /// lz4-compressed blocks, one per doc
@@ -59,7 +59,7 @@ impl SegmentBuilder {
         let mut postings = Vec::with_capacity(nf);
         let mut field_norms = Vec::with_capacity(nf);
         for _ in 0..nf {
-            postings.push(BTreeMap::new());
+            postings.push(HashMap::new());
             field_norms.push(Vec::new());
         }
         Self {
@@ -140,7 +140,7 @@ pub struct SegmentReader {
 
 /// shared by SegmentBuilder::freeze and segment merge
 pub fn freeze_parts(
-    postings: Vec<BTreeMap<String, PostingData>>,
+    postings: Vec<HashMap<String, PostingData>>,
     field_norms: Vec<Vec<u16>>,
     store_blocks: Vec<Box<[u8]>>,
     num_docs: u32,
@@ -150,8 +150,11 @@ pub fn freeze_parts(
     let mut fsts = Vec::with_capacity(postings.len());
     for terms in &postings {
         let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
-        for (term, data) in terms {
-            let info = data.freeze().encode_to(&mut blob);
+        // sorted by term for the FST (HashMap keeps insertion order)
+        let mut sorted: Vec<(&String, &PostingData)> = terms.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        for (term, data) in sorted {
+            let info = crate::posting::FrozenPosting::encode_to(data.freeze(), &mut blob);
             let ordinal = infos.len() as u64;
             map_builder.insert(term.as_bytes(), ordinal).unwrap();
             infos.push(info);

@@ -329,7 +329,7 @@ pub(crate) fn merge_segments(segs: &[Arc<SegmentReader>], nf: usize) -> SegmentR
         fields
             .par_iter()
             .map(|fid| {
-                let mut m = std::collections::BTreeMap::<String, PostingData>::new();
+                let mut m = std::collections::HashMap::<String, PostingData>::new();
                 let mut base = 0u64;
                 for s in segs {
                     for (fid_s, terms) in s.inner_postings() {
