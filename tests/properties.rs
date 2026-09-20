@@ -34,10 +34,8 @@ proptest! {
     ) {
         prop_assume!(!docids.is_empty());
         let mut data = PostingData::default();
-        let mut pos = 0u32;
-        for (&d, &tf) in docids.iter().zip(&tfs) {
-            data.add(d, tf, vec![pos; tf as usize]);
-            pos += 1;
+        for (pos, (&d, &tf)) in docids.iter().zip(&tfs).enumerate() {
+            data.add(d, tf, vec![pos as u32; tf as usize]);
         }
         let mut blob = Vec::new();
         let info = data.freeze(None).encode_to(&mut blob);
@@ -55,7 +53,7 @@ proptest! {
     #[test]
     fn advanced_positions_match_source(
         (docids, tfs) in post_data_strategy(),
-        advance_n in 0usize..64.max(0),
+        advance_n in 0usize..64,
     ) {
         prop_assume!(!docids.is_empty());
         let mut data = PostingData::default();
