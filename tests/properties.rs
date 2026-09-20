@@ -144,6 +144,11 @@ fn ctx_of<'a>(index: &'a Arc<Index>, stats: &'a Stats) -> Ctx<'a> {
     }
 }
 
+/// (doc text, score bits, docid)
+fn text_score_bits(fields: Vec<(String, String)>, score: f32, docid: u32) -> (String, String, u32) {
+    (fields[0].1.clone(), score.to_bits().to_string(), docid)
+}
+
 fn dense_topk(
     node: &zap::query::Node,
     seg: &zap::segment::SegmentReader,
@@ -245,6 +250,145 @@ proptest! {
             );
             for (dh, wh) in dense.iter().zip(wand.iter()) {
                 assert!((dh.score - wh.score).abs() < 1e-4, "kk={kk} scores differ");
+            }
+        }
+    }
+}
+
+// ---------- T4: merge invariants ----------
+
+/// the corpus used to force merges; queries are single terms drawn from the vocab
+fn merge_corpus_strategy() -> impl Strategy<Value = (Vec<String>, Vec<String>)> {
+    (2usize..40, 2usize..30)
+        .prop_flat_map(|(ndocs, nqueries)| {
+            (
+                proptest::collection::vec(0u64..u64::MAX, ndocs * 8),
+                proptest::collection::vec(0usize..WORDS.len(), nqueries),
+            )
+        })
+        .prop_map(|(seeds, qidx)| {
+            let mut docs = Vec::with_capacity(seeds.len() / 8);
+            for i in 0..seeds.len() / 8 {
+                let mut s = String::new();
+                for w in 0..8 {
+                    if w == 0 {
+                        // always one shared term so queries hit many docs
+                        s.push_str("hop ");
+                        continue;
+                    }
+                    let word = WORDS[((seeds[i * 8 + w] >> (w * 7)) as usize) % WORDS.len()];
+                    s.push_str(word);
+                    s.push(' ');
+                }
+                docs.push(s);
+            }
+            let queries = qidx
+                .iter()
+                .map(|i| WORDS[*i].to_string())
+                .collect::<Vec<_>>();
+            (docs, queries)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// T4: a lane-parallel, merge-heavy build must agree with a single-lane
+    /// reference build on ranked top-k output (texts + scores)
+    #[test]
+    fn merged_index_matches_single_lane_reference(
+        (docs, queries) in merge_corpus_strategy(),
+        k in 1usize..8,
+        lane in 1usize..8usize,
+    ) {
+        prop_assume!(!docs.is_empty());
+        // reference: one lane, one commit
+        let mut schema = Schema::default();
+        schema.add_text("text", 1.0);
+        let analyzer = Analyzer::new(AnalyzerConf::default());
+        let ref_index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 1);
+        let ref_docs: Vec<Document> = docs
+            .iter()
+            .map(|d| Document::new().text("text", d.clone()))
+            .collect();
+        ref_index
+            .add_documents(ref_docs)
+            .unwrap();
+        ref_index.commit();
+        let ref_hits: Vec<Vec<(String, String, u32)>> = queries
+            .iter()
+            .map(|q| {
+                ref_index
+                    .search(q, k)
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| {
+                        let fields = ref_index.stored_fields(h.addr).unwrap();
+                        (fields[0].1.clone(), h.score.to_bits().to_string(), h.addr.docid)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // multi-lane, multi-commit: forces merges
+        let mut schema = Schema::default();
+        schema.add_text("text", 1.0);
+        let analyzer = Analyzer::new(AnalyzerConf::default());
+        let merged_index = Index::with_lanes(schema, analyzer, 1.2, 0.75, lane);
+        let chunk = docs.len().div_ceil(lane);
+        let mut i = 0;
+        while i < docs.len() {
+            let end = (i + chunk).min(docs.len());
+            let chunk_docs: Vec<Document> = docs[i..end]
+                .iter()
+                .map(|d| Document::new().text("text", d.clone()))
+                .collect();
+            merged_index.add_documents(chunk_docs).unwrap();
+            merged_index.commit();
+            i = end;
+        }
+        // tie ordering can differ between builds; compare as an unordered
+        // multiset of (score, text) pairs at the same size
+        for (qi, q) in queries.iter().enumerate() {
+            let hits = merged_index.search(q, k).unwrap();
+            let mut got: Vec<(String, String)> = hits
+                .iter()
+                .map(|h| {
+                    let fields = merged_index.stored_fields(h.addr).unwrap();
+                    (fields[0].1.clone(), h.score.to_bits().to_string())
+                })
+                .collect();
+            let mut refs: Vec<(String, String)> = ref_hits[qi]
+                .iter()
+                .map(|(t, s, _)| (t.clone(), s.clone()))
+                .collect();
+            assert_eq!(refs.len(), got.len(), "query {q} hit counts differ");
+            if refs.len() < k {
+                // fewer hits than k: no threshold ties were cut: exact match
+                got.sort();
+                refs.sort();
+                assert_eq!(refs, got, "query {q}: (text, score) multiset differs");
+            } else {
+                // ties at the cut: entries above the min score must match exactly;
+                // the min-level ties may pick different (equally-scored) docs
+                let min_score = got
+                    .iter()
+                    .map(|(_, s)| s.clone())
+                    .min()
+                    .expect("nonempty");
+                let ref_min = refs.iter().map(|(_, s)| s.clone()).min().expect("nonempty");
+                assert_eq!(ref_min, min_score, "query {q}: min score differs");
+                let got_above: Vec<(String, String)> = got
+                    .iter()
+                    .filter(|(_, s)| *s != min_score)
+                    .cloned()
+                    .collect();
+                let ref_above: Vec<(String, String)> = refs
+                    .iter()
+                    .filter(|(_, s)| *s != min_score)
+                    .cloned()
+                    .collect();
+                assert_eq!(ref_above, got_above, "query {q}: above-tie docs differ");
             }
         }
     }
