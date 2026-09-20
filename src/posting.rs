@@ -420,7 +420,7 @@ mod tests {
         }
         let mut blob = Vec::new();
         let info = data.freeze().encode_to(&mut blob);
-        let want = |target: u32| -> u32 { (target + 6) / 7 * 7 };
+        let want = |target: u32| -> u32 { target.div_ceil(7) };
         let mut r = PostingReader::new(&info, &blob);
         for step in [0u32, 900, 3000, 4200, u32::MAX - 7] {
             r.seek_to(step);
