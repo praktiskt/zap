@@ -171,6 +171,8 @@ pub struct PostingReader<'a> {
     docids_base: usize,
     docid_c: usize,
     docids_end: usize,
+    /// cached lower bound for forward-only anchor searches
+    anchor_lo: usize,
     posoff_start: usize,
     pos_start: usize,
     skips_start: usize,
@@ -195,6 +197,7 @@ impl<'a> PostingReader<'a> {
             pos_start: info.pos.start as usize,
             skips_start: info.skips.start as usize,
             skips_end: info.skips.end as usize,
+            anchor_lo: 0,
             doc_count,
             docidx: 0,
             prev_docid: 0,
@@ -293,9 +296,9 @@ impl<'a> PostingReader<'a> {
         if n == 0 {
             return;
         }
-        // binary search: last anchor index with anchor docid <= target
+        // binary search: last anchor index with anchor docid <= target; forward-only hint
         let anchor = |i: usize| u32::from_le_bytes(skips[i * 12..i * 12 + 4].try_into().unwrap());
-        let (mut lo, mut hi) = (0usize, n);
+        let (mut lo, mut hi) = (self.anchor_lo.min(n.saturating_sub(1)), n);
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             if anchor(mid) <= target {
@@ -319,6 +322,7 @@ impl<'a> PostingReader<'a> {
         let _ = a_tf_off; // single interleaved cursor; tf offset folds into docid cursor
         self.docidx = lo * SKIP_STEP;
         self.prev_docid = a_docid;
+        self.anchor_lo = lo;
     }
 
     /// collect all matching docids (used by filter-style evaluation); skips inline tf varints
