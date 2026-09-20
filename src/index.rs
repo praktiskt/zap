@@ -217,30 +217,45 @@ impl Index {
     pub fn search(&self, q: &str, k: usize) -> Result<Vec<SearchHit>, IndexError> {
         let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
         let snap = self.snap.load();
-        let params = Bm25Params {
+        let params = crate::search::Bm25Params {
             k1: self.k1,
             b: self.b,
         };
-        let mut collector = TopK::new(k);
-        for (si, seg) in snap.segments.iter().enumerate() {
-            let ctx = crate::search::exec::Ctx {
-                schema: &self.schema,
-                stats: &snap.stats,
-                params: &params,
-                analyzer: &self.analyzer,
-            };
-            let ds = crate::search::exec::eval(&node, None, seg, &ctx);
-            for (i, doc) in ds.ids.iter().enumerate() {
-                collector.push(
-                    DocAddr {
-                        segment: si as u32,
-                        docid: *doc,
-                    },
-                    ds.scores[i],
-                );
+        // per-segment parallel top-k; the heaps fold into one final TopK
+        let per_seg: Vec<Vec<SearchHit>> = {
+            use rayon::prelude::*;
+            snap.segments
+                .par_iter()
+                .enumerate()
+                .map(|(si, seg)| {
+                    let ctx = crate::search::exec::Ctx {
+                        schema: &self.schema,
+                        stats: &snap.stats,
+                        params: &params,
+                        analyzer: &self.analyzer,
+                    };
+                    let ds = crate::search::exec::eval_allowed(&node, None, seg, &ctx, None);
+                    let mut collector = TopK::new(k);
+                    for (i, doc) in ds.ids.iter().enumerate() {
+                        collector.push(
+                            DocAddr {
+                                segment: si as u32,
+                                docid: *doc,
+                            },
+                            ds.scores[i],
+                        );
+                    }
+                    collector.into_sorted()
+                })
+                .collect()
+        };
+        let mut merged = TopK::new(k);
+        for hits in per_seg {
+            for h in hits {
+                merged.push(h.addr, h.score);
             }
         }
-        Ok(collector.into_sorted())
+        Ok(merged.into_sorted())
     }
 
     pub fn stored_fields(&self, addr: DocAddr) -> Option<Vec<(String, String)>> {

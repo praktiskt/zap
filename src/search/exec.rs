@@ -89,7 +89,7 @@ pub fn eval(
     eval_allowed(node, scope, seg, ctx, None)
 }
 
-fn eval_allowed(
+pub fn eval_allowed(
     node: &Node,
     scope: Option<u32>,
     seg: &crate::segment::SegmentReader,
