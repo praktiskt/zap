@@ -79,12 +79,25 @@ fn glob_match(term: &str, pat: &[char]) -> bool {
     pi == m
 }
 
+/// convenience: eval without bitmap probe
 pub fn eval(
     node: &Node,
     scope: Option<u32>,
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
 ) -> DocScores {
+    eval_allowed(node, scope, seg, ctx, None)
+}
+
+fn eval_allowed(
+    node: &Node,
+    scope: Option<u32>,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    allowed: Option<&roaring::RoaringBitmap>,
+) -> DocScores {
+    // `allowed`: bitmap probe pre-applied at term level (bitmap-first query execution)
+    use crate::search::term::term_scores_allowed;
     match node {
         Node::Term(t) => {
             let mut acc = DocScores::default();
@@ -93,7 +106,7 @@ pub fn eval(
                 for st in &stems {
                     if let Some(info) = seg.term(fid, st) {
                         let idf = bm25_idf(ctx.stats.df_of(fid, st, info.df), ctx.stats.total_docs);
-                        let ts = term_scores(
+                        let ts = term_scores_allowed(
                             &info,
                             seg.blob(),
                             idf,
@@ -101,6 +114,7 @@ pub fn eval(
                             ctx.stats.avg_of(fid),
                             1.0,
                             seg.norms(fid),
+                            allowed,
                         );
                         acc = crate::search::union(&acc, &ts);
                     }
@@ -147,7 +161,7 @@ pub fn eval(
         }
         Node::Phrase { terms, slop } => {
             if terms.len() == 1 {
-                return eval(&Node::Term(terms[0].clone()), scope, seg, ctx);
+                return eval_allowed(&Node::Term(terms[0].clone()), scope, seg, ctx, allowed);
             }
             let mut acc = DocScores::default();
             for fid in scope_ids(scope, ctx) {
@@ -170,49 +184,51 @@ pub fn eval(
         }
         Node::Field { field, node } => {
             match field.as_deref().and_then(|f| ctx.schema.field_id(f)) {
-                Some(fid) => eval(node, Some(fid), seg, ctx),
+                Some(fid) => eval_allowed(node, Some(fid), seg, ctx, allowed),
                 None => DocScores::default(),
             }
         }
         Node::Not(child) => {
-            let ds = eval(child, scope, seg, ctx);
+            let ds = eval_allowed(child, scope, seg, ctx, allowed);
             let docs: RoaringBitmap = ds.ids.iter().collect();
             DocScores::all((0..seg.num_docs).filter(|d| !docs.contains(*d)).collect())
         }
         Node::Or(items) => {
             let mut acc = DocScores::default();
             for it in items {
-                let ds = eval(it, scope, seg, ctx);
+                let ds = eval_allowed(it, scope, seg, ctx, allowed);
                 acc = crate::search::union(&acc, &ds);
             }
             acc
         }
         Node::And(items) => {
+            // legacy vector scoring (R3 bitmap-first probe scored ~2.4x worse on 2-term AND; perf-reject)
             let mut positives: Vec<&Node> = Vec::new();
             let mut excluded: Vec<RoaringBitmap> = Vec::new();
             for it in items {
                 match it {
                     Node::Not(child) => {
-                        let ds = eval(child, scope, seg, ctx);
+                        let ds = eval_allowed(child, scope, seg, ctx, allowed);
                         excluded.push(ds.ids.iter().collect());
                     }
                     other => positives.push(other),
                 }
             }
-            match positives.pop() {
-                Some(first) => {
-                    let mut acc = eval(first, scope, seg, ctx);
-                    for p in positives.iter() {
-                        let ds = eval(p, scope, seg, ctx);
-                        acc = crate::search::intersect(&acc, &ds);
-                    }
-                    if excluded.is_empty() {
-                        acc
-                    } else {
-                        filter_out(&acc, &excluded)
-                    }
-                }
-                None => DocScores::default(),
+            let mut iter = positives.iter();
+            let Some(first) = iter.next() else {
+                return DocScores::default();
+            };
+            let mut acc = eval_allowed(first, scope, seg, ctx, allowed);
+            for p in iter {
+                let ds = eval_allowed(p, scope, seg, ctx, allowed);
+                acc = crate::search::intersect(&acc, &ds);
+            }
+            if excluded.is_empty() {
+                acc
+            } else {
+                let mask: RoaringBitmap = excluded.iter().flat_map(|m| m.iter()).collect();
+                let full: RoaringBitmap = (0..seg.num_docs).collect();
+                filter_by(&acc, &(&full - &mask))
             }
         }
     }
@@ -225,6 +241,18 @@ fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
         v.insert(0, stemmed);
     }
     v
+}
+
+/// score only docs inside the bitmap
+fn filter_by(ds: &DocScores, probe: &RoaringBitmap) -> DocScores {
+    let mut out = DocScores::default();
+    for (i, d) in ds.ids.iter().enumerate() {
+        if probe.contains(*d) {
+            out.ids.push(*d);
+            out.scores.push(ds.scores[i]);
+        }
+    }
+    out
 }
 
 fn scope_ids(scope: Option<u32>, ctx: &Ctx) -> Vec<u32> {
@@ -261,16 +289,4 @@ fn leaf_score(
         acc = crate::search::union(&acc, &ts);
     }
     acc
-}
-
-/// remove excluded docs from a score series
-fn filter_out(ds: &DocScores, excl: &[RoaringBitmap]) -> DocScores {
-    let mut out = DocScores::default();
-    for (i, d) in ds.ids.iter().enumerate() {
-        if !excl.iter().any(|p| p.contains(*d)) {
-            out.ids.push(*d);
-            out.scores.push(ds.scores[i]);
-        }
-    }
-    out
 }
