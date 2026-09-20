@@ -56,6 +56,8 @@ impl DocScores {
 /// intersect two ascending series, summing scores
 pub fn intersect(a: &DocScores, b: &DocScores) -> DocScores {
     let mut out = DocScores::default();
+    out.ids.reserve(a.len().min(b.len()));
+    out.scores.reserve(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
         let (di, dj) = (a.ids[i], b.ids[j]);
