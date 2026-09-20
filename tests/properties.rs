@@ -22,9 +22,7 @@ const WORDS: [&str; 24] = [
 
 // ---------- T3: posting skip-anchor invariants ----------
 
-/// random posting data: ascending docids (with small gaps), small tfs, sparse positions
-// (post_data_strategy replaced by post_data_strategy2)
-
+// random posting data: ascending docids (with small gaps), small tfs, sparse positions
 fn post_data_strategy2() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
     (0usize..64).prop_flat_map(|len| {
         (
@@ -232,7 +230,7 @@ proptest! {
     /// T1: with a live threshold (the dense k-th score), WAND pruning keeps the same top-k
     #[test]
     fn wand_threshold_prunes_to_same_topk(docs in corpus_strategy()) {
-        let (docs, query, k) = docs;
+        let (docs, query, _k) = docs;
         let (index, stats, seg) = build_index(&docs);
         let node = parse(&query).unwrap();
         prop_assume!(matches!(node, zap::query::Node::Term(_)));
