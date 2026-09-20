@@ -45,6 +45,12 @@ struct Args {
     /// auto-commit every N documents (bounds segment memory)
     #[arg(long, default_value = "50000")]
     commit_every: usize,
+    /// run the HTTP API instead of the interactive query loop
+    #[arg(long)]
+    serve: bool,
+    /// bind address for --serve (host:port)
+    #[arg(long, default_value = "127.0.0.1:3279")]
+    bind: String,
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -123,23 +129,21 @@ fn main() -> Result<()> {
     let args = Args::parse();
     ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)).ok();
     let docs = collect_docs(&args)?;
-    if docs.is_empty() {
-        eprintln!("no documents; pass files/dirs or --stdin / --stdin-lines");
-        std::process::exit(2);
-    }
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf {
         stem: !args.no_stem,
         max_token_len: 64,
     });
-    let lanes = args.lanes.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|p| p.get().clamp(1, 16))
-            .unwrap_or(4)
-    });
-    let lanes = lanes.min(docs.len().max(1));
-    let lanes = lanes.max(1);
+    let lanes = args
+        .lanes
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get().clamp(1, 16))
+                .unwrap_or(4)
+        })
+        .min(docs.len().max(1))
+        .max(1);
     let index = Index::with_lanes(schema, analyzer.clone(), args.k1, args.b, lanes);
     let mut chunk: Vec<Document> = Vec::with_capacity(args.commit_every);
     for text in &docs {
@@ -158,6 +162,22 @@ fn main() -> Result<()> {
         index.num_docs(),
         index.num_segments()
     );
+    if args.serve {
+        let index = index;
+        let bind = args.bind.clone();
+        match zap::server::serve(index, &bind, &SHUTDOWN) {
+            Ok(addr) => eprintln!("[zap serving] http://{addr}"),
+            Err(e) => {
+                eprintln!("[zap serve] {e}");
+                std::process::exit(2);
+            }
+        }
+        // block until shutdown
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        return Ok(());
+    }
     for line in std::io::stdin().lock().lines() {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
