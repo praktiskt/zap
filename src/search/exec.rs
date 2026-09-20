@@ -61,12 +61,6 @@ impl Ctx<'_> {
     }
 }
 
-impl Ctx<'_> {
-    pub fn thr(&self) -> f32 {
-        (self.threshold)()
-    }
-}
-
 fn glob_match(term: &str, pat: &[char]) -> bool {
     let t: Vec<char> = term.chars().collect();
     let n = t.len();
