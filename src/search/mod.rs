@@ -118,63 +118,110 @@ pub fn complement(rb: &RoaringBitmap, cap: u32) -> RoaringBitmap {
     &full - rb
 }
 
-/// threshold + bounded top-k collection
+use std::cmp::Reverse;
+
+/// threshold + bounded top-k (binary min-heap)
 pub struct TopK {
-    hits: Vec<(f32, DocAddr)>,
+    heap: std::collections::BinaryHeap<Reverse<HitKey>>,
     k: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HitKey {
+    score_bits: u32,
+    addr: DocAddr,
+}
+
+impl HitKey {
+    fn from(score: f32, addr: DocAddr) -> Self {
+        // total-order mapping of f32 bits for heap ordering; ties by addr
+        let bits = if score < 0.0 {
+            !score.to_bits()
+        } else {
+            score.to_bits() ^ 0x8000_0000
+        };
+        Self {
+            score_bits: bits,
+            addr,
+        }
+    }
+}
+
+impl PartialOrd for HitKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HitKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score_bits
+            .cmp(&other.score_bits)
+            .then_with(|| self.addr.cmp(&other.addr))
+    }
 }
 
 impl TopK {
     pub fn new(k: usize) -> Self {
         Self {
-            hits: Vec::new(),
+            heap: std::collections::BinaryHeap::with_capacity(k + 1),
             k,
         }
     }
 
     pub fn threshold(&self) -> f32 {
-        if self.hits.len() < self.k {
-            f32::MIN
-        } else {
-            self.hit_min().0
+        match self.heap.peek() {
+            Some(Reverse(h)) if self.heap.len() >= self.k => bit_reverse(h.score_bits),
+            _ => f32::MIN,
         }
-    }
-
-    fn hit_min(&self) -> (f32, DocAddr) {
-        *self
-            .hits
-            .iter()
-            .min_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.cmp(&y.1)))
-            .unwrap()
     }
 
     pub fn push(&mut self, addr: DocAddr, score: f32) {
         if self.k == 0 {
             return;
         }
-        if self.hits.len() < self.k {
-            self.hits.push((score, addr));
+        let entry = HitKey::from(score, addr);
+        if self.heap.len() < self.k {
+            self.heap.push(Reverse(entry));
             return;
         }
-        let m = self.hit_min();
-        if score > m.0 || (score == m.0 && addr < m.1) {
-            let i = self
-                .hits
-                .iter()
-                .enumerate()
-                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0;
-            self.hits[i] = (score, addr);
+        let Some(Reverse(min)) = self.heap.peek() else {
+            return;
+        };
+        if entry.score_bits > min.score_bits
+            || (entry.score_bits == min.score_bits && addr < min.addr)
+        {
+            self.heap.pop();
+            self.heap.push(Reverse(entry));
         }
     }
 
     pub fn into_sorted(mut self) -> Vec<SearchHit> {
-        self.hits
-            .sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        self.hits
-            .into_iter()
-            .map(|(score, addr)| SearchHit { addr, score })
-            .collect()
+        let mut hits: Vec<SearchHit> = self
+            .heap
+            .drain()
+            .map(|Reverse(h)| SearchHit {
+                addr: h.addr,
+                score: f32::from_bits(if h.score_bits < 0x8000_0000 {
+                    !h.score_bits
+                } else {
+                    h.score_bits ^ 0x8000_0000
+                }),
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.addr.cmp(&b.addr))
+        });
+        hits
+    }
+}
+
+fn bit_reverse(bits: u32) -> f32 {
+    if bits < 0x8000_0000 {
+        f32::from_bits(!bits)
+    } else {
+        f32::from_bits(bits ^ 0x8000_0000)
     }
 }

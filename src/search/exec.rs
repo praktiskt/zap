@@ -235,12 +235,12 @@ fn eval_allowed(
 }
 
 fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
-    let mut v = vec![t.to_string()];
     let stemmed = ctx.analyzer.stem_word(t);
-    if !v.contains(&stemmed) {
-        v.insert(0, stemmed);
+    if stemmed == t {
+        vec![t.to_string()]
+    } else {
+        vec![stemmed, t.to_string()]
     }
-    v
 }
 
 /// score only docs inside the bitmap
