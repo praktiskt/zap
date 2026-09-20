@@ -125,16 +125,21 @@ pub fn eval(
         }
         Node::Prefix(p) | Node::Wildcard(p) => {
             let prefix = matches!(node, Node::Prefix(_));
-            let pattern: Vec<char> = p.chars().collect();
             let mut acc = DocScores::default();
             for fid in scope_ids(scope, ctx) {
-                let pairs = if prefix {
-                    seg.stream_prefix(fid, p, MAX_EXPANSIONS)
+                // leading literal segment bounds the FST range; remaining glob chars filter
+                let head_end = if prefix {
+                    p.len()
                 } else {
-                    // wildcards in the middle of the term: keep the glob sweep (rare)
-                    let pat = pattern.clone();
-                    into_pairs(seg.stream_terms(fid), move |t| glob_match(t, &pat))
+                    p.find('*').unwrap_or(p.len())
                 };
+                let head = &p[..head_end];
+                let pattern: Vec<char> = p.chars().collect();
+                let pat = pattern.clone();
+                let mut pairs = seg.stream_prefix(fid, head, MAX_EXPANSIONS);
+                if !prefix {
+                    pairs.retain(|(t, _)| glob_match(t, &pat));
+                }
                 let ls = leaf_score(seg, ctx, fid, &pairs, 0);
                 acc = crate::search::union(&acc, &ls);
             }
