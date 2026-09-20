@@ -25,11 +25,11 @@ impl<'a> TermCursor<'a> {
         self.r.seek_to(target);
     }
 
-    /// positions of current doc; consumes the doc (cursor moves past it)
-    fn take_positions(&mut self) -> Vec<u32> {
-        let pos = self.r.peek_positions().unwrap_or_default();
+    /// positions of current doc into `buf` (reused across docs); consumes the doc
+    fn drain_positions(&mut self, buf: &mut Vec<u32>) {
+        buf.clear();
+        self.r.peek_positions_into(buf);
         self.r.advance();
-        pos
     }
 }
 
@@ -84,6 +84,8 @@ pub fn phrase_scores(
     }
     let mut cursors: Vec<TermCursor> = infos.iter().map(|i| TermCursor::new(i, blob)).collect();
     let mut out = DocScores::default();
+    // position buffers reused across doc rounds (no allocs in the hot loop)
+    let mut lists: Vec<Vec<u32>> = cursors.iter().map(|_| Vec::new()).collect();
     loop {
         // current max doc across cursors; exhaustion ends intersection
         let mut any_none = false;
@@ -114,7 +116,9 @@ pub fn phrase_scores(
             }
         }
         if all_eq {
-            let lists: Vec<Vec<u32>> = cursors.iter_mut().map(|c| c.take_positions()).collect();
+            for (c, l) in cursors.iter_mut().zip(lists.iter_mut()) {
+                c.drain_positions(l);
+            }
             if let Some(span) = min_span(&lists, slop) {
                 let bonus = phrase_boost / (1.0 + span as f32);
                 out.ids.push(hi);

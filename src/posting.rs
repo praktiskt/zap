@@ -239,10 +239,35 @@ impl<'a> PostingReader<'a> {
         self.peeked.as_ref().map(|_| self.docidx - 1)
     }
 
-    /// positions of the next un-consumed doc (the peeked one; does not consume)
-    pub fn peek_positions(&self) -> Option<Vec<u32>> {
-        self.peeked?;
-        self.positions(self.docidx - 1)
+    /// positions encoded per doc run (varint count then gaps)
+    pub fn positions_into(&self, docidx: usize, buf: &mut Vec<u32>) {
+        buf.clear();
+        let pos = self.posoff_start + docidx * 4;
+        let r = |i: usize| -> u32 {
+            u32::from_le_bytes(self.blob[pos + i * 4..pos + i * 4 + 4].try_into().unwrap())
+        };
+        let s = r(0) as usize;
+        let e = r(1) as usize;
+        let run = &self.blob[self.pos_start + s..self.pos_start + e];
+        let (count, mut p) = read_varint(run, 0);
+        buf.reserve(count as usize);
+        let mut prev = 0u32;
+        for _ in 0..count {
+            let (d, n) = read_varint(run, p);
+            p += n;
+            prev += d;
+            buf.push(prev);
+        }
+    }
+
+    /// positions of the peeked doc into `buf` reused buffer (does not consume)
+    pub fn peek_positions_into(&self, buf: &mut Vec<u32>) -> bool {
+        if self.peeked.is_none() {
+            return false;
+        }
+        let docidx = self.docidx - 1;
+        self.positions_into(docidx, buf);
+        true
     }
 
     /// gallop to the first doc >= target; `peek()` then yields that doc
