@@ -51,7 +51,7 @@ fn corpus(n_docs: usize, words_per_doc: usize) -> Vec<String> {
     out
 }
 
-fn ingest(c: &mut Criterion) {
+fn ingest_lanes(c: &mut Criterion) {
     let mut g = c.benchmark_group("ingest");
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2))
@@ -66,12 +66,12 @@ fn ingest(c: &mut Criterion) {
                 let mut schema = Schema::default();
                 schema.add_text("text", 1.0);
                 let analyzer = Analyzer::new(AnalyzerConf::default());
-                let index = Index::new(schema, analyzer, 1.2, 0.75);
-                for d in docs {
-                    index
-                        .add_document(&Document::new().text("text", d.clone()))
-                        .unwrap();
-                }
+                let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 8);
+                let owned: Vec<Document> = docs
+                    .iter()
+                    .map(|d| Document::new().text("text", d.clone()))
+                    .collect();
+                index.add_documents(owned).unwrap();
                 index.commit();
             });
         });
@@ -210,16 +210,19 @@ fn build_multi_segment_len(n: usize, commits: usize, words: usize) -> Arc<Index>
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf::default());
-    let index = Index::new(schema, analyzer, 1.2, 0.75);
+    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 8);
     let docs = corpus(n, words);
     let per = (n / commits.max(1)).max(1);
-    for (i, d) in docs.iter().enumerate() {
-        index
-            .add_document(&Document::new().text("text", d.clone()))
-            .unwrap();
-        if i % per == per - 1 {
+    let mut slice: Vec<Document> = Vec::with_capacity(n);
+    for d in docs {
+        slice.push(Document::new().text("text", d));
+        if slice.len() == per {
+            index.add_documents(std::mem::take(&mut slice)).unwrap();
             index.commit();
         }
+    }
+    if !slice.is_empty() {
+        index.add_documents(slice).unwrap();
     }
     index.commit();
     index
@@ -227,7 +230,7 @@ fn build_multi_segment_len(n: usize, commits: usize, words: usize) -> Arc<Index>
 
 criterion_group!(
     benches,
-    ingest,
+    ingest_lanes,
     queries,
     topk_collect,
     query_scale,

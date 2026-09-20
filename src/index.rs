@@ -39,15 +39,31 @@ pub struct Index {
 }
 
 struct IndexInner {
-    hot: SegmentBuilder,
+    /// per-lane builders (round-robin docid partitioning for parallel ingest)
+    hot: Vec<SegmentBuilder>,
+    next_lane: usize,
     segments: Vec<Arc<SegmentReader>>,
     generation: u64,
 }
 
 impl Index {
     pub fn new(schema: Schema, analyzer: Arc<Analyzer>, k1: f32, b: f32) -> Arc<Self> {
+        Self::with_lanes(schema, analyzer, k1, b, 1)
+    }
+
+    /// parallel ingest: docs are round-robined across `lanes` builders; commit freezes in parallel
+    pub fn with_lanes(
+        schema: Schema,
+        analyzer: Arc<Analyzer>,
+        k1: f32,
+        b: f32,
+        lanes: usize,
+    ) -> Arc<Self> {
         let schema = Arc::new(schema);
-        let hot = SegmentBuilder::new(schema.clone(), analyzer.clone());
+        let lanes = lanes.max(1);
+        let hot = (0..lanes)
+            .map(|_| SegmentBuilder::new(schema.clone(), analyzer.clone()))
+            .collect();
         Arc::new(Self {
             schema,
             analyzer,
@@ -60,10 +76,15 @@ impl Index {
             }),
             inner: Mutex::new(IndexInner {
                 hot,
+                next_lane: 0,
                 segments: Vec::new(),
                 generation: 0,
             }),
         })
+    }
+
+    pub fn lane_count(&self) -> usize {
+        self.inner.lock().unwrap().hot.len()
     }
 
     pub fn schema(&self) -> &Schema {
@@ -88,25 +109,65 @@ impl Index {
 
     pub fn add_document(&self, doc: &Document) -> Result<(), IndexError> {
         let mut g = self.inner.lock().unwrap();
-        g.hot
+        let lane = g.next_lane % g.hot.len();
+        g.next_lane += 1;
+        g.hot[lane]
             .add_document(doc)
             .map(|_| ())
             .map_err(IndexError::UnknownField)
     }
 
+    /// parallel batch ingest: docs are chunked into lanes and tokenized/frozen concurrently
+    pub fn add_documents(&self, docs: Vec<Document>) -> Result<(), IndexError> {
+        use rayon::prelude::*;
+        let mut g = self.inner.lock().unwrap();
+        let lanes = g.hot.len().max(1);
+        let chunk = docs.len().div_ceil(lanes).max(1);
+        let mut chunks: Vec<Vec<Document>> = Vec::with_capacity(g.hot.len());
+        for chunk in docs.chunks(chunk) {
+            chunks.push(chunk.to_vec());
+        }
+        while chunks.len() < g.hot.len() {
+            chunks.push(Vec::new());
+        }
+        let errors: Vec<Option<String>> = {
+            let builders: &mut Vec<SegmentBuilder> = &mut g.hot;
+            builders
+                .par_iter_mut()
+                .zip(chunks.into_par_iter())
+                .map(|(b, docs)| {
+                    let first_err = docs.iter().find_map(|d| b.add_document(d).err());
+                    first_err
+                })
+                .collect()
+        };
+        for e in errors.into_iter().flatten() {
+            return Err(IndexError::UnknownField(e));
+        }
+        Ok(())
+    }
+
     pub fn commit(&self) {
         let mut g: std::sync::MutexGuard<'_, IndexInner> = self.inner.lock().unwrap();
-        if g.hot.num_docs == 0 {
+        if g.hot.iter().all(|h| h.num_docs == 0) {
             return;
         }
-        let builder = std::mem::replace(
-            &mut g.hot,
-            SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()),
-        );
-        let seg = builder.freeze();
+        // swap in fresh builders; freeze the hot ones in parallel
+        let frozen = std::mem::take(&mut g.hot);
+        g.hot = (0..frozen.len())
+            .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
+            .collect();
+        let new_segs: Vec<Arc<SegmentReader>> = {
+            use rayon::prelude::*;
+            frozen
+                .into_par_iter()
+                .filter_map(|b| (b.num_docs > 0).then(|| Arc::new(b.freeze())))
+                .collect()
+        };
         let mut segs = std::mem::take(&mut g.segments);
-        segs.push(Arc::new(seg));
-        if segs.len() >= MAX_SEGMENTS {
+        segs.extend(new_segs);
+        let lanes = g.hot.len().max(1);
+        if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
             let merged = merge_segments(&segs, self.schema.num_fields());
             segs = vec![Arc::new(merged)];
         }
