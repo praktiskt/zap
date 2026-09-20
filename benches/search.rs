@@ -171,7 +171,7 @@ fn doc_length(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    for wl in [100usize, 1000, 5000] {
+    for wl in [100usize, 1000, 5000, 20000] {
         let docs = corpus(1000, wl);
         g.throughput(Throughput::Bytes(
             docs.iter().map(|s| s.len() as u64).sum::<u64>(),
@@ -184,18 +184,25 @@ fn doc_length(c: &mut Criterion) {
                     let mut schema = Schema::default();
                     schema.add_text("text", 1.0);
                     let analyzer = Analyzer::new(AnalyzerConf::default());
-                    let index = Index::new(schema, analyzer, 1.2, 0.75);
-                    for d in docs {
-                        index
-                            .add_document(&Document::new().text("text", d.clone()))
-                            .unwrap();
+                    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 8);
+                    let owned: Vec<Document> = docs
+                        .iter()
+                        .map(|d| Document::new().text("text", d.clone()))
+                        .collect();
+                    let per = owned.len().div_ceil(10usize.max(1));
+                    for ch in owned.chunks(per) {
+                        index.add_documents(ch.to_vec()).unwrap();
+                        index.commit();
                     }
-                    index.commit();
                 });
             },
         );
         let ix = build_multi_segment_len(1000, 10, wl);
-        for (tag, q) in [("hot_term", "fox"), ("phrase", "\"winter storm\"")] {
+        for (tag, q) in [
+            ("hot_term", "fox"),
+            ("phrase", "\"winter storm\""),
+            ("rare_term", "quixotic"),
+        ] {
             g.bench_with_input(
                 BenchmarkId::new(format!("query_{wl}w"), tag),
                 tag,
