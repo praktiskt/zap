@@ -24,3 +24,7 @@ proptest = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+[[bench]]
+name = "search"
+harness = false
+
