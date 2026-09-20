@@ -275,13 +275,3 @@ fn filter_out(ds: &DocScores, excl: &[RoaringBitmap]) -> DocScores {
     out
 }
 
-fn into_pairs(
-    terms: Vec<(String, TermInfo)>,
-    pred: impl Fn(&str) -> bool,
-) -> Vec<(String, TermInfo)> {
-    terms
-        .into_iter()
-        .filter(|(t, _)| pred(t))
-        .take(MAX_EXPANSIONS)
-        .collect()
-}
