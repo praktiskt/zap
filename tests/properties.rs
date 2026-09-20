@@ -164,6 +164,26 @@ fn dense_topk(
     col.into_sorted()
 }
 
+fn dense_topk(
+    node: &zap::query::Node,
+    seg: &zap::segment::SegmentReader,
+    ctx: &Ctx,
+    k: usize,
+) -> Vec<SearchHit> {
+    let ds = eval_allowed(node, None, seg, ctx, None);
+    let mut col = TopK::new(k);
+    for (i, doc) in ds.ids.iter().enumerate() {
+        col.push(
+            DocAddr {
+                segment: 0,
+                docid: *doc,
+            },
+            ds.scores[i],
+        );
+    }
+    col.into_sorted()
+}
+
 fn wand_topk(
     node: &zap::query::Node,
     seg: &zap::segment::SegmentReader,
