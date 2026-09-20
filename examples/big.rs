@@ -34,9 +34,7 @@ fn main() {
         }
         chunk.push(Document::new().text("text", s));
         if chunk.len() == 50_000 {
-            index
-                .add_documents(std::mem::take(&mut chunk))
-                .unwrap();
+            index.add_documents(std::mem::take(&mut chunk)).unwrap();
             index.commit();
         }
     }

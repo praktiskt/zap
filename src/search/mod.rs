@@ -75,6 +75,19 @@ pub fn intersect(a: &DocScores, b: &DocScores) -> DocScores {
 
 /// union two ascending series, summing scores on shared docs
 pub fn union(a: &DocScores, b: &DocScores) -> DocScores {
+    // empty side: the other wins outright (skip alloc + merge)
+    if a.is_empty() {
+        let mut out = DocScores::default();
+        out.ids.extend_from_slice(&b.ids);
+        out.scores.extend_from_slice(&b.scores);
+        return out;
+    }
+    if b.is_empty() {
+        let mut out = DocScores::default();
+        out.ids.extend_from_slice(&a.ids);
+        out.scores.extend_from_slice(&a.scores);
+        return out;
+    }
     let mut out = DocScores::default();
     out.ids.reserve(a.len() + b.len());
     out.scores.reserve(a.len() + b.len());
