@@ -148,13 +148,14 @@ pub fn freeze_parts(
     let mut blob: Vec<u8> = Vec::new();
     let mut infos: Vec<TermInfo> = Vec::new();
     let mut fsts = Vec::with_capacity(postings.len());
-    for terms in &postings {
+    for (fid, terms) in postings.iter().enumerate() {
+        let norms = field_norms.get(fid).map(|v| v.as_slice());
         let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
         // sorted by term for the FST (HashMap keeps insertion order)
         let mut sorted: Vec<(&String, &PostingData)> = terms.iter().collect();
         sorted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         for (term, data) in sorted {
-            let info = crate::posting::FrozenPosting::encode_to(data.freeze(), &mut blob);
+            let info = data.freeze(norms).encode_to(&mut blob);
             let ordinal = infos.len() as u64;
             map_builder.insert(term.as_bytes(), ordinal).unwrap();
             infos.push(info);

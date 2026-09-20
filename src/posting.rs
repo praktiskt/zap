@@ -62,22 +62,52 @@ impl PostingData {
         self.docids.is_empty()
     }
 
-    pub fn freeze(&self) -> FrozenPosting {
-        // R16: interleaved stream: [delta_i][tf_i] per doc, one cursor
-        let mut docids = Vec::with_capacity(self.len() * 6);
-        let mut skips = Vec::new();
+    pub fn freeze(&self, norms: Option<&[u16]>) -> FrozenPosting {
+        // R16: interleaved [delta_i][tf_i] per doc, one cursor.
+        // WAND: anchors carry per-block max tf + min doc len for score-bound pruning.
+        let n = self.len();
+        let mut docids = Vec::with_capacity(n * 6);
+        let mut byte_offs: Vec<u32> = Vec::with_capacity(n + 1); // doc cursor byte offsets
         let mut prev = 0u32;
         for (docidx, &d) in self.docids.iter().enumerate() {
-            if docidx % SKIP_STEP == 0 {
-                // anchor semantics: prev_docid BEFORE this doc + cursor at this doc's delta
-                skips.extend_from_slice(&prev.to_le_bytes());
-                skips.extend_from_slice(&(docids.len() as u32).to_le_bytes());
-                skips.extend_from_slice(&(docids.len() as u32).to_le_bytes());
-            }
+            byte_offs.push(docids.len() as u32);
             let delta = d - prev;
             prev = d;
             write_varint(&mut docids, delta);
             write_varint(&mut docids, self.tfs[docidx]);
+        }
+        // skip anchors: per 128 docs, block [bstart, bend) stats
+        let mut skips = Vec::new();
+        for bstart in (0..n).step_by(SKIP_STEP) {
+            let bend = (bstart + SKIP_STEP).min(n);
+            let prev_docid = if bstart == 0 {
+                0u32
+            } else {
+                self.docids[bstart - 1]
+            };
+            let tf_max = self.tfs[bstart..bend].iter().max().copied().unwrap_or(1);
+            let len_min = match norms {
+                Some(ns) => {
+                    let mut lo = u16::MAX;
+                    for &docid in &self.docids[bstart..bend] {
+                        if let Some(len) = ns.get(docid as usize) {
+                            if *len < lo {
+                                lo = *len;
+                            }
+                        }
+                    }
+                    if lo == u16::MAX {
+                        0
+                    } else {
+                        lo as u32
+                    }
+                }
+                None => 0,
+            };
+            skips.extend_from_slice(&prev_docid.to_le_bytes());
+            skips.extend_from_slice(&byte_offs[bstart].to_le_bytes());
+            skips.extend_from_slice(&tf_max.to_le_bytes());
+            skips.extend_from_slice(&len_min.to_le_bytes());
         }
         let tfs: Vec<u8> = Vec::new();
         let mut pos = Vec::new();
@@ -104,8 +134,8 @@ impl PostingData {
 
 /// docs between skip anchors
 const SKIP_STEP: usize = 128;
-/// anchors store u32 docid + u32 docid-byte + u32 tf-byte
-const SKIP_ENTRY_BYTES: usize = 12;
+/// anchors store u32 prev_docid + u32 cursor_off + u32 block_max_tf + u32 block_min_len
+const SKIP_ENTRY_BYTES: usize = 16;
 
 /// serialized form of one posting list
 pub struct FrozenPosting {
@@ -297,7 +327,7 @@ impl<'a> PostingReader<'a> {
             return;
         }
         // binary search: last anchor index with anchor docid <= target; forward-only hint
-        let anchor = |i: usize| u32::from_le_bytes(skips[i * 12..i * 12 + 4].try_into().unwrap());
+        let anchor = |i: usize| u32::from_le_bytes(skips[i * 16..i * 16 + 4].try_into().unwrap());
         let (mut lo, mut hi) = (self.anchor_lo.min(n.saturating_sub(1)), n);
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
@@ -314,9 +344,9 @@ impl<'a> PostingReader<'a> {
         // anchor stores absolute byte offsets within each section (measured from section start)
         let a_docid = anchor(lo);
         let a_docid_off =
-            u32::from_le_bytes(skips[lo * 12 + 4..lo * 12 + 8].try_into().unwrap()) as usize;
+            u32::from_le_bytes(skips[lo * 16 + 4..lo * 16 + 8].try_into().unwrap()) as usize;
         let a_tf_off =
-            u32::from_le_bytes(skips[lo * 12 + 8..lo * 12 + 12].try_into().unwrap()) as usize;
+            u32::from_le_bytes(skips[lo * 16 + 8..lo * 16 + 12].try_into().unwrap()) as usize;
         // rebuild cursor offsets from the section bases stored in ctor
         self.docid_c = self.docids_base + a_docid_off;
         let _ = a_tf_off; // single interleaved cursor; tf offset folds into docid cursor
@@ -423,7 +453,7 @@ mod tests {
         data.add(9, 1, vec![3]);
         data.add(1000, 3, vec![1, 4, 9]);
         let mut blob = Vec::new();
-        let info = data.freeze().encode_to(&mut blob);
+        let info = data.freeze(None).encode_to(&mut blob);
         assert_eq!(info.df, 3);
 
         let mut r = PostingReader::new(&info, &blob);
@@ -444,7 +474,7 @@ mod tests {
             data.add(i * 7, 1, vec![i]);
         }
         let mut blob = Vec::new();
-        let info = data.freeze().encode_to(&mut blob);
+        let info = data.freeze(None).encode_to(&mut blob);
         let want = |target: u32| -> u32 { target.div_ceil(7) * 7 };
         // docs are i*7 for i in 0..600 => last doc = 4193
         let mut r = PostingReader::new(&info, &blob);
