@@ -202,7 +202,12 @@ pub fn eval_allowed(
             acc
         }
         Node::And(items) => {
-            // legacy vector scoring (R3 bitmap-first probe scored ~2.4x worse on 2-term AND; perf-reject)
+            // R12: streaming two-term AND fast path — the smaller posting drives =
+            // galloping seeks on the other; only matches get scored
+            if let Some(ds) = and_two_terms(items, scope, seg, ctx, allowed) {
+                return ds;
+            }
+            // legacy: stream intersect of per-positive scored arrays
             let mut positives: Vec<&Node> = Vec::new();
             let mut excluded: Vec<RoaringBitmap> = Vec::new();
             for it in items {
@@ -232,6 +237,96 @@ pub fn eval_allowed(
             }
         }
     }
+}
+
+/// fast path: exactly one Term positive per side (`a AND b`), no exclusion, probe walk
+fn and_two_terms(
+    items: &[Node],
+    scope: Option<u32>,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    allowed: Option<&roaring::RoaringBitmap>,
+) -> Option<DocScores> {
+    if items.len() != 2 {
+        return None;
+    }
+    // both children plain Terms with a single stem variant?
+    let mut halves: [Option<(u32, String, TermInfo)>; 2] = [None, None];
+    for (i, it) in items.iter().enumerate() {
+        let Node::Term(t) = it else { return None };
+        let mut variant: Option<(u32, String, TermInfo)> = None;
+        for fid in scope_ids(scope, ctx) {
+            for st in stem_variants(ctx, t) {
+                if let Some(info) = seg.term(fid, &st) {
+                    if variant.is_none() {
+                        variant = Some((fid, st.clone(), info));
+                    } else {
+                        // multi-field / multi-stem term: too general for the walk
+                        return None;
+                    }
+                }
+            }
+        }
+        halves[i] = variant;
+    }
+    let Some(first) = halves[0].clone() else {
+        return None;
+    };
+    let Some(second) = halves[1].clone() else {
+        return None;
+    };
+
+    // caller prefilter: intersect child docids into a bitmap first if present
+
+    let df0 = first.2.df;
+    let df1 = first.2.df;
+    let idf0 = bm25_idf(
+        ctx.stats.df_of(first.0, &first.1, df0),
+        ctx.stats.total_docs,
+    );
+    let idf1 = bm25_idf(
+        ctx.stats.df_of(second.0, &second.1, df1),
+        ctx.stats.total_docs,
+    );
+
+    // drive the smaller posting; gallop the other
+    let drive = if df0 <= df1 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let (a, b) = drive;
+    let mut ra = seg.reader(&a.2);
+    let mut rb = seg.reader(&b.2);
+    let norms_a = seg.norms(a.0);
+    let norms_b = seg.norms(b.0);
+    let avg = |fid: u32| ctx.stats.avg_of(fid);
+    let mut out = DocScores::default();
+    while let Some((doc, tf_a)) = ra.advance() {
+        if let Some(al) = allowed {
+            if !al.contains(doc) {
+                continue;
+            }
+        }
+        rb.seek_to(doc);
+        let Some((d2, tf_b)) = rb.peek() else {
+            continue;
+        };
+        if d2 != doc {
+            continue;
+        }
+        let w_a = idf0 * (tf_a as f32 * (ctx.params.k1 + 1.0))
+            / (tf_a as f32
+                + ctx.params.k1
+                    * crate::search::term::norm_ratio(norms_a, doc, avg(a.0), ctx.params.b));
+        let w_b = idf1 * (tf_b as f32 * (ctx.params.k1 + 1.0))
+            / (tf_b as f32
+                + ctx.params.k1
+                    * crate::search::term::norm_ratio(norms_b, doc, avg(b.0), ctx.params.b));
+        out.ids.push(doc);
+        out.scores.push(w_a + w_b);
+    }
+    Some(out)
 }
 
 fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
