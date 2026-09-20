@@ -51,6 +51,27 @@ Query loop command set: terms, flags `-k` top-k, `--k1/--b` BM25 params, `--no-s
 - `cargo bench` matrıx: scale (100/1k/10k/100k docs × term/phrase/AND), doc-length sweep
  (100/1k/5k words), ingest throughput (~8 MB/s, release)
 
+## Benchmarks (release, criterion, current)
+
+Query latency (top-10, 10k doc corpus, 10 segments):
+- single hot term `fox`: **63 µs**
+- `fox AND dog`: 199 µs
+- 3-term OR: 247 µs
+- `"quick brown fox"` phrase: 247 µs
+- wildcard `f*zz*`: 55 µs
+- fuzzy `fox~1`: 151 µs
+- exact rare term: 0.65 µs
+
+Scale (term/phrase/AND, 100k docs): 1.34 ms / 4.5 ms / 1.33 ms.
+1M-doc corpus (8 lanes): built via `zap/examples/big.rs`, 1M-doc ingest ≈ 16.6 s, top-10 query 0.55 ms (df-smeared rare term).
+
+Doc length (1k docs): ingest 100w 41 ms → 20kw 3.1 s (parallel lanes), rare-term query flat ~5 µs
+at every length; phrase scales with doc length (23 µs @100w → 2.2 ms @20kw).
+
+Ingest: 10k×200w docs in 338 ms (~60 MB/s docstore, 8 lanes); 1M×50w in 16.6 s (60k docs/s).
+
+Rejected micro-optimizations live in git history (`perf-reject:` commits): bitmap-first AND
+rescoring, group-varint decode at current sizes.
 ## Roadmap
 
 - Segment-level roaring bitmaps + block-parallel terms for faster scale brittleness
