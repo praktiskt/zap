@@ -83,16 +83,21 @@ fn build_multi_segment(n: usize, commits: usize) -> Arc<Index> {
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf::default());
-    let index = Index::new(schema, analyzer, 1.2, 0.75);
-    let docs = corpus(n, 200);
-    let per = n / commits.max(1);
-    for (i, d) in docs.iter().enumerate() {
-        index
-            .add_document(&Document::new().text("text", d.clone()))
-            .unwrap();
-        if i % per == per - 1 {
+    let lanes = 8.max(1);
+    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, lanes);
+    let words = if n >= 1_000_000 { 50 } else { 200 };
+    let docs = corpus(n, words);
+    let per = (n / commits.max(1)).max(1);
+    let mut chunk: Vec<Document> = Vec::with_capacity(per);
+    for d in docs {
+        chunk.push(Document::new().text("text", d));
+        if chunk.len() == per {
+            index.add_documents(std::mem::take(&mut chunk)).unwrap();
             index.commit();
         }
+    }
+    if !chunk.is_empty() {
+        index.add_documents(chunk).unwrap();
     }
     index.commit();
     index
@@ -145,12 +150,15 @@ fn query_scale(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
+    // 1M tier runs via examples/big.rs (criterion OOM-safe), see bench logs
     for (n, per_commit) in [
         (100usize, 100usize),
         (1000, 250),
         (10000, 1000),
         (100000, 5000),
     ] {
+        let per = per_commit.max(1);
+        let _ = per;
         let ix = build_multi_segment(n, per_commit.max(1));
         for (tag, q) in [
             ("term", "fox"),
