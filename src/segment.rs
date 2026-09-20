@@ -215,7 +215,7 @@ impl SegmentReader {
                 break;
             }
         }
-        let mut rb = fst.range().ge(p);
+        let rb = fst.range().ge(p);
         let mut st = if upper.is_empty() {
             rb.into_stream()
         } else {

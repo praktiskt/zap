@@ -56,7 +56,7 @@ fn ingest(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2))
         .sample_size(10);
-    for n in [1000 as usize, 10000] {
+    for n in [1000_usize, 10000] {
         let docs = corpus(n, 200);
         g.throughput(Throughput::Bytes(
             docs.iter().map(|s| s.len() as u64).sum::<u64>(),

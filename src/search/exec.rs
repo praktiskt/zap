@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use fst::automaton::{Automaton, Levenshtein};
+use fst::automaton::Levenshtein;
 use roaring::RoaringBitmap;
 
 use crate::analyzer::Analyzer;
