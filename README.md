@@ -51,6 +51,27 @@ Query loop command set: terms, flags `-k` top-k, `--k1/--b` BM25 params, `--no-s
 - `cargo bench` matrıx: scale (100/1k/10k/100k docs × term/phrase/AND), doc-length sweep
  (100/1k/5k words), ingest throughput (~8 MB/s, release)
 
+## HTTP serve mode
+
+```sh
+zap --serve --bind 127.0.0.1:3279 dir/          # load corpus, then serve
+zap --serve --bind 127.0.0.1:3279 --stdin-lines # empty index, ingest via HTTP
+```
+
+| endpoint | method | meaning |
+|---|---|---|
+| `/health` | GET | liveness |
+| `/stats` | GET | docs / segments / generation |
+| `/search?q=..&k=N` | GET | query string search (percent-encoded) |
+| `/search` | POST | `{"q":"..","k":N}` body search |
+| `/ingest` | POST | NDJSON `{"text":..}` lines or a JSON array of them (auto-commit) |
+| `/commit` | POST | explicit segment commit |
+
+Search result shape: `{"results":[{"score":0.71,"id":0,"doc":"text"}],"count":N}`.
+Ingest accepts a 64 MB body per call; docs commit per request. Sockets are plain
+threads (no async runtime) — the engine is CPU-bound sync.
+
+
 ## Benchmarks (release, criterion, current)
 
 Query latency (top-10, 10k doc corpus, 10 segments, block-max WAND):
