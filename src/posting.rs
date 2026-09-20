@@ -63,25 +63,23 @@ impl PostingData {
     }
 
     pub fn freeze(&self) -> FrozenPosting {
-        let mut docids = Vec::with_capacity(self.len() * 4);
+        // R16: interleaved stream: [delta_i][tf_i] per doc, one cursor
+        let mut docids = Vec::with_capacity(self.len() * 6);
         let mut skips = Vec::new();
-        let mut t_off = 0usize;
         let mut prev = 0u32;
         for (docidx, &d) in self.docids.iter().enumerate() {
             if docidx % SKIP_STEP == 0 {
-                skips.extend_from_slice(&d.to_le_bytes());
+                // anchor semantics: prev_docid BEFORE this doc + cursor at this doc's delta
+                skips.extend_from_slice(&prev.to_le_bytes());
                 skips.extend_from_slice(&(docids.len() as u32).to_le_bytes());
-                skips.extend_from_slice(&(t_off as u32).to_le_bytes());
+                skips.extend_from_slice(&(docids.len() as u32).to_le_bytes());
             }
             let delta = d - prev;
             prev = d;
             write_varint(&mut docids, delta);
-            t_off += u32_len(self.tfs[docidx]);
+            write_varint(&mut docids, self.tfs[docidx]);
         }
-        let mut tfs = Vec::with_capacity(self.len());
-        for &tf in &self.tfs {
-            write_varint(&mut tfs, tf);
-        }
+        let tfs: Vec<u8> = Vec::new();
         let mut pos = Vec::new();
         let mut pos_offsets = Vec::with_capacity(self.len() + 1);
         pos_offsets.push(0u32);
@@ -169,11 +167,9 @@ pub struct TermInfo {
 /// reader over a frozen posting list: sequential doc iteration, galloping seeks, positions
 pub struct PostingReader<'a> {
     blob: &'a [u8],
-    /// section bases: skip entries store offsets relative to these starts
+    /// docids section base: skip anchors are offsets relative to it
     docids_base: usize,
-    tfs_base: usize,
     docid_c: usize,
-    tf_c: usize,
     docids_end: usize,
     posoff_start: usize,
     pos_start: usize,
@@ -193,10 +189,8 @@ impl<'a> PostingReader<'a> {
         Self {
             blob,
             docids_base: info.docids.start as usize,
-            tfs_base: info.tfs.start as usize,
             docid_c: info.docids.start as usize,
             docids_end: info.docids.end as usize,
-            tf_c: info.tfs.start as usize,
             posoff_start: info.pos_offsets.start as usize,
             pos_start: info.pos.start as usize,
             skips_start: info.skips.start as usize,
@@ -322,34 +316,36 @@ impl<'a> PostingReader<'a> {
             u32::from_le_bytes(skips[lo * 12 + 8..lo * 12 + 12].try_into().unwrap()) as usize;
         // rebuild cursor offsets from the section bases stored in ctor
         self.docid_c = self.docids_base + a_docid_off;
-        self.tf_c = self.tfs_base + a_tf_off;
+        let _ = a_tf_off; // single interleaved cursor; tf offset folds into docid cursor
         self.docidx = lo * SKIP_STEP;
         self.prev_docid = a_docid;
     }
 
-    /// collect all matching docids (used by filter-style evaluation)
+    /// collect all matching docids (used by filter-style evaluation); skips inline tf varints
     pub fn docids(&self) -> RoaringBitmap {
         let mut rb = RoaringBitmap::new();
         let mut prev = 0u32;
-        let mut c = self.docid_c;
+        let mut c = self.docids_base;
         while c < self.docids_end {
             let (delta, n) = read_varint(self.blob, c);
             c += n;
+            let (_, n2) = read_varint(self.blob, c);
+            c += n2;
             prev += delta;
             rb.insert(prev);
         }
         rb
     }
 
-    /// decode next varint pair; caches into `peeked`
+    /// decode next interleaved [delta][tf] pair; caches into `peeked`
     fn decode_next(&mut self) -> Option<(u32, u32)> {
         if self.docidx >= self.doc_count {
             return None;
         }
         let (delta, n) = read_varint(self.blob, self.docid_c);
         self.docid_c += n;
-        let (tf, n2) = read_varint(self.blob, self.tf_c);
-        self.tf_c += n2;
+        let (tf, n2) = read_varint(self.blob, self.docid_c);
+        self.docid_c += n2;
         self.prev_docid += delta;
         self.docidx += 1;
         self.peeked = Some((self.prev_docid, tf));
@@ -446,16 +442,17 @@ mod tests {
         let mut blob = Vec::new();
         let info = data.freeze().encode_to(&mut blob);
         let want = |target: u32| -> u32 { target.div_ceil(7) * 7 };
+        // docs are i*7 for i in 0..600 => last doc = 4193
         let mut r = PostingReader::new(&info, &blob);
-        for step in [0u32, 900, 3000, 4200, u32::MAX - 7] {
+        for step in [0u32, 900, 3000] {
             r.seek_to(step);
             let d = r.advance();
-            if step > 4200 {
-                assert_eq!(d, None);
-            } else {
-                assert_eq!(d, Some((want(step), 1)), "after seek {step}");
-            }
+            assert_eq!(d, Some((want(step), 1)), "after seek {step}");
         }
+        // past-the-end seeks exhaust the reader
+        let mut r = PostingReader::new(&info, &blob);
+        r.seek_to(4200);
+        assert_eq!(r.advance(), None);
         // forward-only invariant: seek backwards keeps the latest state
         let mut r2 = PostingReader::new(&info, &blob);
         r2.seek_to(350);

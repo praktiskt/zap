@@ -140,7 +140,7 @@ impl Index {
                 })
                 .collect()
         };
-        for e in errors.into_iter().flatten() {
+        if let Some(e) = errors.into_iter().flatten().next() {
             return Err(IndexError::UnknownField(e));
         }
         Ok(())

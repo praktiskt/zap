@@ -20,7 +20,7 @@ fn main() {
     let mut seed: u64 = 0x9E3779B97F4A7C15;
     for i in 0..n {
         let mut s = String::with_capacity(per_doc * 7);
-        for w in 0..per_doc {
+        for _w in 0..per_doc {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
@@ -35,7 +35,7 @@ fn main() {
         chunk.push(Document::new().text("text", s));
         if chunk.len() == 50_000 {
             index
-                .add_documents(std::mem::replace(&mut chunk, Vec::new()))
+                .add_documents(std::mem::take(&mut chunk))
                 .unwrap();
             index.commit();
         }
