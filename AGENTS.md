@@ -13,7 +13,9 @@ In-memory full-text search engine. Performance is the product: search-first, ing
 ## Non-perf rules
 - always cargo fmt + clippy clean before commit
 - integration tests in `tests/`; crate tests in `src/`
+- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10)
 - do not use ad-hoc sed/python for edits unless trivial; prefer dedicated tools when editing files
+- top-k tie ordering across different index builds is NOT stable (heap tie-break by docid/addr): property tests must compare as unordered (score,text) multisets, or filter entries strictly above the kth-score threshold
 
 ## Known perf sensitive spots (from history)
 - prefix/fuzzy: FST range/automaton paths (NOT dict scans — `stream_terms` full scans are perf-reject)
