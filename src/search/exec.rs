@@ -52,17 +52,6 @@ pub struct Ctx<'a> {
     pub analyzer: &'a Analyzer,
 }
 
-fn lev_match(lev: &Levenshtein, term: &str) -> bool {
-    let mut state = lev.start();
-    for b in term.as_bytes() {
-        state = lev.accept(&state, *b);
-        if state.is_none() {
-            return false;
-        }
-    }
-    lev.is_match(&state)
-}
-
 fn glob_match(term: &str, pat: &[char]) -> bool {
     let t: Vec<char> = term.chars().collect();
     let n = t.len();
@@ -121,18 +110,14 @@ pub fn eval(
         }
         Node::Fuzzy { term, distance } => {
             let dist = (*distance as u32).min(2);
-            let lev = match Levenshtein::new(term, dist) {
-                Ok(l) => l,
-                Err(_) => return DocScores::default(),
-            };
             let mut acc = DocScores::default();
             for fid in scope_ids(scope, ctx) {
-                let pairs: Vec<(String, TermInfo)> = seg
-                    .stream_terms(fid)
-                    .into_iter()
-                    .filter(|(t, _)| lev_match(&lev, t))
-                    .take(MAX_EXPANSIONS)
-                    .collect();
+                // fresh automaton ownership per field (moved into the fst walk)
+                let lev = match Levenshtein::new(term, dist) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let pairs: Vec<(String, TermInfo)> = seg.stream_automaton(lev, fid, MAX_EXPANSIONS);
                 let ls = leaf_score(seg, ctx, fid, &pairs, dist);
                 acc = crate::search::union(&acc, &ls);
             }
@@ -143,11 +128,12 @@ pub fn eval(
             let pattern: Vec<char> = p.chars().collect();
             let mut acc = DocScores::default();
             for fid in scope_ids(scope, ctx) {
-                let terms = seg.stream_terms(fid);
-                let pairs: Vec<(String, TermInfo)> = if prefix {
-                    into_pairs(terms, |t| t.starts_with(p))
+                let pairs = if prefix {
+                    seg.stream_prefix(fid, p, MAX_EXPANSIONS)
                 } else {
-                    into_pairs(terms, |t| glob_match(t, &pattern))
+                    // wildcards in the middle of the term: keep the glob sweep (rare)
+                    let pat = pattern.clone();
+                    into_pairs(seg.stream_terms(fid), move |t| glob_match(t, &pat))
                 };
                 let ls = leaf_score(seg, ctx, fid, &pairs, 0);
                 acc = crate::search::union(&acc, &ls);

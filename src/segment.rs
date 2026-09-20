@@ -1,8 +1,12 @@
 //! segment: immutable per-segment inverted index + compressed doc store
+//!
+//! term dictionary: one FST per field (term -> global-info ordinal), enabling
+//! DFA/range queries (prefix, fuzzy, glob) without dict scans.
 
 use std::collections::BTreeMap;
 
-use fst::{Map, MapBuilder, Streamer};
+use fst::automaton::Automaton;
+use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 use crate::analyzer::Analyzer;
@@ -37,7 +41,7 @@ pub struct SegmentBuilder {
     schema: Arc<Schema>,
     analyzer: Arc<Analyzer>,
     pub num_docs: u32,
-    /// field_id -> term -> postings; sorted terms feed the FST directly
+    /// field_id -> term -> postings (textarea feed of sorted terms into each field FST)
     postings: Vec<BTreeMap<String, PostingData>>,
     /// field_id -> doc -> token count
     field_norms: Vec<Vec<u16>>,
@@ -64,14 +68,7 @@ impl SegmentBuilder {
         }
     }
 
-    pub fn sum_field_len(&self, fid: u32) -> u64 {
-        self.field_norms
-            .get(fid as usize)
-            .map(|v| v.iter().map(|x| *x as u64).sum())
-            .unwrap_or(0)
-    }
-
-    /// index + store a document; allocates the segment-local docid
+    /// index + store a document; returns its segment-local docid
     pub fn add_document(&mut self, doc: &Document) -> Result<u32, String> {
         let docid = self.num_docs;
         let block = encode_store(doc, &self.schema)?;
@@ -86,7 +83,7 @@ impl SegmentBuilder {
                     .entry(tok.text.clone())
                     .or_default();
                 if e.docids.last() == Some(&docid) {
-                    // repeated token within the same doc: bump tf, extend positions
+                    // repeated token in the same doc: bump tf, extend positions
                     let last = e.tfs.len() - 1;
                     e.tfs[last] += 1;
                     e.positions
@@ -117,7 +114,8 @@ impl SegmentBuilder {
 
 pub struct SegmentReader {
     pub num_docs: u32,
-    fst: Map<Vec<u8>>,
+    /// per-field term dictionaries; global infos offset base is tracked per field
+    fsts: Vec<Map<Vec<u8>>>,
     infos: Vec<TermInfo>,
     blob: Box<[u8]>,
     pub field_norms: Vec<Box<[u16]>>,
@@ -126,27 +124,27 @@ pub struct SegmentReader {
 
 /// shared by SegmentBuilder::freeze and segment merge
 pub fn freeze_parts(
-    postings: Vec<BTreeMap<String, crate::posting::PostingData>>,
+    postings: Vec<BTreeMap<String, PostingData>>,
     field_norms: Vec<Vec<u16>>,
     store_blocks: Vec<Box<[u8]>>,
     num_docs: u32,
 ) -> SegmentReader {
-    let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
     let mut blob: Vec<u8> = Vec::new();
     let mut infos: Vec<TermInfo> = Vec::new();
-    for (fid, terms) in postings.iter().enumerate() {
+    let mut fsts = Vec::with_capacity(postings.len());
+    for terms in &postings {
+        let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
         for (term, data) in terms {
-            let mut key = (fid as u32).to_be_bytes().to_vec();
-            key.extend_from_slice(term.as_bytes());
             let info = data.freeze().encode_to(&mut blob);
             let ordinal = infos.len() as u64;
-            map_builder.insert(key, ordinal).unwrap();
+            map_builder.insert(term.as_bytes(), ordinal).unwrap();
             infos.push(info);
         }
+        fsts.push(Map::new(map_builder.into_inner().unwrap()).unwrap());
     }
     SegmentReader {
         num_docs,
-        fst: Map::new(map_builder.into_inner().unwrap()).unwrap(),
+        fsts,
         infos,
         blob: blob.into_boxed_slice(),
         field_norms: field_norms
@@ -164,9 +162,8 @@ impl SegmentReader {
     }
 
     pub fn term(&self, fid: u32, term: &str) -> Option<TermInfo> {
-        let mut key = fid.to_be_bytes().to_vec();
-        key.extend_from_slice(term.as_bytes());
-        let ord = self.fst.get(&key)?;
+        let fst = self.fsts.get(fid as usize)?;
+        let ord = fst.get(term)?;
         Some(self.infos[ord as usize].clone())
     }
 
@@ -176,6 +173,79 @@ impl SegmentReader {
 
     pub fn reader(&self, info: &TermInfo) -> PostingReader<'_> {
         PostingReader::new(info, &self.blob)
+    }
+
+    /// exact + fuzzy: DFA-pruned walk over the field's sorted dict
+    pub fn stream_automaton<A>(&self, aut: A, fid: u32, limit: usize) -> Vec<(String, TermInfo)>
+    where
+        A: Automaton,
+        A::State: Clone,
+    {
+        let mut out = Vec::new();
+        let fst = match self.fsts.get(fid as usize) {
+            Some(f) => f,
+            None => return out,
+        };
+        let mut st = fst.search_with_state(aut).into_stream();
+        while let Some((key, ord, _state)) = st.next() {
+            if out.len() >= limit {
+                break;
+            }
+            if let Ok(t) = std::str::from_utf8(key) {
+                out.push((t.to_owned(), self.infos[ord as usize].clone()));
+            }
+        }
+        out
+    }
+
+    /// prefix terms via FST range query [prefix, prefix+1)
+    pub fn stream_prefix(&self, fid: u32, p: &str, limit: usize) -> Vec<(String, TermInfo)> {
+        let mut out = Vec::new();
+        let fst = match self.fsts.get(fid as usize) {
+            Some(f) => f,
+            None => return out,
+        };
+        // upper bound: first string after every key with prefix `p`
+        let mut upper = p.as_bytes().to_vec();
+        while let Some(last) = upper.last_mut() {
+            if *last == u8::MAX {
+                upper.pop();
+            } else {
+                *last += 1;
+                break;
+            }
+        }
+        let mut rb = fst.range().ge(p);
+        let mut st = if upper.is_empty() {
+            rb.into_stream()
+        } else {
+            rb.lt(&upper).into_stream()
+        };
+        while let Some((key, ord)) = st.next() {
+            if out.len() >= limit {
+                break;
+            }
+            if let Ok(t) = std::str::from_utf8(key) {
+                out.push((t.to_owned(), self.infos[ord as usize].clone()));
+            }
+        }
+        out
+    }
+
+    /// plain sorted iteration over one field's dict (merge paths)
+    pub fn stream_terms(&self, fid: u32) -> Vec<(String, TermInfo)> {
+        let mut out = Vec::new();
+        let fst = match self.fsts.get(fid as usize) {
+            Some(f) => f,
+            None => return out,
+        };
+        let mut stream = fst.stream();
+        while let Some((key, ord)) = stream.next() {
+            if let Ok(t) = std::str::from_utf8(key) {
+                out.push((t.to_owned(), self.infos[ord as usize].clone()));
+            }
+        }
+        out
     }
 
     pub fn norms(&self, fid: u32) -> Option<&[u16]> {
@@ -188,23 +258,12 @@ impl SegmentReader {
             .unwrap_or(0)
     }
 
-    /// all (term, info) pairs of one field (merge + term expansion)
-    pub fn stream_terms(&self, fid: u32) -> Vec<(String, TermInfo)> {
-        let mut out = Vec::new();
-        let mut stream = self.fst.stream();
-        while let Some((key, ord)) = stream.next() {
-            if key.len() >= 4 && u32::from_be_bytes(key[..4].try_into().unwrap()) == fid {
-                out.push((
-                    String::from_utf8(key[4..].to_vec()).unwrap(),
-                    self.infos[ord as usize].clone(),
-                ));
-            }
-        }
-        out
+    pub fn num_fields(&self) -> usize {
+        self.fsts.len()
     }
 
-    pub fn num_terms(&self) -> usize {
-        self.infos.len()
+    pub fn num_terms(&self, fid: u32) -> usize {
+        self.fsts.get(fid as usize).map_or(0, |f| f.len())
     }
 
     pub fn stored_doc(&self, docid: u32) -> Option<Vec<(u32, String)>> {
@@ -213,7 +272,7 @@ impl SegmentReader {
     }
 }
 
-/// decompress one stored doc block
+/// decompress one stored doc block: count + TLV(field_id, len, text bytes)
 pub fn read_stored(block: &[u8]) -> Option<Vec<(u32, String)>> {
     let raw = decompress_size_prepended(block).ok()?;
     let n = *raw.first()? as usize;
