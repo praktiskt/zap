@@ -39,6 +39,12 @@ struct Args {
     /// snippet width in chars
     #[arg(long, default_value = "240")]
     snippet: usize,
+    /// parallel ingest lanes (default: cores on this machine)
+    #[arg(long)]
+    lanes: Option<usize>,
+    /// auto-commit every N documents (bounds segment memory)
+    #[arg(long, default_value = "50000")]
+    commit_every: usize,
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -127,9 +133,24 @@ fn main() -> Result<()> {
         stem: !args.no_stem,
         max_token_len: 64,
     });
-    let index = Index::new(schema, analyzer.clone(), args.k1, args.b);
+    let lanes = args.lanes.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get().clamp(1, 16))
+            .unwrap_or(4)
+    });
+    let lanes = lanes.min(docs.len().max(1));
+    let lanes = lanes.max(1);
+    let index = Index::with_lanes(schema, analyzer.clone(), args.k1, args.b, lanes);
+    let mut chunk: Vec<Document> = Vec::with_capacity(args.commit_every);
     for text in &docs {
-        index.add_document(&Document::new().text("text", text.clone()))?;
+        chunk.push(Document::new().text("text", text.clone()));
+        if chunk.len() >= args.commit_every {
+            index.add_documents(std::mem::take(&mut chunk))?;
+            index.commit();
+        }
+    }
+    if !chunk.is_empty() {
+        index.add_documents(chunk)?;
     }
     index.commit();
     eprintln!(
