@@ -145,10 +145,6 @@ fn ctx_of<'a>(index: &'a Arc<Index>, stats: &'a Stats) -> Ctx<'a> {
 }
 
 /// (doc text, score bits, docid)
-fn text_score_bits(fields: Vec<(String, String)>, score: f32, docid: u32) -> (String, String, u32) {
-    (fields[0].1.clone(), score.to_bits().to_string(), docid)
-}
-
 fn dense_topk(
     node: &zap::query::Node,
     seg: &zap::segment::SegmentReader,
