@@ -6,40 +6,29 @@ use crate::search::DocScores;
 /// track one posting stream positionally
 pub struct TermCursor<'a> {
     r: PostingReader<'a>,
-    peeked: Option<(u32, u32)>,
-    idx: usize,
 }
 
 impl<'a> TermCursor<'a> {
     pub fn new(info: &crate::posting::TermInfo, blob: &'a [u8]) -> Self {
-        let mut r = PostingReader::new(info, blob);
-        let peeked = r.advance();
-        Self { r, peeked, idx: 0 }
-    }
-
-    pub fn doc(&self) -> Option<u32> {
-        self.peeked.map(|(d, _)| d)
-    }
-
-    /// stream forward until doc >= target
-    pub fn seek_to(&mut self, target: u32) {
-        while let Some(d) = self.doc() {
-            if d >= target {
-                return;
-            }
-            self.step();
+        Self {
+            r: PostingReader::new(info, blob),
         }
     }
 
-    fn step(&mut self) {
-        self.idx += 1;
-        self.peeked = self.r.advance();
+    /// lazy peek of the cursor's current doc
+    pub fn doc(&mut self) -> Option<u32> {
+        self.r.peek().map(|(d, _)| d)
     }
 
-    /// positions of current doc; advances past it
+    /// gallop forward until doc >= target
+    pub fn seek_to(&mut self, target: u32) {
+        self.r.seek_to(target);
+    }
+
+    /// positions of current doc; consumes the doc (cursor moves past it)
     fn take_positions(&mut self) -> Vec<u32> {
-        let pos = self.r.positions(self.idx).unwrap_or_default();
-        self.step();
+        let pos = self.r.peek_positions().unwrap_or_default();
+        self.r.advance();
         pos
     }
 }
@@ -97,21 +86,34 @@ pub fn phrase_scores(
     let mut out = DocScores::default();
     loop {
         // current max doc across cursors; exhaustion ends intersection
+        let mut any_none = false;
         let mut hi = 0u32;
-        for c in &cursors {
+        for c in cursors.iter_mut() {
             match c.doc() {
                 Some(d) => {
                     if d > hi {
                         hi = d;
                     }
                 }
-                None => return out,
+                None => {
+                    any_none = true;
+                }
             }
+        }
+        if any_none {
+            return out;
         }
         for c in cursors.iter_mut() {
             c.seek_to(hi);
         }
-        if cursors.iter().all(|c| c.doc() == Some(hi)) {
+        let mut all_eq = true;
+        for c in cursors.iter_mut() {
+            if c.doc() != Some(hi) {
+                all_eq = false;
+                break;
+            }
+        }
+        if all_eq {
             let lists: Vec<Vec<u32>> = cursors.iter_mut().map(|c| c.take_positions()).collect();
             if let Some(span) = min_span(&lists, slop) {
                 let bonus = phrase_boost / (1.0 + span as f32);

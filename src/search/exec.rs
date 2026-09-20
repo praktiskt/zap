@@ -274,4 +274,3 @@ fn filter_out(ds: &DocScores, excl: &[RoaringBitmap]) -> DocScores {
     }
     out
 }
-
