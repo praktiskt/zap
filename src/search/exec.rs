@@ -79,12 +79,14 @@ fn glob_match(term: &str, pat: &[char]) -> bool {
     pi == m
 }
 
-fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
-    let stemmed = ctx.analyzer.stem_word(t);
-    if stemmed == t {
-        vec![t.to_string()]
+/// [stemmed?, raw] variants (1 alloc max); used by stem_variants()
+/// (stemmed, raw) iteration alternates; at most 1 alloc; replaces stem_variants()
+fn stem_pair(ctx: &Ctx, t: &str) -> [Option<String>; 2] {
+    let stem = ctx.analyzer.stem_word(t);
+    if stem == t {
+        [Some(stem), None]
     } else {
-        vec![stemmed, t.to_string()]
+        [Some(stem), Some(t.to_string())]
     }
 }
 
@@ -110,11 +112,13 @@ pub fn eval_allowed(
     match node {
         Node::Term(t) => {
             let mut acc = DocScores::default();
-            let stems = stem_variants(ctx, t);
             for fid in scope_ids(scope, ctx) {
-                for st in &stems {
-                    if let Some(info) = seg.term(fid, st) {
-                        let idf = bm25_idf(ctx.stats.df_of(fid, st, info.df), ctx.stats.total_docs);
+                for st in stem_pair(ctx, t).into_iter().flatten() {
+                    if let Some(info) = seg.term(fid, &st) {
+                        let idf = bm25_idf(
+                            ctx.stats.df_of(fid, st.as_str(), info.df),
+                            ctx.stats.total_docs,
+                        );
                         let ts = term_scores_allowed(
                             &info,
                             seg.blob(),
@@ -285,7 +289,7 @@ fn resolve_term_positives(
     };
     let mut out = Vec::new();
     for fid in scope_ids(scope, ctx) {
-        for st in stem_variants(ctx, t) {
+        for st in stem_pair(ctx, t).into_iter().flatten() {
             if let Some(info) = seg.term(fid, &st) {
                 out.push((fid, st, info));
             }
