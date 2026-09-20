@@ -1,14 +1,31 @@
-//! property tests for posting-list invariants (T3: skip anchors, seek, positions)
-//!
-//! random posting data is frozen at SKIP_STEP boundaries; the galloping reader
-//! must agree with the in-memory PostingData for every seek and position lookup.
+//! property tests:
+//! T3: posting skip-anchor/seek/position invariants
+//! T1/T2: block-max WAND streaming == dense evaluation top-k equivalence
+
+use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use zap::posting::{PostingData, PostingReader};
+use zap::analyzer::{Analyzer, AnalyzerConf};
+use zap::index::Index;
+use zap::posting::PostingData;
+use zap::query::parse;
+use zap::schema::{Document, Schema};
+use zap::search::exec::{eval_allowed, eval_term_stream, Ctx, Stats};
+use zap::search::{Bm25Params, DocAddr, SearchHit, TopK};
+
+const WORDS: [&str; 24] = [
+    "fox", "quick", "brown", "jumps", "lazy", "dog", "forest", "river", "mountain", "stone",
+    "winter", "summer", "night", "day", "sun", "cloud", "wind", "rain", "field", "road", "tree",
+    "leaf", "root", "grass",
+];
+
+// ---------- T3: posting skip-anchor invariants ----------
 
 /// random posting data: ascending docids (with small gaps), small tfs, sparse positions
-fn post_data_strategy() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
+// (post_data_strategy replaced by post_data_strategy2)
+
+fn post_data_strategy2() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
     (0usize..64).prop_flat_map(|len| {
         (
             proptest::collection::vec(1u32..400, len),
@@ -29,7 +46,7 @@ fn post_data_strategy() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
 proptest! {
     #[test]
     fn seek_matches_first_ge(
-        (docids, tfs) in post_data_strategy(),
+        (docids, tfs) in post_data_strategy2(),
         target in 0u32..100_000,
     ) {
         prop_assume!(!docids.is_empty());
@@ -39,41 +56,39 @@ proptest! {
         }
         let mut blob = Vec::new();
         let info = data.freeze(None).encode_to(&mut blob);
-        let mut r = PostingReader::new(&info, &blob);
+        let mut r = zap::posting::PostingReader::new(&info, &blob);
 
         let expected = docids.iter().copied().find(|d| *d >= target);
         r.seek_to(target);
-        assert_eq!(r.peek_docid(), expected, "seek_to({target})");
-
-        // repeated seek at the same target is stable
+        assert_eq!(r.peek().map(|(d, _)| d), expected, "seek_to({target})");
+        // repeated seek to the same target keeps the state
         r.seek_to(target);
-        assert_eq!(r.peek_docid(), expected, "repeated seek_to({target})");
+        assert_eq!(r.peek().map(|(d, _)| d), expected, "repeated seek_to({target})");
     }
 
     #[test]
     fn advanced_positions_match_source(
-        (docids, tfs) in post_data_strategy(),
+        (docids, tfs) in post_data_strategy2(),
         advance_n in 0usize..64,
     ) {
         prop_assume!(!docids.is_empty());
-        let mut data = PostingData::default();
         let src_positions: Vec<Vec<u32>> = docids
             .iter()
             .zip(tfs.iter())
             .enumerate()
             .map(|(i, (_, tf))| vec![i as u32; *tf as usize])
             .collect();
+        let mut data = PostingData::default();
         for (i, (d, tf)) in docids.iter().zip(tfs.iter()).enumerate() {
             data.add(*d, *tf, src_positions[i].clone());
         }
         let mut blob = Vec::new();
         let info = data.freeze(None).encode_to(&mut blob);
-        let mut r = PostingReader::new(&info, &blob);
+        let mut r = zap::posting::PostingReader::new(&info, &blob);
         let n = advance_n.min(docids.len());
         for _ in 0..n {
             r.advance();
         }
-        // the peeked doc (if any) carries positions equal to the source at its docidx
         let idx = n;
         if idx < src_positions.len() {
             let mut buf = Vec::new();
@@ -85,6 +100,165 @@ proptest! {
             // exhausted reader
             let mut buf = Vec::new();
             assert!(!r.peek_positions_into(&mut buf));
+        }
+    }
+}
+
+// ---------- T1/T2 corpus builders ----------
+
+fn build_index(docs: &[String]) -> (Arc<Index>, Stats, Arc<zap::segment::SegmentReader>) {
+    let mut schema = Schema::default();
+    schema.add_text("text", 1.0);
+    let analyzer = Analyzer::new(AnalyzerConf::default());
+    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 2);
+    let owned: Vec<Document> = docs
+        .iter()
+        .map(|d| Document::new().text("text", d.clone()))
+        .collect();
+    index.add_documents(owned).unwrap();
+    index.commit();
+    let seg = index.segments_snapshot()[0].clone();
+    // stats rebuilt the same way index.publish_snapshot does
+    let mut stats = Stats::empty();
+    let mut df = std::collections::HashMap::new();
+    let mut total: u64 = 0;
+    let mut sums: Vec<u64> = vec![0; 1];
+    for s in &index.segments_snapshot() {
+        total += s.num_docs as u64;
+        sums[0] += s.sum_field_len(0);
+        for (term, info) in s.stream_terms(0) {
+            *df.entry((0u32, term)).or_insert(0) += info.df;
+        }
+    }
+    stats.total_docs = total as u32;
+    stats.avg_len = vec![sums[0] as f32 / total.max(1) as f32];
+    stats.df = df;
+    (index, stats, seg)
+}
+
+fn ctx_of<'a>(index: &'a Arc<Index>, stats: &'a Stats) -> Ctx<'a> {
+    Ctx {
+        schema: index.schema(),
+        stats,
+        params: &Bm25Params { k1: 1.2, b: 0.75 },
+        analyzer: index.analyzer(),
+        threshold: &(|| 0.0),
+    }
+}
+
+fn dense_topk(
+    node: &zap::query::Node,
+    seg: &zap::segment::SegmentReader,
+    ctx: &Ctx,
+    k: usize,
+) -> Vec<SearchHit> {
+    let ds = eval_allowed(node, None, seg, ctx, None);
+    let mut col = TopK::new(k);
+    for (i, doc) in ds.ids.iter().enumerate() {
+        col.push(
+            DocAddr {
+                segment: 0,
+                docid: *doc,
+            },
+            ds.scores[i],
+        );
+    }
+    col.into_sorted()
+}
+
+fn wand_topk(
+    node: &zap::query::Node,
+    seg: &zap::segment::SegmentReader,
+    ctx: &Ctx,
+    k: usize,
+) -> Vec<SearchHit> {
+    let mut col = TopK::new(k);
+    eval_term_stream(node, None, seg, ctx, &mut col);
+    col.into_sorted()
+}
+
+fn corpus_strategy() -> impl Strategy<Value = (Vec<String>, String, usize)> {
+    (2usize..20, 1usize..6, 1usize..12).prop_flat_map(|(ndocs, hot_every, k)| {
+        proptest::collection::vec(0u64..u64::MAX, ndocs * 8).prop_map(move |seeds| {
+            let mut docs = Vec::with_capacity(ndocs);
+            for i in 0..ndocs {
+                let mut s = String::new();
+                if i % hot_every.max(1) == 0 {
+                    // hot outliers with repeated terms
+                    s.push_str("fox fox ");
+                }
+                for w in 0..8 {
+                    let idx = ((seeds[i * 8 + w] >> (w * 7)) as usize) % WORDS.len();
+                    let word = if w == 0 { "fox" } else { WORDS[idx] };
+                    s.push_str(word);
+                    s.push(' ');
+                }
+                docs.push(s);
+            }
+            let query = WORDS[(seeds[ndocs] as usize) % WORDS.len()].to_string();
+            (docs, query, k)
+        })
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// T1/T2: streaming WAND walk must produce the identical top-k as dense eval
+    #[test]
+    fn wand_matches_dense_topk(docs in corpus_strategy()) {
+        let (docs, query, _k) = docs;
+        let (index, stats, seg) = build_index(&docs);
+        let node = parse(&query).unwrap();
+        prop_assume!(matches!(node, zap::query::Node::Term(_)));
+        let ctx = ctx_of(&index, &stats);
+        for k in [1usize, 3, 10] {
+            let dense = dense_topk(&node, &seg, &ctx, k);
+            let mut wcol = TopK::new(k);
+            eval_term_stream(&node, None, &seg, &ctx, &mut wcol);
+            let wand = wcol.into_sorted();
+            assert_eq!(dense.len(), wand.len(), "k={k} hit counts differ");
+            for (dh, wh) in dense.iter().zip(wand.iter()) {
+                assert_eq!(dh.addr, wh.addr, "k={k} dense vs wand");
+                assert!((dh.score - wh.score).abs() < 1e-4, "k={k} scores differ");
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// T1: with a live threshold (the dense k-th score), WAND pruning keeps the same top-k
+    #[test]
+    fn wand_threshold_prunes_to_same_topk(docs in corpus_strategy()) {
+        let (docs, query, k) = docs;
+        let (index, stats, seg) = build_index(&docs);
+        let node = parse(&query).unwrap();
+        prop_assume!(matches!(node, zap::query::Node::Term(_)));
+        let ctx = ctx_of(&index, &stats);
+        for kk in [1usize, 3, 10] {
+            let dense = dense_topk(&node, &seg, &ctx, kk);
+            let Some(kth) = dense.get(kk - 1) else { continue; };
+            let thr_val = kth.score;
+            let ctx_prune = Ctx {
+                schema: index.schema(),
+                stats: &stats,
+                params: &Bm25Params { k1: 1.2, b: 0.75 },
+                analyzer: index.analyzer(),
+                threshold: &(move || thr_val),
+            };
+            let mut wcol = TopK::new(kk);
+            eval_term_stream(&node, None, &seg, &ctx_prune, &mut wcol);
+            let wand = wcol.into_sorted();
+            assert_eq!(
+                dense.iter().map(|h| h.addr).collect::<Vec<_>>(),
+                wand.iter().map(|h| h.addr).collect::<Vec<_>>(),
+                "kk={kk} wand-pruned topk diverged"
+            );
+            for (dh, wh) in dense.iter().zip(wand.iter()) {
+                assert!((dh.score - wh.score).abs() < 1e-4, "kk={kk} scores differ");
+            }
         }
     }
 }
