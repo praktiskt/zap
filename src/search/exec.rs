@@ -61,14 +61,9 @@ impl Ctx<'_> {
     }
 }
 
-/// caches a threshold provider pointee
-pub struct ThresholdRef<'a> {
-    closure: &'a dyn Fn() -> f32,
-}
-
-impl<'a> ThresholdRef<'a> {
-    pub fn new(closure: &'a dyn Fn() -> f32) -> Self {
-        Self { closure }
+impl Ctx<'_> {
+    pub fn thr(&self) -> f32 {
+        (self.threshold)()
     }
 }
 

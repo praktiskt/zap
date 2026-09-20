@@ -40,7 +40,6 @@ fn main() {
     }
     println!("docs={} segs={}", index.num_docs(), index.num_segments());
     // top-10 for 'fox': the 200 tf-100 outliers should win; others tf~1
-    let t0 = std::time::Instant::now();
     let hits = index.search("fox", 10).unwrap();
     println!(
         "{} hits in {:?}",
