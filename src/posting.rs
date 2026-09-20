@@ -266,6 +266,62 @@ impl<'a> PostingReader<'a> {
         self.peeked.as_ref().map(|_| self.docidx - 1)
     }
 
+    /// block-max stats for the block containing the current decode position
+    /// returns (tf_max, len_min, next_block_first_docid); None when no anchors
+    pub fn block_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        let skips = &self.blob[self.skips_start..self.skips_end];
+        let n = skips.len() / SKIP_ENTRY_BYTES;
+        if n == 0 {
+            return None;
+        }
+        let b = self.docidx / SKIP_STEP;
+        let b = b.min(n - 1);
+        let row = |field: usize| {
+            u32::from_le_bytes(
+                skips[b * 16 + field * 4..b * 16 + field * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let prev_docid = row(0);
+        let _off = row(1);
+        let tf_max = row(2);
+        let len_min = row(3);
+        // first doc of the next block: prev_docid of the following anchor + 1
+        let next_start = if b + 1 < n {
+            let next_row = |field: usize| {
+                u32::from_le_bytes(
+                    skips[(b + 1) * 16 + field * 4..(b + 1) * 16 + field * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            Some(next_row(0) + 1)
+        } else {
+            None
+        };
+        Some((prev_docid, _off, tf_max, len_min))
+    }
+
+    /// block index containing the current decode position
+    pub fn cur_block(&self) -> usize {
+        self.docidx / SKIP_STEP
+    }
+
+    /// first docid of the block following the current one (for block skipping)
+    pub fn next_block_start(&self) -> Option<u32> {
+        let skips = &self.blob[self.skips_start..self.skips_end];
+        let n = skips.len() / SKIP_ENTRY_BYTES;
+        let b = (self.docidx / SKIP_STEP).min(n.saturating_sub(1));
+        if b + 1 < n {
+            let next_row =
+                u32::from_le_bytes(skips[(b + 1) * 16..(b + 1) * 16 + 4].try_into().unwrap());
+            Some(next_row + 1)
+        } else {
+            None
+        }
+    }
+
     /// positions encoded per doc run (varint count then gaps)
     pub fn positions_into(&self, docidx: usize, buf: &mut Vec<u32>) {
         buf.clear();

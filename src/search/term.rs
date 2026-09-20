@@ -9,6 +9,66 @@ pub fn bm25_idf(df: u32, total_docs: u32) -> f32 {
     (1.0 + (n - d + 0.5) / (d + 0.5)).ln()
 }
 
+/// bm25 evaluation with per-block upper-bound skip (block-max WAND lite)
+/// `threshold_fn() -> f32` returns the current top-k heap minimum; blocks whose
+/// theoretical max score can't beat it are jumped over (docs in them are missing
+/// from the output by design: retained top-k only)
+#[allow(clippy::too_many_arguments)]
+pub fn term_scores_wand(
+    info: &TermInfo,
+    blob: &[u8],
+    idf: f32,
+    params: &Bm25Params,
+    avg_len: f32,
+    boost: f32,
+    norms: Option<&[u16]>,
+    threshold_fn: impl Fn() -> f32,
+) -> DocScores {
+    let mut r = PostingReader::new(info, blob);
+    let mut out = DocScores::default();
+    out.ids.reserve(info.df as usize);
+    let mut seen_block = usize::MAX;
+    let mut done = false;
+    while !done {
+        match r.advance() {
+            Some((doc, tf)) => {
+                let blk = r.cur_block();
+                if blk != seen_block {
+                    seen_block = blk;
+                    if let Some((_, _, tf_max, len_min)) = r.block_bounds() {
+                        let tfm = tf_max.max(tf) as f32;
+                        let norm_min = if len_min > 0 {
+                            (1.0 - params.b) + params.b * (len_min as f32 / avg_len.max(1.0))
+                        } else {
+                            1.0
+                        };
+                        let bound = idf * (tfm * (params.k1 + 1.0)) / (tfm + params.k1 * norm_min);
+                        if bound * boost < threshold_fn() {
+                            match r.next_block_start() {
+                                Some(ns) => {
+                                    r.seek_to(ns);
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                let tf = tf as f32;
+                let norm = norm_ratio(norms, doc, avg_len, params.b);
+                let w = idf * (tf * (params.k1 + 1.0)) / (tf + params.k1 * norm);
+                out.ids.push(doc);
+                out.scores.push(w * boost);
+            }
+            None => {
+                done = true;
+            }
+        }
+    }
+    out
+}
+
+/// norm ratio: (1-b) + b*len/avg
 pub fn norm_ratio(norms: Option<&[u16]>, doc: u32, avg_len: f32, b: f32) -> f32 {
     let avg = avg_len.max(1.0);
     match norms.and_then(|n| n.get(doc as usize)) {
