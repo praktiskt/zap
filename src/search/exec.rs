@@ -79,6 +79,15 @@ fn glob_match(term: &str, pat: &[char]) -> bool {
     pi == m
 }
 
+fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
+    let stemmed = ctx.analyzer.stem_word(t);
+    if stemmed == t {
+        vec![t.to_string()]
+    } else {
+        vec![stemmed, t.to_string()]
+    }
+}
+
 /// convenience: eval without bitmap probe
 pub fn eval(
     node: &Node,
@@ -202,12 +211,8 @@ pub fn eval_allowed(
             acc
         }
         Node::And(items) => {
-            // R12: streaming two-term AND fast path — the smaller posting drives =
-            // galloping seeks on the other; only matches get scored
-            if let Some(ds) = and_two_terms(items, scope, seg, ctx, allowed) {
-                return ds;
-            }
-            // legacy: stream intersect of per-positive scored arrays
+            // R12/R15: streaming term-AND: two smallest-df positives drive
+            // galloping walks; only matches get scored; longer chains intersect
             let mut positives: Vec<&Node> = Vec::new();
             let mut excluded: Vec<RoaringBitmap> = Vec::new();
             for it in items {
@@ -219,6 +224,35 @@ pub fn eval_allowed(
                     other => positives.push(other),
                 }
             }
+            let all_terms =
+                positives.iter().all(|p| matches!(p, Node::Term(_))) && excluded.is_empty();
+            if all_terms {
+                let term_infos: Vec<Vec<(u32, String, TermInfo)>> = positives
+                    .iter()
+                    .map(|p| resolve_term_positives(p, scope, seg, ctx))
+                    .collect();
+                let dfs: Vec<u32> = term_infos
+                    .iter()
+                    .map(|infos| infos.iter().map(|i| i.2.df).sum())
+                    .collect();
+                let mut order: Vec<usize> = (0..positives.len()).collect();
+                order.sort_by_key(|i| dfs[*i]);
+                let pair = [order[0], order[1]];
+                if let Some(mut acc) = and_two_infos(
+                    &term_infos[pair[0]],
+                    &term_infos[pair[1]],
+                    seg,
+                    ctx,
+                    allowed,
+                ) {
+                    for &oi in &order[2..] {
+                        let ds = term_infos_doc_scores(&term_infos[oi], seg, ctx, None);
+                        acc = crate::search::intersect(&acc, &ds);
+                    }
+                    return acc;
+                }
+            }
+            // legacy: stream intersect of per-positive scored arrays
             let mut iter = positives.iter();
             let Some(first) = iter.next() else {
                 return DocScores::default();
@@ -239,99 +273,108 @@ pub fn eval_allowed(
     }
 }
 
-/// fast path: exactly one Term positive per side (`a AND b`), no exclusion, probe walk
-fn and_two_terms(
-    items: &[Node],
+/// resolve a Term node to all matching (fid, stem, info) entries
+fn resolve_term_positives(
+    p: &Node,
     scope: Option<u32>,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+) -> Vec<(u32, String, TermInfo)> {
+    let Node::Term(t) = p else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for fid in scope_ids(scope, ctx) {
+        for st in stem_variants(ctx, t) {
+            if let Some(info) = seg.term(fid, &st) {
+                out.push((fid, st, info));
+            }
+        }
+    }
+    out
+}
+
+/// bm25 score series for a resolved term set (plain walk)
+fn term_infos_doc_scores(
+    infos: &[(u32, String, TermInfo)],
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    allowed: Option<&roaring::RoaringBitmap>,
+) -> DocScores {
+    let mut acc = DocScores::default();
+    for (fid, st, info) in infos {
+        let idf = bm25_idf(ctx.stats.df_of(*fid, st, info.df), ctx.stats.total_docs);
+        let sc = crate::search::term::term_scores_allowed(
+            info,
+            seg.blob(),
+            idf,
+            ctx.params,
+            ctx.stats.avg_of(*fid),
+            1.0,
+            seg.norms(*fid),
+            allowed,
+        );
+        acc = crate::search::union(&acc, &sc);
+    }
+    acc
+}
+
+/// galloping driver-walk over two resolved single-variant postings; smallest df drives
+fn and_two_infos(
+    a_infos: &[(u32, String, TermInfo)],
+    b_infos: &[(u32, String, TermInfo)],
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
     allowed: Option<&roaring::RoaringBitmap>,
 ) -> Option<DocScores> {
-    if items.len() != 2 {
+    if a_infos.len() != 1 || b_infos.len() != 1 {
         return None;
     }
-    // both children plain Terms with a single stem variant?
-    let mut halves: [Option<(u32, String, TermInfo)>; 2] = [None, None];
-    for (i, it) in items.iter().enumerate() {
-        let Node::Term(t) = it else { return None };
-        let mut variant: Option<(u32, String, TermInfo)> = None;
-        for fid in scope_ids(scope, ctx) {
-            for st in stem_variants(ctx, t) {
-                if let Some(info) = seg.term(fid, &st) {
-                    if variant.is_none() {
-                        variant = Some((fid, st.clone(), info));
-                    } else {
-                        // multi-field / multi-stem term: too general for the walk
-                        return None;
-                    }
-                }
-            }
-        }
-        halves[i] = variant;
-    }
-    let first = halves[0].clone()?;
-    let second = halves[1].clone()?;
-
-    // caller prefilter: intersect child docids into a bitmap first if present
-
-    let df0 = first.2.df;
-    let df1 = first.2.df;
-    let idf0 = bm25_idf(
-        ctx.stats.df_of(first.0, &first.1, df0),
-        ctx.stats.total_docs,
-    );
-    let idf1 = bm25_idf(
-        ctx.stats.df_of(second.0, &second.1, df1),
-        ctx.stats.total_docs,
-    );
-
-    // drive the smaller posting; gallop the other
-    let drive = if df0 <= df1 {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    let (a, b) = drive;
-    let mut ra = seg.reader(&a.2);
-    let mut rb = seg.reader(&b.2);
-    let norms_a = seg.norms(a.0);
-    let norms_b = seg.norms(b.0);
-    let avg = |fid: u32| ctx.stats.avg_of(fid);
+    let (a, b) = (&a_infos[0], &b_infos[0]);
+    let idf_a = bm25_idf(ctx.stats.df_of(a.0, &a.1, a.2.df), ctx.stats.total_docs);
+    let idf_b = bm25_idf(ctx.stats.df_of(b.0, &b.1, b.2.df), ctx.stats.total_docs);
+    let drive = if a.2.df <= b.2.df { (a, b) } else { (b, a) };
+    let (drv, oth) = drive;
+    let mut r_drv = seg.reader(&drv.2);
+    let mut r_oth = seg.reader(&oth.2);
+    let norms_drv = seg.norms(drv.0);
+    let norms_oth = seg.norms(oth.0);
     let mut out = DocScores::default();
-    while let Some((doc, tf_a)) = ra.advance() {
+    while let Some((doc, tf_d)) = r_drv.advance() {
         if let Some(al) = allowed {
             if !al.contains(doc) {
                 continue;
             }
         }
-        rb.seek_to(doc);
-        let Some((d2, tf_b)) = rb.peek() else {
+        r_oth.seek_to(doc);
+        let Some((d2, tf_o)) = r_oth.peek() else {
             continue;
         };
         if d2 != doc {
             continue;
         }
-        let w_a = idf0 * (tf_a as f32 * (ctx.params.k1 + 1.0))
-            / (tf_a as f32
+        let w_d = idf_a * (tf_d as f32 * (ctx.params.k1 + 1.0))
+            / (tf_d as f32
                 + ctx.params.k1
-                    * crate::search::term::norm_ratio(norms_a, doc, avg(a.0), ctx.params.b));
-        let w_b = idf1 * (tf_b as f32 * (ctx.params.k1 + 1.0))
-            / (tf_b as f32
+                    * crate::search::term::norm_ratio(
+                        norms_drv,
+                        doc,
+                        ctx.stats.avg_of(drv.0),
+                        ctx.params.b,
+                    ));
+        let w_o = idf_b * (tf_o as f32 * (ctx.params.k1 + 1.0))
+            / (tf_o as f32
                 + ctx.params.k1
-                    * crate::search::term::norm_ratio(norms_b, doc, avg(b.0), ctx.params.b));
+                    * crate::search::term::norm_ratio(
+                        norms_oth,
+                        doc,
+                        ctx.stats.avg_of(oth.0),
+                        ctx.params.b,
+                    ));
         out.ids.push(doc);
-        out.scores.push(w_a + w_b);
+        out.scores.push(w_d + w_o);
     }
     Some(out)
-}
-
-fn stem_variants(ctx: &Ctx, t: &str) -> Vec<String> {
-    let stemmed = ctx.analyzer.stem_word(t);
-    if stemmed == t {
-        vec![t.to_string()]
-    } else {
-        vec![stemmed, t.to_string()]
-    }
 }
 
 /// score only docs inside the bitmap

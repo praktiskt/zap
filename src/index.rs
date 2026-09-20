@@ -220,8 +220,22 @@ impl Index {
             k1: self.k1,
             b: self.b,
         };
-        // per-segment parallel top-k; the heaps fold into one final TopK
-        let per_seg: Vec<Vec<SearchHit>> = {
+        // parallel per-segment topk only pays when there is real work per thread
+        let collect_one = |si: usize, seg: &Arc<SegmentReader>, ctx: &crate::search::exec::Ctx| {
+            let ds = crate::search::exec::eval_allowed(&node, None, seg, ctx, None);
+            let mut collector = TopK::new(k);
+            for (i, doc) in ds.ids.iter().enumerate() {
+                collector.push(
+                    DocAddr {
+                        segment: si as u32,
+                        docid: *doc,
+                    },
+                    ds.scores[i],
+                );
+            }
+            collector.into_sorted()
+        };
+        let per_seg: Vec<Vec<SearchHit>> = if snap.segments.len() > 1000 {
             use rayon::prelude::*;
             snap.segments
                 .par_iter()
@@ -233,18 +247,21 @@ impl Index {
                         params: &params,
                         analyzer: &self.analyzer,
                     };
-                    let ds = crate::search::exec::eval_allowed(&node, None, seg, &ctx, None);
-                    let mut collector = TopK::new(k);
-                    for (i, doc) in ds.ids.iter().enumerate() {
-                        collector.push(
-                            DocAddr {
-                                segment: si as u32,
-                                docid: *doc,
-                            },
-                            ds.scores[i],
-                        );
-                    }
-                    collector.into_sorted()
+                    collect_one(si, seg, &ctx)
+                })
+                .collect()
+        } else {
+            snap.segments
+                .iter()
+                .enumerate()
+                .map(|(si, seg)| {
+                    let ctx = crate::search::exec::Ctx {
+                        schema: &self.schema,
+                        stats: &snap.stats,
+                        params: &params,
+                        analyzer: &self.analyzer,
+                    };
+                    collect_one(si, seg, &ctx)
                 })
                 .collect()
         };
