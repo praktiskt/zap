@@ -455,7 +455,12 @@ impl<'a> PostingReader<'a> {
         if self.peeked.is_none() && self.docidx < self.doc_count {
             self.decode_next();
         }
-        self.peeked.take()
+        let out = self.peeked.take();
+        // keep the peek invariant: next unread doc always cached (positions access)
+        if self.peeked.is_none() && self.docidx < self.doc_count {
+            self.decode_next();
+        }
+        out
     }
 
     /// positions of the doc at 0-based order `docidx`
