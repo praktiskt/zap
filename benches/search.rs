@@ -83,7 +83,7 @@ fn build_multi_segment(n: usize, commits: usize) -> Arc<Index> {
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf::default());
-    let lanes = 8.max(1);
+    let lanes = 8;
     let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, lanes);
     let words = if n >= 1_000_000 { 50 } else { 200 };
     let docs = corpus(n, words);
@@ -197,7 +197,7 @@ fn doc_length(c: &mut Criterion) {
                         .iter()
                         .map(|d| Document::new().text("text", d.clone()))
                         .collect();
-                    let per = owned.len().div_ceil(10usize.max(1));
+                    let per = owned.len().div_ceil(10);
                     for ch in owned.chunks(per) {
                         index.add_documents(ch.to_vec()).unwrap();
                         index.commit();
