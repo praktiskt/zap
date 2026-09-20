@@ -72,7 +72,7 @@ fn serve_ingest_search_stats() {
     // GET search with percent escape
     let v = get_json(addr, "/search?q=quick+fox&k=5");
     let results = v["results"].as_array().expect("results array");
-    assert!(results.len() >= 1, "{v}");
+    assert!(!results.is_empty(), "{v}");
     // JSON body search path
     let v = post_json(addr, "/search", r#"{"q":"fox","k":2}"#);
     let hits = v["results"].as_array().unwrap();
