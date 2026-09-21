@@ -1,6 +1,26 @@
 # AGENTS.md — zap
 
 In-memory full-text search engine. Performance is the product: search-first, ingest second.
+Single binary, everything lives in the process; no mmap, no persistence, no server dependency
+(HTTP mode serves straight out of RAM over tiny_http threads).
+
+## What zap is
+- Rust FTS: BM25 (+ phrase window bonus, field boosts), boolean/phrase/slop/prefix/wildcard/fuzzy queries
+- Segment architecture: immutable sealed segments (FST term dict, delta-varint postings, skip anchors) + a parallel hot-ingest lane builder; log-tier merge
+- block-max WAND top-k with live thresholds; galloping seeks power both phase cursors and block pruning
+- arccos-swap snapshots: single writer, lock-free readers
+- HTTP serve subcommand (tiny_http): /ingest /search /stats /commit /health
+- multilingual tokenization via charabia (+ snowball stemming on latin tokens)
+
+Future extension is pre-plumbed: `schema.rs` declares `vector` fields (dim + metric) with
+validation gates, so embedding search can be added without re-shaping the documents model.
+
+## Repo layout
+- `src/lib.rs` crate; `src/main.rs` CLI (interactive + `serve` subcommand)
+- core modules: `analyzer/`, `index.rs` (writer/snapshots/merge), `query.rs` (AST+parser),
+  `search/` (term/phrase/exec: scorers + WAND), `segment.rs`, `posting.rs`, `schema.rs`, `server.rs`
+- `tests/`: property + integration tests; `benches/search.rs`: criterion matrix;
+  `examples/`: scale probes (`big.rs` 1M-doc, `wand.rs` skew probe)
 
 ## Perf-optimization history
 - Every optimization attempt (successful or failed) gets its own git commit.
@@ -19,8 +39,14 @@ In-memory full-text search engine. Performance is the product: search-first, ing
 
 ## Known perf sensitive spots (from history)
 - prefix/fuzzy: FST range/automaton paths (NOT dict scans — `stream_terms` full scans are perf-reject)
-- AND eval: smallest-df positive seeds + stream intersect; bitmap-first double-scan is perf-reject (R3)
-- phrase cursors: must use galloping `seek_to`, never linear re-decode
+- AND eval: streaming gallop-intersection with the smallest-df term as driver (R12/R15); bitmap-first double-scan is perf-reject (R3)
+- phrase cursors: must use galloping `seek_to`, never linear re-decode; hoist position buffers out of per-doc loops (R6)
 - ingestion cost lands in `analyzer.tokenize` (charabia); parallelize per document lanes when possible
 - group-varint postings decode: perf-reject (R4, +57% term scan; branchy GV loses to plain varint at tested sizes 10k docs) — retry only with true fixed-width SIMD blocks
 - block-max WAND: implemented (streaming single-Term path + live threshold); skip anchors (16B: prev_docid/off/tf_max/len_min) power both galloping seek and block pruning; length tables are NOT term-local (field-level)
+- inline `[delta][tf]` posting layout (R16): single cursor; do NOT split docid/tf streams again
+
+## Future rounds, if we resume WAND/general top-k work
+- WAND fan-out into AND/OR walkers (currently only single-Term streaming prunes)
+- per-field postings bitpack (128-doc blocks à la tantivy) if profiling shows decode-bound
+- embedding search: flat SIMD scan first; HNSW (hnsw_rs / instant-distance) behind the `VectorIndex` trait seam

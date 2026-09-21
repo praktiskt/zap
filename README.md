@@ -1,9 +1,28 @@
 # zap — in-memory full-text search engine
 
-Single-binary Rust FTS: BM25 ranking, boolean/phrase/prefix/wildcard/fuzzy queries,
-multilingual tokenization (charabia), segmented index with log-tier merge, snapshot
-concurrency (arc-swap), lambda4 doc store for snippets + highlighting. Nothing leaves the
-process: all index data lives in memory.
+**Blazingly fast, single-binary text search in Rust.** Everything lives in RAM — the index,
+the docs, the HTTP API and the query loop share one process. Built for scale: millions of
+documents, texts 100k+ characters long.
+
+```
+top-10 query (10k docs):  single hot term 48 µs • AND 94 µs • phrase 290 µs
+1M docs (8 lanes):        ingest 16 s  •  query 0.36 ms
+skewed tf (block-max WAND): 90 ns @ 200k docs
+ingest: 10k × 200w docs in 320 ms  •  1M × 50w docs in 16 s (60k docs/s)
+```
+
+## What's inside
+- **BM25 ranking** (Lucene-style idf) + phrase-window bonus + per-field boosts
+- **Full query language**: boolean ops with parens, phrases with slop, `field:` scoping,
+  prefix/wildcard globs, fuzzy `~N` (Levenshtein DFA over the term FST)
+- **Segments**: immutable sealed segments (FST term dict + delta-varint postings +
+  skip anchors), parallel hot-ingest lanes, log-tier merge
+- **block-max WAND**: live top-k thresholds skip whole 128-doc blocks
+- **arc-swap snapshots**: single writer, lock-free readers; commits/merges never block queries
+- **charabia tokenization**: Unicode segmentation, NFC folding, CJK segmentation, snowball
+  stemming for Latin tokens
+- **doc store**: lz4 blocks per doc (raw for tiny docs) → snippets + ANSI highlighting
+- **HTTP serve mode** (tiny_http threads, no async runtime) and an interactive query loop
 
 ## Query syntax
 
@@ -13,43 +32,46 @@ process: all index data lives in memory.
 | `a AND b` / `a OR b` | boolean operators (uppercase) |
 | `a NOT b` | exclusion matching (subtract docs) |
 | `"quick brown fox"` | exact phrase (consecutive positions) |
-| `"fast the"~1` | phrase with slop (1 token gaps allowed) |
-| `field:term` | restrict to a field; `field:(a OR b)` scopes a subtree |
-| `prefix*` | prefix expansion from term dict |
-| `wild*car?` | expr wildcard (`*` any run, `?` one char) |
-| `typo~1` | fuzzy match (Levenshtein/Damerau DFA over term FST, up to distance 2) |
+| `"ran and fast"~1` | phrase with slop (1 token gap allowed, order-preserving) |
+| `field:term` / `field:(a OR b)` | restrict a subtree to one field |
+| `prefix*` | prefix expansion from the term FST (range walk) |
+| `wild*car?` | glob wildcard (`*` = any run, `?` = one char) |
+| `typo~1` | fuzzy match, distance 1 or 2 (DFA over term dictionary) |
 | `( a OR b ) AND NOT c` | grouping, operators |
-| `:stats` / `:help` / `:q` | meta commands in the CLI query loop |
+| `:stats` / `:help` / `:q` | query-loop meta commands |
 
 ## Usage
 
 ```sh
 # index files/dirs, search interactively (every stdin line = one query)
 zap dir/ file.md
-# whole stdin as ONE doc; per-line documents with a blank-line terminator
-echo anthology | zap --stdin-lines
+# per-line documents; blank line ends docs, the rest is queries
+{ echo "doc one"; echo; echo "some query"; } | zap --stdin-lines --lanes 8
+# block-max WAND needs BM25 params; defaults are k1=1.2 b=0.75
+zap --k1 1.2 --b 0.75 dir/
 ```
 
-Docs: files/dirs (`.txt .md .rst .json .toml .csv .log .xml`, unknown extensions tried as text).
-Query loop command set: terms, flags `-k` top-k, `--k1/--b` BM25 params, `--no-stem`.
+Input docs: files/dirs (`.txt .md .rst .json .toml .csv .log .xml`; unknown extensions tried
+as text); `--stdin` = whole stdin is one doc; `--stdin-lines` = one doc per line until a
+blank line. Common flags: `-k N`, `--lanes N`, `--no-stem`, `--plain`, `--snippet N`,
+`--commit-every N`.
 
-## Architecture
+## Repo
 
-- `schema`: field declarative text fields (vectors declared as future extension hook)
-- segments: immutable, sealed, FST term dict; hot-built segments + committing
-- posting list: delta-varint docids/tfs/positions packed with per-doc offset table
-- Evaluators: materialized `DocScores` (doc ids + scores arrays) merged by boolean vectors
--ór ranking: BM25 with Lucene-style idf, norm-provider fieldnorms (bytes/doc), field boosts
-- Termdict: fst FST: exact/prefix/range via automaton, configure fst-levenshtein for fuzzy
-- doc store: lz4 blocks per doc + metadata for snippet/highlight reconstruction (highlighting via re-tokenization)
-- multi-lang: charabia detectors (Latin uax word segmentation + NFKC + CJK segmentation), stemmers
-
-## Tests + benchmarks
-
-- `tests/search_it.rs`: boolean/phrase/slop/prefix/fuzzy/field/merge/CJK (integration)
-- unit tests: varint, posting roundtrip, tokenizer behavior, parser grammar
-- `cargo bench` matrıx: scale (100/1k/10k/100k docs × term/phrase/AND), doc-length sweep
- (100/1k/5k words), ingest throughput (~8 MB/s, release)
+```
+src/lib.rs        engine crate
+src/main.rs       CLI + serve dispatch
+src/index.rs      writer: hot lanes, commit, log-tier merge, snapshots
+src/query.rs      query AST + recursive-descent parser
+src/search/       scoring: DocScores merges, phrase windows, block-max WAND, exec tree
+src/segment.rs    segment freeze (FSTs per field + doc store)
+src/posting.rs    postings: interleave [delta][tf], skip anchors, galloping seeks
+src/analyzer.rs   charabia + stemmer, one analyzer pipeline shared by docs and queries
+src/server.rs     tiny_http serve mode
+tests/            property + integration suite (41 tests)
+benches/search.rs criterion scale + doc-length matrix
+examples/big.rs   1M-doc probe   example: wand.rs: skew probe
+```
 
 ## HTTP serve mode
 
@@ -71,30 +93,39 @@ Search result shape: `{"results":[{"score":0.71,"id":0,"doc":"text"}],"count":N}
 Ingest accepts a 64 MB body per call; docs commit per request. Sockets are plain
 threads (no async runtime) — the engine is CPU-bound sync.
 
+## Benchmarks (release, criterion)
 
-## Benchmarks (release, criterion, current)
-
-Query latency (top-10, 10k doc corpus, 10 segments, block-max WAND):
-- single hot term `fox`: **48 µs** (was 131 µs pre-Opt)
+Query latency (top-10, 10k doc corpus, merged single segment, block-max WAND):
+- single hot term `fox`: **48 µs** (was 131 µs at the first working version)
 - `fox AND dog`: 94 µs
 - 3-term OR: 113 µs
 - `"quick brown fox"` phrase: 290 µs
-- wildcard `f*zz*`: 56 µs
+- wildcard `f*zz*`: 56 µs (was 1000 µs — FST range walk win)
 - fuzzy `fox~1`: ~150 µs
 - exact rare term: 0.65 µs
 
-Scale (term/phrase/AND, 100k docs): 1.34 ms / 4.5 ms / 1.33 ms.
-1M-doc corpus (8 lanes): built via `zap/examples/big.rs`, 1M-doc ingest ≈ 16.1 s, top-10 query 0.36 ms (block-max WAND, 1.8x faster than pre-WAND 0.65 ms); skew probe (`examples/wand.rs`): 90 ns @200k docs.
+Scale (term / phrase / AND at 100k docs): 1.3 ms / 4.5 ms / 1.3 ms.
+1M docs (`examples/big.rs`): ingest ≈ 16 s (8 lanes), rare-term top-10 = **0.36 ms**,
+skew probe (`examples/wand.rs`): 90 ns @200k docs (outlier blocks only).
 
-Doc length (1k docs): ingest 100w 41 ms → 20kw 3.1 s (parallel lanes), rare-term query flat ~5 µs
-at every length; phrase scales with doc length (23 µs @100w → 2.2 ms @20kw).
+Doc-length sweep (1k docs/photo): rare-term query flat ~5 µs regardless of doc size
+(100 w → 20 kw / 100k chars); phrase scales with doc length (23 µs @100w → 2.2 ms @20kw).
+Ingest: 10k × 200w in 320 ms; 1M × 50w (8 lanes) in ~16 s.
 
-Ingest: 10k×200w docs in 338 ms (~60 MB/s docstore, 8 lanes); 1M×50w in 16.6 s (60k docs/s).
+## Correctness
 
-Rejected micro-optimizations live in git history (`perf-reject:` commits): bitmap-first AND
-rescoring, group-varint decode at current sizes.
+41-test suite: `cargo test`
+- WAND-vs-dense evaluator equivalence (proptest, skewed corpora)
+- skip-anchor invariants (seek = first doc ≥ t; positions source-identical)
+- merge-heavy lane builds match single-lane reference (tie-tolerant compare)
+- long-doc (100k chars) roundtrip; degenerate-input edge cases
+- docstore decode fuzz (never panics on garbage)
+- concurrent commit + reader stress; top-k outlier canary; CLI e2e over real sockets
+
+Benchmarks: `cargo bench --bench search -- --noplot <filter>`.
+
 ## Roadmap
 
-- Segment-level roaring bitmaps + block-parallel terms for faster scale brittleness
-- Embedding search: vectors declared in schema + brute-force SIMD matrix scan → HNSW
-- Docid-tier compression for postings (bitpacked blocks 128 like tantivy) + block-max WAND
+- WAND fan-out into AND/OR chains (currently only single-Term streaming prunes)
+- Embedding search: schema-gated vector fields + flat SIMD scan → HNSW via `VectorIndex` seam
+- Per-field bitpacked postings (128-doc blocks à la tantivy) if profiling shows decode-bound
