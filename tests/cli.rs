@@ -54,11 +54,10 @@ fn stdin_lines_with_unknown_query() {
 
 #[test]
 fn serve_subcommand_starts_http_api() {
-    // ephemeral port; the server prints the bound socket to stderr
-    // attempt a bind on a random-ish port; skip when occupied
-    use std::io::{BufRead, Write};
+    // fixed high port for the test; the serve subcommand serves /search etc.
+    use std::io::{Read, Write};
     use std::net::TcpStream;
-    let port = 47412u16; // high fixed port for the test
+    let port = 47412u16;
     let docs_path = std::env::temp_dir().join(format!("zap-serve-cli-{port}.txt"));
     std::fs::write(
         &docs_path,
@@ -76,7 +75,6 @@ fn serve_subcommand_starts_http_api() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn zap serve");
-    use std::io::Read;
 
     // wait for the server to listen, then hit /search over a raw socket
     let mut bound = false;
