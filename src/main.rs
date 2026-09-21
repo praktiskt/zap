@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
 use zap::schema::{Document, Schema};
@@ -45,12 +45,20 @@ struct Args {
     /// auto-commit every N documents (bounds segment memory)
     #[arg(long, default_value = "50000")]
     commit_every: usize,
-    /// run the HTTP API instead of the interactive query loop
-    #[arg(long)]
-    serve: bool,
-    /// bind address for --serve (host:port)
-    #[arg(long, default_value = "127.0.0.1:3279")]
-    bind: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// serve the HTTP API (POST /ingest, GET /search, POST /commit)
+    Serve {
+        /// host:port to bind
+        #[arg(long, default_value = "127.0.0.1:3279")]
+        bind: String,
+        /// files or directories to index before serving (also HTTP /ingest)
+        inputs: Vec<PathBuf>,
+    },
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -72,7 +80,7 @@ fn read_doc(p: &Path) -> Result<String> {
     }
 }
 
-fn collect_docs(args: &Args) -> Result<Vec<String>> {
+fn collect_docs(args: &Args, extra_inputs: Vec<PathBuf>) -> Result<Vec<String>> {
     let mut docs = Vec::new();
     if args.stdin {
         let mut s = String::new();
@@ -96,7 +104,9 @@ fn collect_docs(args: &Args) -> Result<Vec<String>> {
         }
         return Ok(docs);
     }
-    for p in &args.inputs {
+    let mut inputs = args.inputs.clone();
+    inputs.extend(extra_inputs);
+    for p in &inputs {
         let md = std::fs::metadata(p).with_context(|| p.display().to_string())?;
         if md.is_file() {
             docs.push(read_doc(p)?);
@@ -128,7 +138,16 @@ fn collect_docs(args: &Args) -> Result<Vec<String>> {
 fn main() -> Result<()> {
     let args = Args::parse();
     ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)).ok();
-    let docs = collect_docs(&args)?;
+    let docs = collect_docs(
+        &args,
+        args.command
+            .as_ref()
+            .map(|c| match c {
+                Command::Serve { inputs, .. } => inputs.clone(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default(),
+    )?;
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf {
@@ -162,10 +181,9 @@ fn main() -> Result<()> {
         index.num_docs(),
         index.num_segments()
     );
-    if args.serve {
-        let index = index;
-        let bind = args.bind.clone();
-        match zap::server::serve(index, &bind, &SHUTDOWN) {
+    if let Some(Command::Serve { bind, .. }) = &args.command {
+        let idx = index.clone();
+        match zap::server::serve(idx, &bind.clone(), &SHUTDOWN) {
             Ok(addr) => eprintln!("[zap serving] http://{addr}"),
             Err(e) => {
                 eprintln!("[zap serve] {e}");

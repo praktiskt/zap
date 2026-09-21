@@ -51,3 +51,55 @@ fn stdin_lines_with_unknown_query() {
         .success()
         .stderr(predicates::str::contains("query error"));
 }
+
+#[test]
+fn serve_subcommand_starts_http_api() {
+    // ephemeral port; the server prints the bound socket to stderr
+    // attempt a bind on a random-ish port; skip when occupied
+    use std::io::{BufRead, Write};
+    use std::net::TcpStream;
+    let port = 47412u16; // high fixed port for the test
+    let docs_path = std::env::temp_dir().join(format!("zap-serve-cli-{port}.txt"));
+    std::fs::write(
+        &docs_path,
+        "the quick brown fox jumps\nfoxes in the winter forest\n",
+    )
+    .expect("corpus file");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_zap"))
+        .args([
+            "serve",
+            "--bind",
+            &format!("127.0.0.1:{port}"),
+            &docs_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn zap serve");
+    use std::io::Read;
+
+    // wait for the server to listen, then hit /search over a raw socket
+    let mut bound = false;
+    for _ in 0..50 {
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            bound = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(bound, "serve did not start listening");
+    let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    s.write_all(b"GET /search?q=fox HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut resp_buf = [0u8; 65536];
+    s.read(&mut resp_buf).unwrap();
+    let resp = String::from_utf8_lossy(&resp_buf).into_owned();
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    assert!(body.contains("fox"), "response: {resp}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&docs_path);
+}
