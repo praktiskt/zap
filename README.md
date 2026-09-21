@@ -55,7 +55,7 @@ Query loop command set: terms, flags `-k` top-k, `--k1/--b` BM25 params, `--no-s
 
 ```sh
 zap serve --bind 127.0.0.1:3279 dir/            # load corpus, then serve
-zap serve --bind 127.0.0.1:3279                 # empty index, ingest via HTTP
+zap serve --bind 127.0.0.1:3279 --stdin-lines   # empty index, ingest via HTTP
 ```
 
 | endpoint | method | meaning |
