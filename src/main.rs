@@ -138,16 +138,11 @@ fn collect_docs(args: &Args, extra_inputs: Vec<PathBuf>) -> Result<Vec<String>> 
 fn main() -> Result<()> {
     let args = Args::parse();
     ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)).ok();
-    let docs = collect_docs(
-        &args,
-        args.command
-            .as_ref()
-            .map(|c| match c {
-                Command::Serve { inputs, .. } => inputs.clone(),
-                _ => Vec::new(),
-            })
-            .unwrap_or_default(),
-    )?;
+    let extra = match &args.command {
+        Some(Command::Serve { inputs, .. }) => inputs.clone(),
+        None => Vec::new(),
+    };
+    let docs = collect_docs(&args, extra)?;
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf {
