@@ -1,4 +1,4 @@
-//! zap CLI: load corpus into memory, search interactively
+//!returnzap CLI: load corpus into memory, search interactively
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -16,34 +16,34 @@ struct Args {
     /// files or directories to index into the `text` field
     inputs: Vec<PathBuf>,
     /// read one document from stdin instead of files
-    #[arg(long)]
+    #[arg(long, global = true)]
     stdin: bool,
     /// each stdin line becomes one document
-    #[arg(long)]
+    #[arg(long, global = true)]
     stdin_lines: bool,
     /// number of results per query
-    #[arg(short, long, default_value = "10")]
+    #[arg(short, long, default_value = "10", global = true)]
     top_k: usize,
-    /// BM25 k1
-    #[arg(long, default_value = "1.2")]
+    /// BM25 k1 (0 disables length normalization variance; default 1.2)
+    #[arg(long, global = true, default_value = "1.2")]
     k1: f32,
-    /// BM25 b
-    #[arg(long, default_value = "0.75")]
+    /// BM25 b (0 = no length normalization; default 0.75)
+    #[arg(long, global = true, default_value = "0.75")]
     b: f32,
     /// disable stemming
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_stem: bool,
     /// plain output (no ANSI)
-    #[arg(long)]
+    #[arg(long, global = true)]
     plain: bool,
     /// snippet width in chars
-    #[arg(long, default_value = "240")]
+    #[arg(long, global = true, default_value = "240")]
     snippet: usize,
     /// parallel ingest lanes (default: cores on this machine)
-    #[arg(long)]
-    lanes: Option<usize>,
+    #[arg(long, global = true, default_value = "16")]
+    lanes: usize,
     /// auto-commit every N documents (bounds segment memory)
-    #[arg(long, default_value = "50000")]
+    #[arg(long, global = true, default_value = "50000")]
     commit_every: usize,
     #[command(subcommand)]
     command: Option<Command>,
@@ -149,15 +149,7 @@ fn main() -> Result<()> {
         stem: !args.no_stem,
         max_token_len: 64,
     });
-    let lanes = args
-        .lanes
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get().clamp(1, 16))
-                .unwrap_or(4)
-        })
-        .min(docs.len().max(1))
-        .max(1);
+    let lanes = args.lanes.min(docs.len().max(1)).max(1);
     let index = Index::with_lanes(schema, analyzer.clone(), args.k1, args.b, lanes);
     let mut chunk: Vec<Document> = Vec::with_capacity(args.commit_every);
     for text in &docs {
