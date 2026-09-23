@@ -26,14 +26,20 @@ impl<'a> TermCursor<'a> {
     }
 
     /// positions of current doc into `buf` (reused across docs); consumes the doc
-    fn drain_positions(&mut self, buf: &mut Vec<u32>) {
+    pub fn drain_positions_pub(&mut self, buf: &mut Vec<u32>) {
         buf.clear();
         self.r.peek_positions_into(buf);
         self.r.advance();
     }
+
+    /// positions of current doc into `buf` (reused across docs); consumes the doc
+    fn drain_positions(&mut self, buf: &mut Vec<u32>) {
+        self.drain_positions_pub(buf)
+    }
 }
 
-/// smallest span of an increasing chain with gaps <= slop+1; None when no chain fits
+/// smallest span of an increasing chain with gaps <= slop+1; None when no chain fits.
+/// Early-exits at the minimal possible span (n-1: each step advances >= 1).
 pub fn min_span(lists: &[Vec<u32>], slop: u32) -> Option<u32> {
     if lists.is_empty() {
         return None;
@@ -42,6 +48,7 @@ pub fn min_span(lists: &[Vec<u32>], slop: u32) -> Option<u32> {
     if n == 1 {
         return lists[0].first().map(|_| 0);
     }
+    let best_possible = (n - 1) as u32;
     let mut best: Option<u32> = None;
     let mut ptrs = vec![0usize; n];
     for &start in &lists[0] {
@@ -63,7 +70,7 @@ pub fn min_span(lists: &[Vec<u32>], slop: u32) -> Option<u32> {
         if ok {
             let span = prev - start;
             best = Some(best.map_or(span, |b: u32| b.min(span)));
-            if span == 0 {
+            if span <= best_possible {
                 break;
             }
         }

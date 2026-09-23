@@ -174,13 +174,16 @@ fn query_scale(c: &mut Criterion) {
 }
 
 fn doc_length(c: &mut Criterion) {
-    // short vs long documents at a fixed corpus: ingest throughput + query time
+    // short vs long documents at a fixed corpus: ingest throughput + query time.
+    // tiers: ~600B, ~1KB, ~6KB, ~30KB, ~120KB, ~1MB per doc (big tiers use fewer
+    // docs to keep per-iteration cost bounded)
     let mut g = c.benchmark_group("doc_length");
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    for wl in [100usize, 1000, 5000, 20000] {
-        let docs = corpus(1000, wl);
+    for wl in [100usize, 170, 1000, 5000, 20000, 160000] {
+        let n_docs = if wl >= 50000 { 16 } else { 1000 };
+        let docs = corpus(n_docs, wl);
         g.throughput(Throughput::Bytes(
             docs.iter().map(|s| s.len() as u64).sum::<u64>(),
         ));
@@ -205,7 +208,7 @@ fn doc_length(c: &mut Criterion) {
                 });
             },
         );
-        let ix = build_multi_segment_len(1000, 10, wl);
+        let ix = build_multi_segment_len(n_docs, 10, wl);
         for (tag, q) in [
             ("hot_term", "fox"),
             ("phrase", "\"winter storm\""),
