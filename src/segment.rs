@@ -186,15 +186,53 @@ pub fn freeze_parts(
     let mut fsts = Vec::with_capacity(postings.len());
     for (fid, terms) in postings.iter().enumerate() {
         let norms = field_norms.get(fid).map(|v| v.as_slice());
-        let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
         // sorted by term for the FST (HashMap keeps insertion order)
         let mut sorted: Vec<(&String, &PostingData)> = terms.iter().collect();
         sorted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        for (term, data) in sorted {
-            let info = data.freeze(norms).encode_to(&mut blob);
-            let ordinal = infos.len() as u64;
-            map_builder.insert(term.as_bytes(), ordinal).unwrap();
-            infos.push(info);
+        // R22: parallel per-term encoding. Each worker chunk freezes+encodes
+        // its own sub-blob (sections are self-contained), the serial fold
+        // appends the bytes and rebases section ranges; FST inserts stay
+        // sequential (ordinals are the global infos order).
+        let encoded: Vec<(Vec<u8>, Vec<TermInfo>, Vec<&String>)> = {
+            use rayon::prelude::*;
+            let workers = rayon::current_num_threads().max(1);
+            let chunk = sorted.len().div_ceil(workers).max(1);
+            sorted
+                .par_chunks(chunk)
+                .map(|part| {
+                    let mut sub = Vec::new();
+                    let mut local: Vec<TermInfo> = Vec::with_capacity(part.len());
+                    for (_, data) in part {
+                        let info = data.freeze(norms).encode_to(&mut sub);
+                        local.push(info);
+                    }
+                    let part_terms: Vec<&String> = part.iter().map(|(t, _)| *t).collect();
+                    (sub, local, part_terms)
+                })
+                .collect()
+        };
+        let mut map_builder = MapBuilder::new(Vec::new()).unwrap();
+        for (sub, mut local, part_terms) in encoded {
+            let base = blob.len() as u32;
+            for info in local.iter_mut() {
+                info.docids.start += base;
+                info.docids.end += base;
+                info.tfs.start += base;
+                info.tfs.end += base;
+                info.pos.start += base;
+                info.pos.end += base;
+                info.pos_offsets.start += base;
+                info.pos_offsets.end += base;
+                info.skips.start += base;
+                info.skips.end += base;
+            }
+            blob.extend_from_slice(&sub);
+            for (i, info) in local.iter().enumerate() {
+                let term = part_terms[i];
+                let ordinal = infos.len() as u64;
+                map_builder.insert(term.as_bytes(), ordinal).unwrap();
+                infos.push(info.clone());
+            }
         }
         fsts.push(Map::new(map_builder.into_inner().unwrap()).unwrap());
     }

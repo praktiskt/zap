@@ -37,6 +37,9 @@ const MAX_SEGMENTS: usize = 8;
 /// cached publish stats: (per-field length sums, global df, total docs)
 type StatsCache = (Vec<u64>, Arc<HashMap<(u32, String), u32>>, u64);
 
+/// per-segment merge scan: (per-field norm slices, store blocks, external ids)
+type SegScan = (Vec<Vec<u16>>, Vec<Box<[u8]>>, Vec<Option<String>>);
+
 /// resolved store payload for one document
 #[derive(Debug, Clone)]
 pub struct DocPayload {
@@ -619,29 +622,49 @@ pub(crate) fn merge_segments(
             }
         }
     }
+    // R22: parallel per-segment scan of norms + store blocks + external ids;
+    // which-parallel collect keeps segment order, the fold is order-preserving
+    let per_seg: Vec<SegScan> = {
+        use rayon::prelude::*;
+        (0..segs.len())
+            .into_par_iter()
+            .map(|si| {
+                let s = &segs[si];
+                let remap = &remaps[si];
+                let mut norms: Vec<Vec<u16>> = Vec::with_capacity(s.field_norms.len());
+                for n in s.field_norms.iter() {
+                    norms.push(
+                        n.iter()
+                            .enumerate()
+                            .filter(|(d, _)| remap[*d] != u32::MAX)
+                            .map(|(_, v)| *v)
+                            .collect(),
+                    );
+                }
+                let mut blocks = Vec::new();
+                let mut seg_ids = Vec::new();
+                for (docid, &nd) in remap.iter().enumerate() {
+                    if nd == u32::MAX {
+                        continue;
+                    }
+                    if let Some(block) = s.stored_raw(docid as u32) {
+                        blocks.push(block.to_vec().into_boxed_slice());
+                    }
+                    seg_ids.push(s.id_of(docid as u32).map(|x| x.to_owned()));
+                }
+                (norms, blocks, seg_ids)
+            })
+            .collect()
+    };
     let mut field_norms: Vec<Vec<u16>> = (0..nf).map(|_| Vec::new()).collect();
     let mut store_blocks: Vec<Box<[u8]>> = Vec::new();
     let mut ids: Vec<Option<String>> = Vec::new();
-    for (si, s) in segs.iter().enumerate() {
-        let remap = &remaps[si];
-        for (fid, norms) in s.field_norms.iter().enumerate() {
-            field_norms[fid].extend(
-                norms
-                    .iter()
-                    .enumerate()
-                    .filter(|(d, _)| remap[*d] != u32::MAX)
-                    .map(|(_, n)| *n),
-            );
+    for (seg_norms, blocks, seg_ids) in per_seg {
+        for (fid, n) in seg_norms.into_iter().enumerate() {
+            field_norms[fid].extend(n);
         }
-        for (docid, &nd) in remap.iter().enumerate() {
-            if nd == u32::MAX {
-                continue;
-            }
-            if let Some(block) = s.stored_raw(docid as u32) {
-                store_blocks.push(block.to_vec().into_boxed_slice());
-            }
-            ids.push(s.id_of(docid as u32).map(|s| s.to_owned()));
-        }
+        store_blocks.extend(blocks);
+        ids.extend(seg_ids);
     }
     let total = running;
     // per-field posting union. The field list alone saturates only multi-field
