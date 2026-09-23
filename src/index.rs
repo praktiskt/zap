@@ -496,7 +496,18 @@ impl Index {
                             );
                         }
                         _ => {
-                            let thr = || 0.0;
+                            // live threshold only for root-level phrase (the doc's score
+                            // IS the phrase score there, so a segment-level bound is
+                            // sound); nested phrases must evaluate unconditionally
+                            let phrase_root = matches!(&node, Node::Phrase { .. })
+                                || matches!(&node, Node::Field { node: inner, .. }
+                                    if matches!(**inner, Node::Phrase { .. }));
+                            let col: *mut TopK = &mut collector as *mut TopK;
+                            let thr: Box<dyn Fn() -> f32> = if phrase_root {
+                                Box::new(move || unsafe { (*col).threshold() })
+                            } else {
+                                Box::new(|| 0.0)
+                            };
                             let ctx = crate::search::exec::Ctx {
                                 schema: &self.schema,
                                 stats: &snap.stats,

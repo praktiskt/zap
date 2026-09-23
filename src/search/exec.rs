@@ -276,6 +276,12 @@ pub fn eval_allowed(
                         bm25_idf(ctx.stats.df_of(fid, t, info.df), ctx.stats.total_docs)
                     })
                     .sum();
+                // segment-level bound (sound only for root phrases, where the doc
+                // score equals the phrase score): bonus max = 1.5/n at minimal span
+                let score_max = idf_sum * (1.0 + 1.5 / infos.len() as f32);
+                if ctx.thr() > score_max {
+                    return acc;
+                }
                 let ps = phrase_scores(&infos, seg.blob(), idf_sum, *slop, 1.5);
                 acc = crate::search::union(&acc, &ps);
             }

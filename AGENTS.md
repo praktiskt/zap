@@ -41,7 +41,7 @@ validation gates, so embedding search can be added without re-shaping the docume
 ## Known perf sensitive spots (from history)
 - prefix/fuzzy: FST range/automaton paths (NOT dict scans — `stream_terms` full scans are perf-reject)
 - AND eval: streaming gallop-intersection with the smallest-df term as driver (R12/R15); bitmap-first double-scan is perf-reject (R3)
-- phrase cursors: must use galloping `seek_to`, never linear re-decode; hoist position buffers out of per-doc loops (R6)
+- phrase cursors: must use galloping `seek_to`, never linear re-decode; hoist position buffers out of per-doc loops (R6); min_span early-exits at minimal span n-1 (R17, 2x on huge docs); phrase eval is DUAL-PATH (R18): small-df = fused single-pass gallop merge + inline verify (do NOT split — two-pass cost +24-77% on small corpora), large-df (min_df >= 65536) = docid_vec decode + sorted-vec intersect + rayon-parallel per-doc verify (1M-doc phrase 43.3->24.6ms); roaring bitmap AND tried for intersection: no win (decode-bound, not seek-bound) — do not re-add; root-level phrase gets live-threshold segment skip, nested phrases must evaluate unconditionally (score-sum safety)
 - ingestion cost lands in `analyzer.tokenize` (charabia); parallelize per document lanes when possible
 - group-varint postings decode: perf-reject (R4, +57% term scan; branchy GV loses to plain varint at tested sizes 10k docs) — retry only with true fixed-width SIMD blocks
 - block-max WAND: implemented (streaming single-Term path + live threshold); skip anchors (16B: prev_docid/off/tf_max/len_min) power both galloping seek and block pruning; length tables are NOT term-local (field-level)

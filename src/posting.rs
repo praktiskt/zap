@@ -427,6 +427,23 @@ impl<'a> PostingReader<'a> {
         rb
     }
 
+    /// decode the full docid series into an ascending Vec (no bitmap container
+    /// overhead); caller intersects sorted vecs directly for large-df phrases
+    pub fn docid_vec(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.doc_count);
+        let mut prev = 0u32;
+        let mut c = self.docids_base;
+        while c < self.docids_end {
+            let (delta, n) = read_varint(self.blob, c);
+            c += n;
+            let (_, n2) = read_varint(self.blob, c);
+            c += n2;
+            prev += delta;
+            out.push(prev);
+        }
+        out
+    }
+
     /// decode next interleaved [delta][tf] pair; caches into `peeked`
     fn decode_next(&mut self) -> Option<(u32, u32)> {
         if self.docidx >= self.doc_count {

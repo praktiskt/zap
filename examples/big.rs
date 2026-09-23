@@ -66,4 +66,26 @@ fn main() {
             .map(|h| h.addr.docid)
             .collect::<Vec<_>>()
     );
+    // phrase at scale: candidate df spans ~1M (zipf hot pairs), mid, rare
+    let t2 = std::time::Instant::now();
+    let hits = index.search("\"winter storm\"", 10).unwrap();
+    println!(
+        "phrase \"winter storm\" hits={} in {:.2} ms",
+        hits.len(),
+        t2.elapsed().as_secs_f32() * 1e3
+    );
+    let t3 = std::time::Instant::now();
+    let hits = index.search("\"quixotic fox\"", 10).unwrap();
+    println!(
+        "phrase \"quixotic fox\" (df~59k) hits={} in {:.2} ms",
+        hits.len(),
+        t3.elapsed().as_secs_f32() * 1e3
+    );
+    let t4 = std::time::Instant::now();
+    let hits = index.search("\"storm bridge stone\"", 10).unwrap();
+    println!(
+        "phrase 3-term \"storm bridge stone\" hits={} in {:.2} ms",
+        hits.len(),
+        t4.elapsed().as_secs_f32() * 1e3
+    );
 }
