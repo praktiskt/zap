@@ -25,10 +25,11 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-/// parallel verification kicks in above this many candidate docs (serial below)
-const PAR_MIN_CANDIDATES: usize = 4096;
-/// minimum candidates per rayon chunk
-const PAR_CHUNK: usize = 2048;
+/// parallel verification kicks in above this many candidate docs (serial below);
+/// heavy docs make per-doc verify expensive, so parallel runs at low counts too
+const PAR_MIN_CANDIDATES: usize = 64;
+/// granularity floor for rayon chunking (candidates/threads wins below this)
+const PAR_CHUNK: usize = 8;
 
 /// track one posting stream positionally
 pub struct TermCursor<'a> {
@@ -96,6 +97,10 @@ pub fn min_span(lists: &[Vec<u32>], slop: u32) -> Option<u32> {
                 break;
             }
         }
+        // downstream list exhausted: no later start can form a chain, stop
+        if (1..n).any(|i| ptrs[i] >= lists[i].len()) {
+            break;
+        }
     }
     best
 }
@@ -118,7 +123,11 @@ fn verify_doc(
 
 /// df gate for the two-pass large-df phrase path (vec intersection + parallel verify)
 const VEC_MIN_DF: u64 = 65_536;
-
+/// position-bytes gate: documents whose positional payload dominates get the
+/// two-pass parallel verify even when their df is modest (huge-doc corpora).
+/// The old df-only gate left 1000x1M-char corpora single-threaded (R18-era
+/// threshold measured work by docid count, which says nothing about doc size).
+const VEC_MIN_POS_BYTES: u64 = 32_768;
 /// intersect all phrase cursors; bonus score scales with window tightness.
 /// Small-df phrases use the fused single-pass walk (gallop merge + inline
 /// window verify — no re-walk). Large-df phrases decode docid vecs, fold
@@ -138,7 +147,13 @@ pub fn phrase_scores(
     // bonus ∈ (0, phrase_boost]; span >= n_terms-1 always
     let score = |span: u32| idf_sum * (1.0 + phrase_boost / (1.0 + span as f32));
     let min_df = infos.iter().map(|i| i.df as u64).min().unwrap_or(0);
-    let large_df = n_terms >= 2 && min_df >= VEC_MIN_DF;
+    // work estimate: either many docs (df) or big positional payload (bytes)
+    let pos_bytes = infos
+        .iter()
+        .map(|i| (i.pos.end - i.pos.start) as u64)
+        .min()
+        .unwrap_or(0);
+    let large_df = n_terms >= 2 && (min_df >= VEC_MIN_DF || pos_bytes >= VEC_MIN_POS_BYTES);
 
     if !large_df {
         // fused single pass: gallop merge + verify in one walk over the postings
@@ -213,7 +228,10 @@ pub fn phrase_scores(
     }
     // parallel: chunk the ascending candidate list; each chunk owns fresh cursors
     // and reuses its position buffers across its docs
-    let chunk = PAR_CHUNK.max(candidates.len().div_ceil(rayon::current_num_threads()));
+    let chunk = candidates
+        .len()
+        .div_ceil(rayon::current_num_threads())
+        .max(PAR_CHUNK);
     let results: Vec<Vec<(u32, u32)>> = candidates
         .par_chunks(chunk)
         .map(|docs| {

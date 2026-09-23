@@ -149,6 +149,46 @@ fn main() {
                 );
             }
         }
+        "querybigscale" => {
+            // the big-docs-at-scale scenario: 1000 docs x 1M chars (~1GB of
+            // text, 160M tokens). Uses the parallel lane ingest.
+            let docs = corpus(1000, 160_000);
+            let mut schema = Schema::default();
+            schema.add_text("text", 1.0);
+            let index =
+                Index::with_lanes(schema, Analyzer::new(AnalyzerConf::default()), 1.2, 0.75, 8);
+            let t = Instant::now();
+            for d in &docs {
+                index
+                    .add_document(&Document::new().text("text", d.clone()))
+                    .unwrap();
+            }
+            index.commit();
+            println!(
+                "ingest 1000x1M-char: {t:?} ({:.1} MB/s, segs={})",
+                (docs.iter().map(|d| d.len()).sum::<usize>() as f64 / 1e6)
+                    / t.elapsed().as_secs_f64(),
+                index.num_segments()
+            );
+            for (tag, q, iters) in [
+                ("term fox (hot)", "fox", 50),
+                ("phrase \"winter storm\"", "\"winter storm\"", 20),
+                ("phrase \"storm bridge\"", "\"storm bridge\"", 20),
+                ("rare doc999", "doc999", 500),
+            ] {
+                for _ in 0..2 {
+                    black_box(index.search(q, 10).unwrap());
+                }
+                let t = Instant::now();
+                for _ in 0..iters {
+                    black_box(index.search(q, 10).unwrap());
+                }
+                println!(
+                    "bigscale {tag:>26}: {:9.1} us",
+                    t.elapsed().as_secs_f64() * 1e6 / iters as f64
+                );
+            }
+        }
         "phrase_breakdown" => {
             // where does 1M-char phrase time go: docid intersect vs position
             // decode vs min-window verify
