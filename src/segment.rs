@@ -106,9 +106,15 @@ impl SegmentBuilder {
                 .ok_or_else(|| format!("unknown field `{name}`"))?;
             let mut pos = 0u32;
             for tok in self.analyzer.tokenize(val) {
-                let e = self.postings[fid as usize]
-                    .entry(tok.text.clone())
-                    .or_default();
+                // R21: get-mut-first dict probe — token allocation only when the
+                // term is new to this builder (hot terms skip the per-occurrence
+                // String clone entirely)
+                let e = match self.postings[fid as usize].get_mut(tok.text.as_str()) {
+                    Some(e) => e,
+                    None => self.postings[fid as usize]
+                        .entry(tok.text.clone())
+                        .or_default(),
+                };
                 if e.docids.last() == Some(&docid) {
                     // repeated token in the same doc: bump tf, extend positions
                     let last = e.tfs.len() - 1;

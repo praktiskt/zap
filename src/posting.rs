@@ -62,6 +62,14 @@ impl PostingData {
         self.docids.is_empty()
     }
 
+    /// fold a partial-merge posting list into this one; docids must already be
+    /// globally sorted across the two (per-chunk docid ranges concatenate cleanly)
+    pub fn absorb(&mut self, other: PostingData) {
+        self.docids.extend_from_slice(&other.docids);
+        self.tfs.extend_from_slice(&other.tfs);
+        self.positions.extend(other.positions);
+    }
+
     pub fn freeze(&self, norms: Option<&[u16]>) -> FrozenPosting {
         // R16: interleaved [delta_i][tf_i] per doc, one cursor.
         // WAND: anchors carry per-block max tf + min doc len for score-bound pruning.

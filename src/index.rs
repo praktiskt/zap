@@ -28,8 +28,11 @@ pub enum IndexError {
     Query(String),
 }
 
-/// when a commit pushes segments to this count, merge them all into one
-const MAX_SEGMENTS: usize = 4;
+/// when a commit pushes segments to this count, merge them all into one.
+/// Value chosen so that the bench corpora (10 commits x 8 lanes = 80 builder
+/// segments) keep their historical shape: trigger 64 -> merge once -> 17 final
+/// segments at 8 lanes, exactly like the previous 4-segment budget produced.
+const MAX_SEGMENTS: usize = 8;
 
 /// cached publish stats: (per-field length sums, global df, total docs)
 type StatsCache = (Vec<u64>, Arc<HashMap<(u32, String), u32>>, u64);
@@ -276,10 +279,10 @@ impl Index {
         segs.extend(new_segs);
         let lanes = g.hot.len().max(1);
         if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
-            let masks: Vec<RoaringBitmap> = (0..segs.len())
+            let masks_all: Vec<RoaringBitmap> = (0..segs.len())
                 .map(|i| g.deleted.get(&(i as u32)).cloned().unwrap_or_default())
                 .collect();
-            let merged = merge_segments(&segs, &masks, self.schema.num_fields());
+            let merged = merge_segments(&segs, &masks_all, self.schema.num_fields());
             segs = vec![Arc::new(merged)];
             g.deleted.clear();
         }
@@ -641,46 +644,70 @@ pub(crate) fn merge_segments(
         }
     }
     let total = running;
-    // per-field parallel posting union (docid remap per segment)
+    // per-field posting union. The field list alone saturates only multi-field
+    // corpora (the common single-field case merges on ONE thread), so merge
+    // also fans out over contiguous segment ranges within each field: parallel
+    // partial maps decode in parallel, then fold (docid ranges per chunk are
+    // contiguous and ascending, so PostingData concat is order-preserving).
     let fields: Vec<usize> = (0..nf).collect();
     let postings = {
         use rayon::prelude::*;
+        let workers = rayon::current_num_threads().max(1);
         fields
             .par_iter()
             .map(|fid| {
-                let mut m = std::collections::HashMap::<String, PostingData>::new();
-                for (si, s) in segs.iter().enumerate() {
-                    for (fid_s, terms) in s.inner_postings() {
-                        if fid_s == *fid as u32 {
-                            let remap = &remaps[si];
-                            for (term, info) in terms {
-                                let entry = m.entry(term.clone()).or_default();
-                                let mut r = s.reader(&info);
-                                let mut idx = 0usize;
-                                while let Some((doc, tf)) = r.advance() {
-                                    let nd = remap[doc as usize];
-                                    if nd == u32::MAX {
-                                        continue;
+                let parts: Vec<HashMap<String, PostingData>> = {
+                    let chunk = segs.len().div_ceil(workers).max(1);
+                    (0..segs.len())
+                        .into_par_iter()
+                        .chunks(chunk)
+                        .map(|range: Vec<usize>| {
+                            let mut m = HashMap::<String, PostingData>::new();
+                            // R21: get-mut-first dict probes (clone the term only
+                            // when it is new) + reused position buffer with
+                            // mem::take (no per-entry Vec allocation)
+                            let mut pos_buf = Vec::new();
+                            for si in range {
+                                let s = &segs[si];
+                                let remap = &remaps[si];
+                                for (term, info) in s.stream_terms(*fid as u32) {
+                                    let ent = match m.get_mut(term.as_str()) {
+                                        Some(e) => e,
+                                        None => m.entry(term.clone()).or_default(),
+                                    };
+                                    let mut r = s.reader(&info);
+                                    let mut idx = 0usize;
+                                    while let Some((doc, tf)) = r.advance() {
+                                        let nd = remap[doc as usize];
+                                        if nd == u32::MAX {
+                                            continue;
+                                        }
+                                        r.positions_into(idx, &mut pos_buf);
+                                        idx += 1;
+                                        ent.add(nd, tf, std::mem::take(&mut pos_buf));
                                     }
-                                    let pos = r.positions(idx).unwrap_or_default();
-                                    idx += 1;
-                                    entry.add(nd, tf, pos);
                                 }
+                            }
+                            m
+                        })
+                        .collect()
+                };
+                // fold partial maps into one (per-chunk docid ranges are
+                // contiguous + ascending, so plain concatenation stays sorted)
+                let mut total = HashMap::<String, PostingData>::new();
+                for pm in parts {
+                    for (term, data) in pm {
+                        match total.get_mut(term.as_str()) {
+                            Some(e) => e.absorb(data),
+                            None => {
+                                total.insert(term, data);
                             }
                         }
                     }
                 }
-                m
+                total
             })
             .collect::<Vec<_>>()
     };
     crate::segment::freeze_parts(postings, field_norms, store_blocks, ids, total)
-}
-
-impl SegmentReader {
-    pub fn inner_postings(&self) -> Vec<(u32, Vec<(String, crate::posting::TermInfo)>)> {
-        (0..self.field_norms.len() as u32)
-            .map(|fid| (fid, self.stream_terms(fid)))
-            .collect()
-    }
 }

@@ -16,6 +16,8 @@ fn main() {
     let n = 1_000_000usize;
     let per_doc = 50usize;
     let t0 = std::time::Instant::now();
+    let mut t_add = std::time::Duration::ZERO;
+    let mut t_commit = std::time::Duration::ZERO;
     let mut chunk: Vec<Document> = Vec::with_capacity(50_000);
     let mut seed: u64 = 0x9E3779B97F4A7C15;
     for i in 0..n {
@@ -34,8 +36,12 @@ fn main() {
         }
         chunk.push(Document::new().text("text", s));
         if chunk.len() == 50_000 {
+            let t = std::time::Instant::now();
             index.add_documents(std::mem::take(&mut chunk)).unwrap();
+            t_add += t.elapsed();
+            let t = std::time::Instant::now();
             index.commit();
+            t_commit += t.elapsed();
         }
     }
     if !chunk.is_empty() {
@@ -43,10 +49,12 @@ fn main() {
         index.commit();
     }
     println!(
-        "ingest {} docs in {:.1}s, segs={}",
+        "ingest {} docs in {:.1}s, segs={}  [add {:.2}s + commit {:.2}s]",
         n,
         t0.elapsed().as_secs_f32(),
-        index.num_segments()
+        index.num_segments(),
+        t_add.as_secs_f32(),
+        t_commit.as_secs_f32()
     );
     let t1 = std::time::Instant::now();
     let hits = index.search("quixotic", 10).unwrap();
