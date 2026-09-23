@@ -2,6 +2,17 @@
 
 use std::collections::HashMap;
 
+/// one document as returned by a get-by-id / search result store read
+#[derive(Debug, Clone, Default)]
+pub struct StoredDoc {
+    /// external id, when the doc carries one
+    pub id: Option<String>,
+    /// (field_id, text) pairs, sorted by field id
+    pub fields: Vec<(u32, String)>,
+    /// stored-only metadata, when the doc carries it
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldKind {
     #[allow(dead_code)]
@@ -68,9 +79,14 @@ impl Schema {
     }
 }
 
-/// one document: field -> text. Unknown fields are rejected at add time.
+/// one document: optional external id, stored-only metadata, field -> text.
+/// Unknown fields are rejected at add time.
 #[derive(Debug, Clone, Default)]
 pub struct Document {
+    /// user-assigned identity (unique across the live index); None = implicit internal id
+    pub id: Option<String>,
+    /// arbitrary JSON, stored only (never tokenized or scored)
+    pub metadata: Option<serde_json::Value>,
     pub fields: HashMap<String, String>,
 }
 
@@ -81,6 +97,16 @@ impl Document {
 
     pub fn text(mut self, field: &str, value: impl Into<String>) -> Self {
         self.fields.insert(field.to_string(), value.into());
+        self
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }

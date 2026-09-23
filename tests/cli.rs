@@ -90,8 +90,15 @@ fn serve_subcommand_starts_http_api() {
     s.write_all(b"GET /search?q=fox HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut resp_buf = [0u8; 65536];
-    s.read(&mut resp_buf).unwrap();
-    let resp = String::from_utf8_lossy(&resp_buf).into_owned();
+    let mut resp = Vec::new();
+    loop {
+        let n = s.read(&mut resp_buf).unwrap();
+        resp.extend_from_slice(&resp_buf[..n]);
+        if n == 0 {
+            break;
+        }
+    }
+    let resp = String::from_utf8_lossy(&resp).into_owned();
     let body = resp
         .split_once("\r\n\r\n")
         .map(|(_, b)| b.to_owned())

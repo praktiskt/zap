@@ -13,6 +13,9 @@ ingest: 10k × 200w docs in 320 ms  •  1M × 50w docs in 16 s (60k docs/s)
 
 ## What's inside
 - **BM25 ranking** (Lucene-style idf) + phrase-window bonus + per-field boosts
+- **External doc ids + metadata**: user-assigned unique string ids (duplicate ingest
+  replaces), arbitrary stored-only JSON metadata, get/delete-by-id over lock-free
+  snapshots; tombstones mask deleted docs and are physically purged by merge
 - **Full query language**: boolean ops with parens, phrases with slop, `field:` scoping,
   prefix/wildcard globs, fuzzy `~N` (Levenshtein DFA over the term FST)
 - **Segments**: immutable sealed segments (FST term dict + delta-varint postings +
@@ -64,13 +67,13 @@ src/main.rs       CLI + serve dispatch
 src/index.rs      writer: hot lanes, commit, log-tier merge, snapshots
 src/query.rs      query AST + recursive-descent parser
 src/search/       scoring: DocScores merges, phrase windows, block-max WAND, exec tree
-src/segment.rs    segment freeze (FSTs per field + doc store)
+src/segment.rs    segment freeze (FSTs per field + doc store: v2 blocks with id/metadata)
 src/posting.rs    postings: interleave [delta][tf], skip anchors, galloping seeks
 src/analyzer.rs   charabia + stemmer, one analyzer pipeline shared by docs and queries
 src/server.rs     tiny_http serve mode
-tests/            property + integration suite (41 tests)
+tests/            property + integration suite (57 tests)
 benches/search.rs criterion scale + doc-length matrix
-examples/big.rs   1M-doc probe   example: wand.rs: skew probe
+examples/big.rs   1M-doc probe   example: wand.rs: skew probe   example: smoke.rs: quick timings
 ```
 
 ## HTTP serve mode
@@ -83,13 +86,20 @@ zap serve --bind 127.0.0.1:3279 --stdin-lines   # empty index, ingest via HTTP
 | endpoint | method | meaning |
 |---|---|---|
 | `/health` | GET | liveness |
-| `/stats` | GET | docs / segments / generation |
+| `/stats` | GET | live docs / segments / generation |
 | `/search?q=..&k=N` | GET | query string search (percent-encoded) |
 | `/search` | POST | `{"q":"..","k":N}` body search |
 | `/ingest` | POST | NDJSON `{"text":..}` lines or a JSON array of them (auto-commit) |
 | `/commit` | POST | explicit segment commit |
+| `/doc/{id}` | GET | stored fields + metadata for one external id |
+| `/doc/{id}` | DELETE | tombstone one doc (visible immediately, purged at merge) |
 
-Search result shape: `{"results":[{"score":0.71,"id":0,"doc":"text"}],"count":N}`.
+Ingest docs accept optional `"id"` (string, unique — duplicates replace) and
+`"metadata"` (arbitrary JSON, stored only, never tokenized).
+
+Search result shape: `{"results":[{"score":0.71,"id":"my-doc","docid":42,"doc":"text",
+"metadata":{...}}],"count":N}` — `"id"` is the external id (`null` when absent),
+`"docid"` is the internal segment-local address, `"metadata"` only when present.
 Ingest accepts a 64 MB body per call; docs commit per request. Sockets are plain
 threads (no async runtime) — the engine is CPU-bound sync.
 
@@ -114,15 +124,19 @@ Ingest: 10k × 200w in 320 ms; 1M × 50w (8 lanes) in ~16 s.
 
 ## Correctness
 
-41-test suite: `cargo test`
+57-test suite: `cargo test`
 - WAND-vs-dense evaluator equivalence (proptest, skewed corpora)
 - skip-anchor invariants (seek = first doc ≥ t; positions source-identical)
 - merge-heavy lane builds match single-lane reference (tie-tolerant compare)
 - long-doc (100k chars) roundtrip; degenerate-input edge cases
-- docstore decode fuzz (never panics on garbage)
-- concurrent commit + reader stress; top-k outlier canary; CLI e2e over real sockets
+- docstore decode fuzz (never panics on garbage; v2 blocks roundtrip raw + lz4)
+- ids: roundtrip, replace across commit boundaries, delete masking (WAND/dense/
+  fuzzy/prefix paths), tombstone purge at merge, duplicate batches, HTTP lifecycle
+- concurrent commit + reader stress (incl. replace/delete storm); top-k outlier
+  canary; CLI e2e over real sockets
 
 Benchmarks: `cargo bench --bench search -- --noplot <filter>`.
+Quick iteration: `cargo run --release --example smoke` (~1 s wall, coarse timings).
 
 ## Roadmap
 

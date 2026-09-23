@@ -40,11 +40,18 @@ fn longdoc_roundtrip() {
     let hits = index.search("leaf", 5).unwrap();
     assert_eq!(hits.len(), 1, "tf-heavy leaf doc must hit");
     // fieldnorm u16 must record every token (~2800)
-    let stored = index.stored_fields(hits[0].addr).unwrap();
-    assert_eq!(stored[0].1.len(), text.len(), "docstore bytes survive");
-    assert!(stored[0].1.contains("中文"), "CJK inside long doc stored");
+    let stored = index.doc_payload(hits[0].addr).unwrap();
+    assert_eq!(
+        stored.fields[0].1.len(),
+        text.len(),
+        "docstore bytes survive"
+    );
     assert!(
-        stored[0].1.contains("ここ"),
+        stored.fields[0].1.contains("中文"),
+        "CJK inside long doc stored"
+    );
+    assert!(
+        stored.fields[0].1.contains("ここ"),
         "multi-block inside long doc stored"
     );
 

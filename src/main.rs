@@ -222,8 +222,11 @@ fn main() -> Result<()> {
                     println!("no hits");
                 }
                 for hit in &hits {
-                    if let Some(fields) = index.stored_fields(hit.addr) {
-                        for (name, text) in &fields {
+                    if let Some(p) = index.doc_payload(hit.addr) {
+                        if let Some(id) = &p.id {
+                            println!("score={:.4} id={} |", hit.score, id);
+                        }
+                        for (name, text) in &p.fields {
                             let snippet = snippet_of(text, &highlight, args.snippet, args.plain);
                             println!("score={:.4} {} | {}", hit.score, name, snippet);
                         }

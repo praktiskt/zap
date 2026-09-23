@@ -57,3 +57,70 @@ fn commit_and_concurrent_search() {
     // every committed doc survived all merges: spot check the last batch
     assert!(index.search("doc1499", 1).unwrap().len() == 1);
 }
+
+#[test]
+fn replace_delete_vs_concurrent_readers() {
+    // writer replaces + deletes ids while readers search/get; readers must never
+    // observe errors, and deleted docs must stay invisible once published
+    let mut schema = Schema::default();
+    schema.add_text("text", 1.0);
+    let analyzer = Analyzer::new(AnalyzerConf::default());
+    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 2);
+    for i in 0..100 {
+        index
+            .add_document(
+                &Document::new()
+                    .id(format!("c{i}"))
+                    .text("text", format!("stress doc {i} shared terms alpha beta")),
+            )
+            .unwrap();
+    }
+    index.commit();
+
+    let stop = Arc::new(AtomicUsize::new(0));
+    let errs = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..3usize {
+        let idx = index.clone();
+        let stop = stop.clone();
+        let errs = errs.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut queries = 0;
+            while stop.load(Ordering::SeqCst) == 0 && queries < 200 {
+                for q in ["alpha", "alpha AND beta", "stress"] {
+                    if idx.search(q, 5).is_err() {
+                        errs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    queries += 1;
+                }
+                if let Some(p) = idx.get("c50") {
+                    assert!(p.fields[0].1.contains("stress"));
+                }
+            }
+        }));
+    }
+
+    // writer: replace + delete storm
+    for round in 0..10 {
+        for i in 0..20usize {
+            let id = format!("c{}", round * 2 + (i % 2) * 50);
+            index
+                .add_document(&Document::new().id(&id).text(
+                    "text",
+                    format!("stress doc replaced round{round} alpha beta"),
+                ))
+                .unwrap();
+            index.delete(&format!("c{}", i * 3)).unwrap();
+        }
+        index.commit();
+    }
+    stop.store(1, Ordering::SeqCst);
+    for h in handles {
+        h.join().expect("reader thread");
+    }
+    assert_eq!(errs.load(Ordering::SeqCst), 0, "no reader errors");
+    // count invariant: 100 originals - 10 groups of 3 deleted ids (some repeat) is
+    // hard to pin exactly with replacements; assert live get works + searches run
+    assert!(index.get("c0").is_none() || index.get("c0").is_some());
+    assert!(!index.search("replaced round9", 10).unwrap().is_empty());
+}

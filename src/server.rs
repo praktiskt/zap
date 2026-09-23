@@ -103,6 +103,34 @@ fn handle(mut req: Request, index: &Index) {
                 serde_json::json!({ "committed": true, "docs": index.num_docs() }).to_string();
             reply(req, 200, &body);
         }
+        (Method::Get, p) if p.starts_with("/doc/") => {
+            let id = url_decode(&p["/doc/".len()..]);
+            match index.get(&id) {
+                Some(p) => {
+                    let mut v = serde_json::json!({
+                        "id": p.id,
+                        "fields": p.fields,
+                    });
+                    if let Some(meta) = p.metadata {
+                        v["metadata"] = meta;
+                    }
+                    reply(req, 200, &v.to_string());
+                }
+                None => reply(req, 404, r#"{"error":"not found"}"#),
+            }
+        }
+        (Method::Delete, p) if p.starts_with("/doc/") => {
+            let id = url_decode(&p["/doc/".len()..]);
+            match index.delete(&id) {
+                Ok(true) => reply(
+                    req,
+                    200,
+                    &serde_json::json!({ "deleted": true, "docs": index.num_docs() }).to_string(),
+                ),
+                Ok(false) => reply(req, 404, r#"{"error":"not found"}"#),
+                Err(e) => reply(req, 400, &e.to_string()),
+            }
+        }
         _ => {
             reply(req, 404, r#"{"error":"not found"}"#);
         }
@@ -114,19 +142,25 @@ fn search_reply(req: Request, index: &Index, q: String, k: usize) {
         Ok(hits) => {
             let results: Vec<serde_json::Value> = hits
                 .iter()
-                .map(|h| {
-                    let doc = index
-                        .stored_fields(h.addr)
-                        .unwrap_or_default()
-                        .into_iter()
+                .filter_map(|h| {
+                    let p = index.doc_payload(h.addr)?;
+                    let doc = p
+                        .fields
+                        .iter()
                         .map(|(_name, text)| text)
+                        .cloned()
                         .collect::<Vec<_>>()
                         .join("\n");
-                    serde_json::json!({
+                    let mut v = serde_json::json!({
                         "score": h.score,
-                        "id": h.addr.docid,
+                        "id": p.id,
+                        "docid": h.addr.docid,
                         "doc": doc,
-                    })
+                    });
+                    if let Some(meta) = p.metadata {
+                        v["metadata"] = meta;
+                    }
+                    Some(v)
                 })
                 .collect();
             reply(
@@ -155,7 +189,9 @@ fn json_search(body: &str) -> Result<(String, usize), String> {
     Ok((q, k))
 }
 
-/// NDJSON (one `{"text": ...}` per line) or a JSON array of such objects
+/// NDJSON (one `{"text": ...}` per line) or a JSON array of such objects.
+/// Optional per doc: `"id"` (string, unique — duplicates replace) and
+/// `"metadata"` (arbitrary JSON, stored-only).
 fn ingest(req: &mut Request, index: &Index) -> Result<usize, String> {
     let body = read_body(req)?;
     if body.is_empty() {
@@ -189,12 +225,22 @@ fn ingest(req: &mut Request, index: &Index) -> Result<usize, String> {
 }
 
 fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
-    let text = v
-        .as_object()
-        .and_then(|o| o.get("text"))
+    let obj = v.as_object().ok_or("each doc must be a JSON object")?;
+    let text = obj
+        .get("text")
         .and_then(|x| x.as_str())
         .ok_or("each doc requires a string `text` field")?;
-    Ok(Document::new().text("text", text))
+    let mut doc = Document::new().text("text", text);
+    if let Some(id) = obj.get("id") {
+        let id = id.as_str().ok_or("`id` must be a string")?;
+        doc = doc.id(id);
+    }
+    if let Some(meta) = obj.get("metadata") {
+        if !meta.is_null() {
+            doc = doc.metadata(meta.clone());
+        }
+    }
+    Ok(doc)
 }
 
 fn read_body(req: &mut Request) -> Result<String, String> {

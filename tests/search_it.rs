@@ -36,8 +36,8 @@ fn texts(index: &Index, q: &str) -> Vec<String> {
         .search(q, 10)
         .unwrap()
         .into_iter()
-        .filter_map(|h| index.stored_fields(h.addr))
-        .map(|f| f[0].1.clone())
+        .filter_map(|h| index.doc_payload(h.addr))
+        .map(|f| f.fields[0].1.clone())
         .collect()
 }
 
@@ -102,8 +102,11 @@ fn commit_merge() {
     assert_eq!(hits.len(), 4);
     // every hit contains the stem `fox`
     for h in &hits {
-        let f = index.stored_fields(h.addr).unwrap();
-        assert!(f[0].1.contains("fox") || f[0].1.contains("foxes"), "{f:?}");
+        let f = index.doc_payload(h.addr).unwrap();
+        assert!(
+            f.fields[0].1.contains("fox") || f.fields[0].1.contains("foxes"),
+            "{f:?}"
+        );
     }
 }
 

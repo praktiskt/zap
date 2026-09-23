@@ -33,7 +33,8 @@ validation gates, so embedding search can be added without re-shaping the docume
 ## Non-perf rules
 - always cargo fmt + clippy clean before commit
 - integration tests in `tests/`; crate tests in `src/`
-- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10)
+- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10), `ids.rs` (T11: external ids/metadata/replace/delete), `serve.rs` (HTTP incl. /doc/{id} lifecycle), `search_it.rs` (boolean/phrase integration)
+- benchmarking: use `examples/smoke.rs` (`cargo run --release --example smoke`, ~1 s) for iteration feedback; run rigorous criterion benches (`cargo bench --bench search -- --noplot <filter>`) sparsely — at meaningful checkpoints only, not per change
 - do not use ad-hoc sed/python for edits unless trivial; prefer dedicated tools when editing files
 - top-k tie ordering across different index builds is NOT stable (heap tie-break by docid/addr): property tests must compare as unordered (score,text) multisets, or filter entries strictly above the kth-score threshold
 
@@ -45,6 +46,8 @@ validation gates, so embedding search can be added without re-shaping the docume
 - group-varint postings decode: perf-reject (R4, +57% term scan; branchy GV loses to plain varint at tested sizes 10k docs) — retry only with true fixed-width SIMD blocks
 - block-max WAND: implemented (streaming single-Term path + live threshold); skip anchors (16B: prev_docid/off/tf_max/len_min) power both galloping seek and block pruning; length tables are NOT term-local (field-level)
 - inline `[delta][tf]` posting layout (R16): single cursor; do NOT split docid/tf streams again
+- external ids: snapshot `ids` map + per-segment `id_fwd` rebuilt ONLY at segment change; tombstone-only publishes (delete) are O(1) via cached Arc'd df stats + id map, readers mask via `deleted`; deleting from hot lanes commits first — do NOT add hot-lane deletion machinery
+- doc store v2: [tag][len][flags][n][TLV fields][id][metadata]; merge copies blocks verbatim (ids/metadata survive free); purge at merge uses per-segment docid remap (u32::MAX = purged)
 
 ## Future rounds, if we resume WAND/general top-k work
 - WAND fan-out into AND/OR walkers (currently only single-Term streaming prunes)

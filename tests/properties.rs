@@ -130,7 +130,7 @@ fn build_index(docs: &[String]) -> (Arc<Index>, Stats, Arc<zap::segment::Segment
     }
     stats.total_docs = total as u32;
     stats.avg_len = vec![sums[0] as f32 / total.max(1) as f32];
-    stats.df = df;
+    stats.df = std::sync::Arc::new(df);
     (index, stats, seg)
 }
 
@@ -203,7 +203,7 @@ proptest! {
         for k in [1usize, 3, 10] {
             let dense = dense_topk(&node, &seg, &ctx, k);
             let mut wcol = TopK::new(k);
-            eval_term_stream(&node, None, &seg, &ctx, &mut wcol);
+            eval_term_stream(&node, None, &seg, &ctx, None, &mut wcol);
             let wand = wcol.into_sorted();
             assert_eq!(dense.len(), wand.len(), "k={k} hit counts differ");
             for (dh, wh) in dense.iter().zip(wand.iter()) {
@@ -237,7 +237,7 @@ proptest! {
                 threshold: &(move || thr_val),
             };
             let mut wcol = TopK::new(kk);
-            eval_term_stream(&node, None, &seg, &ctx_prune, &mut wcol);
+            eval_term_stream(&node, None, &seg, &ctx_prune, None, &mut wcol);
             let wand = wcol.into_sorted();
             assert_eq!(
                 dense.iter().map(|h| h.addr).collect::<Vec<_>>(),
@@ -319,8 +319,8 @@ proptest! {
                     .unwrap()
                     .into_iter()
                     .map(|h| {
-                        let fields = ref_index.stored_fields(h.addr).unwrap();
-                        (fields[0].1.clone(), h.score.to_bits().to_string(), h.addr.docid)
+                        let fields = ref_index.doc_payload(h.addr).unwrap();
+                        (fields.fields[0].1.clone(), h.score.to_bits().to_string(), h.addr.docid)
                     })
                     .collect()
             })
@@ -350,8 +350,8 @@ proptest! {
             let mut got: Vec<(String, String)> = hits
                 .iter()
                 .map(|h| {
-                    let fields = merged_index.stored_fields(h.addr).unwrap();
-                    (fields[0].1.clone(), h.score.to_bits().to_string())
+                    let fields = merged_index.doc_payload(h.addr).unwrap();
+                    (fields.fields[0].1.clone(), h.score.to_bits().to_string())
                 })
                 .collect();
             let mut refs: Vec<(String, String)> = ref_hits[qi]

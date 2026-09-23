@@ -21,8 +21,8 @@ pub struct Stats {
     pub total_docs: u32,
     /// field id -> average doc length
     pub avg_len: Vec<f32>,
-    /// (field id, term) -> global doc frequency
-    pub df: HashMap<(u32, String), u32>,
+    /// (field id, term) -> global doc frequency (Arc-shared across snapshots)
+    pub df: std::sync::Arc<HashMap<(u32, String), u32>>,
 }
 
 impl Stats {
@@ -30,7 +30,7 @@ impl Stats {
         Self {
             total_docs: 0,
             avg_len: Vec::new(),
-            df: HashMap::new(),
+            df: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -111,11 +111,13 @@ pub fn eval(
 
 /// single-term streaming with live topk threshold (block-max WAND lite)
 /// returns true if the node was handled (plain Term); blog members pushed into `col`
+/// `allowed`: tombstone mask complement — docs outside it are live-only probes
 pub fn eval_term_stream(
     node: &Node,
     scope: Option<u32>,
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
+    allowed: Option<&RoaringBitmap>,
     col: &mut crate::search::TopK,
 ) -> bool {
     let Node::Term(t) = node else {
@@ -134,6 +136,11 @@ pub fn eval_term_stream(
             let mut seen_block = usize::MAX;
             let norms = seg.norms(fid);
             while let Some((doc, tf)) = r.advance() {
+                if let Some(al) = allowed {
+                    if !al.contains(doc) {
+                        continue;
+                    }
+                }
                 let blk = r.cur_block();
                 if blk != seen_block {
                     seen_block = blk;
@@ -283,7 +290,11 @@ pub fn eval_allowed(
         Node::Not(child) => {
             let ds = eval_allowed(child, scope, seg, ctx, allowed);
             let docs: RoaringBitmap = ds.ids.iter().collect();
-            DocScores::all((0..seg.num_docs).filter(|d| !docs.contains(*d)).collect())
+            DocScores::all(
+                (0..seg.num_docs)
+                    .filter(|d| allowed.is_none_or(|a| a.contains(*d)) && !docs.contains(*d))
+                    .collect(),
+            )
         }
         Node::Or(items) => {
             let mut acc = DocScores::default();

@@ -11,14 +11,17 @@ use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 use crate::analyzer::Analyzer;
 use crate::posting::{PostingData, PostingReader, TermInfo};
-use crate::schema::{Document, Schema};
+use crate::schema::{Document, Schema, StoredDoc};
 use std::sync::Arc;
 
 /// doc-store size gate: below this, store raw instead of lz4 (frequent tiny docs)
 const RAW_STORE_THRESHOLD: usize = 4096;
 const STORE_RAW_TAG: u8 = 0x00;
 const STORE_COMP_TAG: u8 = 0x01;
-/// single doc store block: count + TLV(field_id, len, text bytes)
+/// block flags: bit0 = external id present, bit1 = metadata present
+const BLOCK_FLAG_ID: u8 = 0b0000_0001;
+const BLOCK_FLAG_META: u8 = 0b0000_0010;
+/// block layout: [tag][len u32][flags u8][n u8][TLV(fid u32, len u32, text)][id len u32 + utf8][meta len u32 + json]
 fn encode_store(doc: &Document, schema: &Schema) -> Result<Vec<u8>, String> {
     let mut pairs: Vec<(u32, &String)> = doc
         .fields
@@ -32,11 +35,28 @@ fn encode_store(doc: &Document, schema: &Schema) -> Result<Vec<u8>, String> {
         .collect::<Result<_, String>>()?;
     pairs.sort_by_key(|p| p.0);
     let mut block = Vec::new();
+    let mut flags = 0u8;
+    if doc.id.is_some() {
+        flags |= BLOCK_FLAG_ID;
+    }
+    if doc.metadata.is_some() {
+        flags |= BLOCK_FLAG_META;
+    }
+    block.push(flags);
     block.push(pairs.len() as u8);
     for (fid, val) in pairs {
         block.extend_from_slice(&fid.to_le_bytes());
         block.extend_from_slice(&(val.len() as u32).to_le_bytes());
         block.extend_from_slice(val.as_bytes());
+    }
+    if let Some(id) = &doc.id {
+        block.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        block.extend_from_slice(id.as_bytes());
+    }
+    if let Some(meta) = &doc.metadata {
+        let json = serde_json::to_vec(meta).map_err(|e| format!("metadata: {e}"))?;
+        block.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        block.extend_from_slice(&json);
     }
     Ok(block)
 }
@@ -51,6 +71,8 @@ pub struct SegmentBuilder {
     field_norms: Vec<Vec<u16>>,
     /// lz4-compressed blocks, one per doc
     store_blocks: Vec<Box<[u8]>>,
+    /// per-doc external id (None = implicit internal id only)
+    ids: Vec<Option<String>>,
 }
 
 impl SegmentBuilder {
@@ -69,6 +91,7 @@ impl SegmentBuilder {
             postings,
             field_norms,
             store_blocks: Vec::new(),
+            ids: Vec::new(),
         }
     }
 
@@ -114,6 +137,7 @@ impl SegmentBuilder {
             c.into_boxed_slice()
         };
         self.store_blocks.push(stored);
+        self.ids.push(doc.id.clone());
         self.num_docs += 1;
         Ok(docid)
     }
@@ -123,6 +147,7 @@ impl SegmentBuilder {
             self.postings,
             self.field_norms,
             self.store_blocks,
+            self.ids,
             self.num_docs,
         )
     }
@@ -136,6 +161,10 @@ pub struct SegmentReader {
     blob: Box<[u8]>,
     pub field_norms: Vec<Box<[u16]>>,
     store_blocks: Vec<Box<[u8]>>,
+    /// docid-indexed external ids; empty when the segment has no ids at all
+    ids: Vec<Option<String>>,
+    /// docids sorted by their id (binary-search forward index); empty iff ids is empty
+    id_fwd: Vec<u32>,
 }
 
 /// shared by SegmentBuilder::freeze and segment merge
@@ -143,6 +172,7 @@ pub fn freeze_parts(
     postings: Vec<HashMap<String, PostingData>>,
     field_norms: Vec<Vec<u16>>,
     store_blocks: Vec<Box<[u8]>>,
+    ids: Vec<Option<String>>,
     num_docs: u32,
 ) -> SegmentReader {
     let mut blob: Vec<u8> = Vec::new();
@@ -162,6 +192,22 @@ pub fn freeze_parts(
         }
         fsts.push(Map::new(map_builder.into_inner().unwrap()).unwrap());
     }
+    // forward id index: only materialized when at least one doc carries an id
+    let any_ids = ids.iter().any(Option::is_some);
+    let (ids, id_fwd) = if any_ids {
+        let mut fwd: Vec<u32> = (0..num_docs)
+            .filter(|d| ids[*d as usize].is_some())
+            .collect();
+        fwd.sort_unstable_by(|a, b| {
+            ids[*a as usize]
+                .as_deref()
+                .unwrap()
+                .cmp(ids[*b as usize].as_deref().unwrap())
+        });
+        (ids, fwd)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     SegmentReader {
         num_docs,
         fsts,
@@ -172,13 +218,36 @@ pub fn freeze_parts(
             .map(|v| v.into_boxed_slice())
             .collect(),
         store_blocks,
+        ids,
+        id_fwd,
     }
 }
 
 impl SegmentReader {
-    /// raw (still compressed) stored doc block
+    /// raw (still compressed) store block for one doc
     pub fn stored_raw(&self, docid: u32) -> Option<&[u8]> {
         self.store_blocks.get(docid as usize).map(|b| b.as_ref())
+    }
+
+    /// external id of a segment-local docid (cheap: one Vec index)
+    pub fn id_of(&self, docid: u32) -> Option<&str> {
+        self.ids.get(docid as usize).and_then(|o| o.as_deref())
+    }
+
+    /// true when at least one doc in this segment carries an external id
+    pub fn has_ids(&self) -> bool {
+        !self.ids.is_empty()
+    }
+
+    /// forward id lookup: binary search over docids sorted by id (O(log n) compares)
+    pub fn lookup_id(&self, id: &str) -> Option<u32> {
+        if self.id_fwd.is_empty() {
+            return None;
+        }
+        self.id_fwd
+            .binary_search_by(|d| self.ids[*d as usize].as_deref().unwrap_or("").cmp(id))
+            .ok()
+            .map(|i| self.id_fwd[i])
     }
 
     pub fn term(&self, fid: u32, term: &str) -> Option<TermInfo> {
@@ -286,26 +355,32 @@ impl SegmentReader {
         self.fsts.get(fid as usize).map_or(0, |f| f.len())
     }
 
-    pub fn stored_doc(&self, docid: u32) -> Option<Vec<(u32, String)>> {
+    pub fn stored_doc(&self, docid: u32) -> Option<StoredDoc> {
         let block = self.store_blocks.get(docid as usize)?;
         read_stored(block)
     }
 }
 
-/// decompress one stored doc block: count + TLV(field_id, len, text bytes)
-pub fn read_stored(block: &[u8]) -> Option<Vec<(u32, String)>> {
+/// decompress + decode one store block:
+/// [tag][len u32][flags u8][n u8][TLV(fid u32, len u32, text)][id len u32 + utf8][meta len u32 + json]
+pub fn read_stored(block: &[u8]) -> Option<StoredDoc> {
     let raw: std::borrow::Cow<[u8]> = match block.first() {
         None => return None,
         Some(&STORE_RAW_TAG) => {
-            // raw layout: tag + le-u32 length + bytes
+            // raw layout: tag + le-u32 length + payload
             let len = u32::from_le_bytes(block.get(1..5)?.try_into().ok()?) as usize;
             std::borrow::Cow::Owned(block.get(5..5 + len)?.to_vec())
         }
-        _ => std::borrow::Cow::Owned(decompress_size_prepended(&block[1..]).ok()?),
+        Some(&STORE_COMP_TAG) => {
+            std::borrow::Cow::Owned(decompress_size_prepended(&block[1..]).ok()?)
+        }
+        _ => return None,
     };
-    let n = *raw.first()? as usize;
+    let flags = *raw.first()?;
     let mut p = 1;
-    let mut out = Vec::with_capacity(n);
+    let n = *raw.get(p)? as usize;
+    p += 1;
+    let mut fields = Vec::with_capacity(n);
     for _ in 0..n {
         let fid = u32::from_le_bytes(raw.get(p..p + 4)?.try_into().ok()?);
         p += 4;
@@ -313,7 +388,28 @@ pub fn read_stored(block: &[u8]) -> Option<Vec<(u32, String)>> {
         p += 4;
         let val = String::from_utf8(raw.get(p..p + l)?.to_vec()).ok()?;
         p += l;
-        out.push((fid, val));
+        fields.push((fid, val));
     }
-    Some(out)
+    let id = if flags & BLOCK_FLAG_ID != 0 {
+        let l = u32::from_le_bytes(raw.get(p..p + 4)?.try_into().ok()?) as usize;
+        p += 4;
+        let val = String::from_utf8(raw.get(p..p + l)?.to_vec()).ok()?;
+        p += l;
+        Some(val)
+    } else {
+        None
+    };
+    let metadata = if flags & BLOCK_FLAG_META != 0 {
+        let l = u32::from_le_bytes(raw.get(p..p + 4)?.try_into().ok()?) as usize;
+        p += 4;
+        let val: serde_json::Value = serde_json::from_slice(raw.get(p..p + l)?).ok()?;
+        Some(val)
+    } else {
+        None
+    };
+    Some(StoredDoc {
+        id,
+        fields,
+        metadata,
+    })
 }

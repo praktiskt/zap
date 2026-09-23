@@ -102,3 +102,66 @@ fn serve_rejects_bad_ingest() {
         "not found"
     );
 }
+
+#[test]
+fn serve_doc_id_metadata_lifecycle() {
+    let addr = start_serve();
+    // ingest with ids + metadata (NDJSON)
+    let docs = concat!(
+        "{\"id\":\"http-1\",\"text\":\"alpha bravo charlie\",\"metadata\":{\"src\":\"api\",\"n\":1}}\n",
+        "{\"id\":\"http-2\",\"text\":\"bravo delta echo\"}\n",
+        "{\"text\":\"no id here\"}\n"
+    );
+    let v = post_json(addr, "/ingest", docs);
+    assert_eq!(v["accepted"], json!(3), "{v}");
+
+    // get-by-id roundtrips id + metadata
+    let v = get_json(addr, "/doc/http-1");
+    assert_eq!(v["id"], json!("http-1"), "{v}");
+    assert_eq!(v["metadata"]["src"], json!("api"));
+    let v = get_json(addr, "/doc/http-2");
+    assert_eq!(v["id"], json!("http-2"));
+    assert!(v.get("metadata").is_none_or(|m| m.is_null()));
+    // missing id -> 404
+    let (code, b) = request_raw(addr, "GET", "/doc/nope", None);
+    assert_eq!(code, 404, "{b}");
+
+    // search results carry external id + metadata; internal docid present
+    let v = post_json(addr, "/search", r#"{"q":"bravo","k":10}"#);
+    let hits = v["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{v}");
+    let ids: Vec<&str> = hits.iter().filter_map(|r| r["id"].as_str()).collect();
+    assert!(ids.contains(&"http-1") && ids.contains(&"http-2"));
+    assert!(hits[0].get("docid").is_some());
+
+    // replace over HTTP: old text gone
+    let v = post_json(
+        addr,
+        "/ingest",
+        "{\"id\":\"http-1\",\"text\":\"zulu uniform victor\"}\n",
+    );
+    assert_eq!(v["accepted"], json!(1));
+    assert_eq!(
+        get_json(addr, "/stats")["docs"],
+        json!(3),
+        "replace keeps count"
+    );
+    let v = get_json(addr, "/doc/http-1");
+    assert_eq!(v["fields"][0][1], json!("zulu uniform victor"));
+    let v = post_json(addr, "/search", r#"{"q":"alpha","k":10}"#);
+    assert_eq!(v["count"], json!(0), "old version must be invisible: {v}");
+
+    // delete over HTTP
+    let (code, b) = request_raw(addr, "DELETE", "/doc/http-2", None);
+    assert_eq!(code, 200, "{b}");
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["deleted"], json!(true));
+    assert_eq!(get_json(addr, "/stats")["docs"], json!(2));
+    let (code, _) = request_raw(addr, "GET", "/doc/http-2", None);
+    assert_eq!(code, 404);
+    let (code, _) = request_raw(addr, "DELETE", "/doc/http-2", None);
+    assert_eq!(code, 404, "double delete misses");
+    // deleted doc invisible to search
+    let v = post_json(addr, "/search", r#"{"q":"delta","k":10}"#);
+    assert_eq!(v["count"], json!(0), "{v}");
+}
