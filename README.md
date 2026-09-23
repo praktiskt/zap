@@ -156,6 +156,5 @@ Quick iteration: `cargo run --release --example smoke` (~1 s wall, coarse timing
 
 ## Roadmap
 
-- WAND fan-out into AND/OR chains (currently only single-Term streaming prunes)
 - Embedding search: schema-gated vector fields + flat SIMD scan → HNSW via `VectorIndex` seam
 - Per-field bitpacked postings (128-doc blocks à la tantivy) if profiling shows decode-bound

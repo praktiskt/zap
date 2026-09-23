@@ -40,16 +40,25 @@ fn main() {
     }
     println!("docs={} segs={}", index.num_docs(), index.num_segments());
     // top-10 for 'fox': the 200 tf-100 outliers should win; others tf~1
-    let hits = index.search("fox", 10).unwrap();
-    println!(
-        "{} hits in {:?}",
-        hits.len(),
-        std::time::Instant::now().elapsed()
-    );
-    println!(
-        "scores: {:?}",
-        hits.iter()
-            .map(|h| (h.addr.docid, h.score))
-            .collect::<Vec<_>>()
-    );
+    for q in ["fox", "fox OR dog", "fox AND dog", "fox OR dog OR quick"] {
+        let t = std::time::Instant::now();
+        let hits = index.search(q, 10).unwrap();
+        println!(
+            "{}: {} hits in {:?} (~{:.2} us)",
+            q,
+            hits.len(),
+            t.elapsed(),
+            t.elapsed().as_secs_f64() * 1e6
+        );
+    }
+    // top-10 for 'fox': the 200 tf-100 outliers should win; others tf~1
+    {
+        let hits = index.search("fox", 10).unwrap();
+        println!(
+            "scores: {:?}",
+            hits.iter()
+                .map(|h| (h.addr.docid, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
 }

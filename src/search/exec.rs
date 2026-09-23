@@ -433,8 +433,12 @@ fn and_two_infos(
     let (a, b) = (&a_infos[0], &b_infos[0]);
     let idf_a = bm25_idf(ctx.stats.df_of(a.0, &a.1, a.2.df), ctx.stats.total_docs);
     let idf_b = bm25_idf(ctx.stats.df_of(b.0, &b.1, b.2.df), ctx.stats.total_docs);
-    let drive = if a.2.df <= b.2.df { (a, b) } else { (b, a) };
-    let (drv, oth) = drive;
+    let drive = if a.2.df <= b.2.df {
+        (a, idf_a, b, idf_b)
+    } else {
+        (b, idf_b, a, idf_a)
+    };
+    let (drv, idf_drv, oth, idf_oth) = drive;
     let mut r_drv = seg.reader(&drv.2);
     let mut r_oth = seg.reader(&oth.2);
     let norms_drv = seg.norms(drv.0);
@@ -453,7 +457,7 @@ fn and_two_infos(
         if d2 != doc {
             continue;
         }
-        let w_d = idf_a * (tf_d as f32 * (ctx.params.k1 + 1.0))
+        let w_d = idf_drv * (tf_d as f32 * (ctx.params.k1 + 1.0))
             / (tf_d as f32
                 + ctx.params.k1
                     * crate::search::term::norm_ratio(
@@ -462,7 +466,7 @@ fn and_two_infos(
                         ctx.stats.avg_of(drv.0),
                         ctx.params.b,
                     ));
-        let w_o = idf_b * (tf_o as f32 * (ctx.params.k1 + 1.0))
+        let w_o = idf_oth * (tf_o as f32 * (ctx.params.k1 + 1.0))
             / (tf_o as f32
                 + ctx.params.k1
                     * crate::search::term::norm_ratio(

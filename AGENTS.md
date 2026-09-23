@@ -54,6 +54,6 @@ validation gates, so embedding search can be added without re-shaping the docume
 - doc store v2: [tag][len][flags][n][TLV fields][id][metadata]; merge copies blocks verbatim (ids/metadata survive free); purge at merge uses per-segment docid remap (u32::MAX = purged)
 
 ## Future rounds, if we resume WAND/general top-k work
-- WAND fan-out into AND/OR walkers (currently only single-Term streaming prunes)
+- WAND fan-out into AND/OR walkers (R20, perf-reject): classic pivot WAND-OR (static-max bound, docid-gap seeking, live per-segment collector threshold via direct pushes) + AND driver block skipping both implemented and LOSE: uniform 10k-corpus OR +8% (139.0 vs 128.71us), skew 200k 'fox OR dog' +23% (4.68 vs 3.81ms, env-gated same-binary A/B); per-iteration pivot refresh (docs+order+sort) outweighs threshold pruning because dense union is already efficient and uniform score distributions keep thresholds low; dense AND gained nothing either (102.6 vs 102.1us) — reattempt only with block-max-refined pivot bounds AND push-free cursor granularity; reverted to dense-union OR + return-based galloping AND
 - per-field postings bitpack (128-doc blocks à la tantivy) if profiling shows decode-bound
 - embedding search: flat SIMD scan first; HNSW (hnsw_rs / instant-distance) behind the `VectorIndex` trait seam
