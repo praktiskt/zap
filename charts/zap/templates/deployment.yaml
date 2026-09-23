@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Release.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 65534
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          command: ["/zap", "serve", "--bind", "0.0.0.0:{{ .Values.service.targetPort }}"]
+          args:
+            {{- if .Values.serve.lanes }}
+            - --lanes={{ .Values.serve.lanes }}
+            {{- end }}
+            - --top-k={{ .Values.serve.topK }}
+            - --k1={{ .Values.serve.k1 }}
+            - --b={{ .Values.serve.b }}
+            {{- if .Values.serve.noStem }}
+            - --no-stem
+            {{- end }}
+            {{- if .Values.corpus.configMap }}
+            - /corpus
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if .Values.corpus.configMap }}
+          volumeMounts:
+            - name: corpus
+              mountPath: /corpus
+              readOnly: true
+          {{- end }}
+          {{- with .Values.health.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.health.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- if .Values.corpus.configMap }}
+      volumes:
+        - name: corpus
+          configMap:
+            name: {{ .Values.corpus.configMap }}
+      {{- end }}

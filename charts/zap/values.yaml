@@ -1,0 +1,87 @@
+image:
+  repository: praktiskt/zap
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 3279
+  targetPort: 3279
+
+# serve-mode flags (zap serve --bind <host>:<targetPort> ...)
+serve:
+  lanes: ""    # parallel ingest lanes; "" = default (cores)
+  topK: 10
+  k1: "1.2"
+  b: "0.75"
+  noStem: false
+
+# load a corpus at startup: configMap holding text files, mounted at /corpus
+# and passed to `zap serve` as a directory input. Leave "" for an empty index
+# populated via POST /ingest.
+corpus:
+  configMap: ""
+
+extraArgs: []
+
+# the index lives only in RAM: replicas do NOT share data, and a rolling
+# update would serve from an empty pod. Default Recreate swaps in-place.
+strategy:
+  type: Recreate
+
+resources: {}
+# requests/limits matter: the index lives in RAM. Size limits to your corpus
+# (docs + postings + index structures) with headroom, e.g.:
+# requests:
+#   memory: 1Gi
+#   cpu: "1"
+# limits:
+#   memory: 4Gi
+
+env: []
+# - name: MY_VAR
+#   value: "x"
+# - name: MY_SECRET
+#   valueFrom:
+#     secretKeyRef:
+#       name: my-secret
+#       key: password
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  labels: {}
+  tls: []
+  # - hosts:
+  #   - my-host
+  #   secretName: my-tls-secret
+
+health:
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 3279
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 3279
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    # allow slow corpus loads from a ConfigMap before traffic is sent
+    failureThreshold: 30
+
+affinity: {}
+# nodeAffinity:
+#   preferredDuringSchedulingIgnoredDuringExecution:
+#   - weight: 1
+#     preference:
+#       matchExpressions:
+#       - key: kubernetes.io/hostname
+#         operator: In
+#         values:
+#         - my-node

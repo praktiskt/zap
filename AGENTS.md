@@ -20,7 +20,10 @@ validation gates, so embedding search can be added without re-shaping the docume
 - core modules: `analyzer/`, `index.rs` (writer/snapshots/merge), `query.rs` (AST+parser),
   `search/` (term/phrase/exec: scorers + WAND), `segment.rs`, `posting.rs`, `schema.rs`, `server.rs`
 - `tests/`: property + integration tests; `benches/search.rs`: criterion matrix;
-  `examples/`: scale probes (`big.rs` 1M-doc, `wand.rs` skew probe)
+  `examples/`: scale probes (`big.rs` 1M-doc, `wand.rs` skew probe, `postprobe.rs` decode A/B, `smoke.rs` quick timings, `doclen_probe.rs` doc-length phases)
+- packaging: `Dockerfile` (rust:alpine musl static -> FROM scratch, non-root), `Makefile`
+  (build/test/bench/build-all/docker-*/helm-lint), `charts/zap/` (serve-mode Deployment
+  Recreate strategy, corpus ConfigMap mount, /health probes)
 
 ## Perf-optimization history
 - Every optimization attempt (successful or failed) gets its own git commit.

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: zap
+description: In-memory full-text search engine served over HTTP (BM25, block-max WAND)
+type: application
+version: 0.1.0
+appVersion: "latest"

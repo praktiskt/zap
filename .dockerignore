@@ -1,0 +1,9 @@
+target
+dist
+.git
+.gitignore
+charts
+examples
+tests
+README.md
+AGENTS.md

@@ -76,6 +76,22 @@ benches/search.rs criterion scale + doc-length matrix
 examples/big.rs   1M-doc probe   example: wand.rs: skew probe   example: smoke.rs: quick timings
 ```
 
+## Packaging
+
+```sh
+make build              # release binary
+make docker-build       # rust:alpine musl static -> FROM scratch (non-root 65534)
+make docker-run         # serve mode on :3279
+make helm-lint          # helm lint + template the chart
+helm install zap charts/zap                 # empty index, populate via POST /ingest
+kubectl create configmap corpus --from-file=docs/ -o yaml --dry-run=client | kubectl apply -f -
+helm install zap charts/zap --set corpus.configMap=corpus   # bootstrap from static text
+```
+
+The index lives in RAM only: chart defaults to `Recreate` strategy (a rolling
+update would serve from an empty pod), `replicaCount > 1` runs independent
+indexes. Size memory resources to your corpus.
+
 ## HTTP serve mode
 
 ```sh
