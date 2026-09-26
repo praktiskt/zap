@@ -35,9 +35,17 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.env }}
+          {{- if or .Values.env (and .Values.cluster.enabled .Values.cluster.peersService) }}
           env:
-            {{- toYaml . | nindent 12 }}
+            {{- if .Values.env }}
+            {{- toYaml .Values.env | nindent 12 }}
+            {{- end }}
+            {{- if and .Values.cluster.enabled .Values.cluster.peersService }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- end }}
           {{- end }}
           ports:
             - containerPort: {{ .Values.service.targetPort }}
@@ -51,6 +59,10 @@ spec:
             - --b={{ .Values.serve.b }}
             {{- if .Values.serve.noStem }}
             - --no-stem
+            {{- end }}
+            {{- if and .Values.cluster.enabled .Values.cluster.peersService }}
+            - --peers={{ .Values.cluster.peersService }}:{{ .Values.service.targetPort }}
+            - --announce=$(POD_IP):{{ .Values.service.targetPort }}
             {{- end }}
             {{- if .Values.corpus.configMap }}
             - /corpus

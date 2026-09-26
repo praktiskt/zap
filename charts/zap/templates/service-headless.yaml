@@ -1,0 +1,18 @@
+{{- if and .Values.cluster.enabled .Values.cluster.peersService }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.cluster.peersService }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http
+  selector:
+    app: {{ .Release.Name }}
+{{- end }}

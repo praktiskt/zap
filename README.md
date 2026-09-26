@@ -76,6 +76,24 @@ benches/search.rs criterion scale + doc-length matrix
 examples/big.rs   1M-doc probe   example: wand.rs: skew probe   example: smoke.rs: quick timings
 ```
 
+## Distributed mode
+
+Three+ replicas can form a static ring: search fans out to every shard and
+merges top-k (scores stay comparable because each replica gossips its BM25
+stats deltas at commit); ingest ring-routes each doc by hash of its external id
+(unid'd docs: content hash), and `GET/DELETE /doc/{id}` route to the owning
+shard. Ids stay unique + replaceable; replicas are plain shards (no replication
+factor, no resharding — resizing requires re-ingest).
+
+```sh
+zap serve --bind 127.0.0.1:3279 --announce 127.0.0.1:3279 --peers addr1:3279,addr2:3279
+```
+
+Any node acts as the query coordinator (`/search` fan-out); a dead peer shows
+up as `"degraded": true`. Cluster-internal routes live under `/__zap/…`
+(gossip, shard_search, shard_ingest, shard_stats). Helm: `cluster.enabled=true`
+plus a **headless** service (`zap-headless`) wires the ring automatically.
+
 ## Packaging
 
 ```sh

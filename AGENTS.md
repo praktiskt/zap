@@ -10,6 +10,7 @@ Single binary, everything lives in the process; no mmap, no persistence, no serv
 - block-max WAND top-k with live thresholds; galloping seeks power both phase cursors and block pruning
 - arccos-swap snapshots: single writer, lock-free readers
 - HTTP serve subcommand (tiny_http): /ingest /search /stats /commit /health
+- distributed mode (cluster.rs): static ring ([self+peers...] sorted by addr, owner = fnv64a(id) % N), coordinator-less scatter-gather (any pod fans out /search via /__zap/shard_search), BM25-stats gossip (per-peer ABSOLUTE df envelopes pushed as deltas at commit; first contact = full envelope + resync pull), ring-routed ingest and /doc/{id}; empty --peers = zero-overhead single-node path (engine untouched; scores need the global view via Index::search_with_stats)
 - multilingual tokenization via charabia (+ snowball stemming on latin tokens)
 
 Future extension is pre-plumbed: `schema.rs` declares `vector` fields (dim + metric) with
@@ -36,7 +37,7 @@ validation gates, so embedding search can be added without re-shaping the docume
 ## Non-perf rules
 - always cargo fmt + clippy clean before commit
 - integration tests in `tests/`; crate tests in `src/`
-- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10), `ids.rs` (T11: external ids/metadata/replace/delete), `serve.rs` (HTTP incl. /doc/{id} lifecycle), `search_it.rs` (boolean/phrase integration)
+- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10), `ids.rs` (T11: external ids/metadata/replace/delete), `serve.rs` (HTTP incl. /doc/{id} lifecycle), `cluster.rs` (3-process ring roundtrip), `search_it.rs` (boolean/phrase integration)
 - benchmarking: use `examples/smoke.rs` (`cargo run --release --example smoke`, ~1 s) for iteration feedback; run rigorous criterion benches (`cargo bench --bench search -- --noplot <filter>`) sparsely — at meaningful checkpoints only, not per change
 - do not use ad-hoc sed/python for edits unless trivial; prefer dedicated tools when editing files
 - top-k tie ordering across different index builds is NOT stable (heap tie-break by docid/addr): property tests must compare as unordered (score,text) multisets, or filter entries strictly above the kth-score threshold
