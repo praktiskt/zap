@@ -15,10 +15,11 @@
 //! - `POST   /__zap/shard_search` local search with merged global stats
 //! - `POST   /__zap/shard_ingest` local ingest (owner already chose us)
 //! - `GET    /__zap/shard_stats`  live counts for the aggregate /stats
+//! - `GET    /dashboard`          live HTML stats page (catppuccin mocha)
 
 use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tiny_http::{Method, Request, Response, Server};
@@ -32,6 +33,11 @@ use crate::schema::Document;
 use crate::search::exec::Stats;
 
 const MAX_BODY: usize = 64 << 20; // 64 MB ingest ceiling per request
+
+// dashboard counters (per process; the cluster chips merge them per shard)
+static SEARCHES: AtomicU64 = AtomicU64::new(0);
+static INGESTED: AtomicU64 = AtomicU64::new(0);
+static SERVE_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// owned cluster runtime; None = single node (routes unchanged)
 pub type ClusterOpt = Option<Arc<LocalCluster>>;
@@ -93,6 +99,7 @@ pub fn serve(
     shutdown: &'static AtomicBool,
 ) -> Result<SocketAddr, String> {
     let server = Server::http(bind).map_err(|e| format!("bind {bind}: {e}"))?;
+    SERVE_STARTED.set(std::time::Instant::now()).ok();
     let addr: SocketAddr = server
         .server_addr()
         .to_ip()
@@ -145,12 +152,16 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
         (Method::Get, "/health") => {
             reply(req, 200, r##"{"status":"ok"}"##);
         }
+        (Method::Get, "/dashboard") => {
+            reply_html(req, 200, DASHBOARD_HTML);
+        }
         (Method::Get, "/stats") => stats_reply(req, index, cluster),
         (Method::Get, "/search") => match query_param(&query, "q") {
             Some(q) => {
                 let k = query_param(&query, "k")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(10);
+                SEARCHES.fetch_add(1, Ordering::Relaxed);
                 search_reply(req, index, cluster, q, k);
             }
             None => {
@@ -158,11 +169,15 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
             }
         },
         (Method::Post, "/search") => match read_body(&mut req).and_then(|b| json_search(&b)) {
-            Ok((q, k)) => search_reply(req, index, cluster, q, k),
+            Ok((q, k)) => {
+                SEARCHES.fetch_add(1, Ordering::Relaxed);
+                search_reply(req, index, cluster, q, k);
+            }
             Err(msg) => reply(req, 400, &msg),
         },
         (Method::Post, "/ingest") => match ingest(&mut req, index, cluster) {
             Ok(n) => {
+                INGESTED.fetch_add(n as u64, Ordering::Relaxed);
                 let body = serde_json::json!({
                     "accepted": n,
                     "docs": docs_total(index, cluster),
@@ -243,6 +258,9 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
                 "docs": index.num_docs(),
                 "segments": index.num_segments(),
                 "generation": index.generation(),
+                "searches": SEARCHES.load(Ordering::Relaxed),
+                "ingested": INGESTED.load(Ordering::Relaxed),
+                "uptime_s": uptime_secs(),
             })
             .to_string();
             reply(req, 200, &body);
@@ -757,13 +775,63 @@ fn push_own_stats(cl: &LocalCluster, index: &Index) {
 
 fn stats_reply(req: Request, index: &Index, cluster: ClusterRef<'_>) {
     let (docs, segments, generation) = aggregate_stats(index, cluster);
+    // per-shard chips (self first, then peers that answered in time)
+    let mut shards: Vec<serde_json::Value> = vec![serde_json::json!({
+        "addr": local_addr_of(cluster).unwrap_or_else(|| "self".to_string()),
+        "docs": index.num_docs(),
+        "segments": index.num_segments(),
+        "generation": index.generation(),
+        "searches": SEARCHES.load(Ordering::Relaxed),
+        "ingested": INGESTED.load(Ordering::Relaxed),
+        "uptime_s": uptime_secs(),
+    })];
+    let mut degraded = false;
+    if let Some(cl) = cluster {
+        for peer in cl.cache.lock().unwrap().peers() {
+            if let Some((_, b)) = http_get(peer, "/__zap/shard_stats") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&b) {
+                    shards.push(serde_json::json!({
+                        "addr": peer.to_string(),
+                        "docs": v["docs"].as_u64().unwrap_or(0),
+                        "segments": v["segments"].as_u64().unwrap_or(0),
+                        "generation": v["generation"].as_u64().unwrap_or(0),
+                        "searches": v["searches"].as_u64().unwrap_or(0),
+                        "ingested": v["ingested"].as_u64().unwrap_or(0),
+                        "uptime_s": v["uptime_s"].as_u64().unwrap_or(0),
+                    }));
+                }
+            } else {
+                degraded = true;
+                shards.push(serde_json::json!({
+                    "addr": peer.to_string(),
+                    "docs": null, "segments": null,
+                    "generation": null, "searches": null,
+                    "ingested": null, "uptime_s": null,
+                    "down": true,
+                }));
+            }
+        }
+    }
     let body = serde_json::json!({
         "docs": docs,
         "segments": segments,
         "generation": generation,
+        "shards": shards,
+        "degraded": degraded,
     })
     .to_string();
     reply(req, 200, &body);
+}
+
+fn uptime_secs() -> u64 {
+    SERVE_STARTED
+        .get()
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+fn local_addr_of(cluster: ClusterRef<'_>) -> Option<String> {
+    cluster.map(|c| c.cache.lock().unwrap().self_addr().to_string())
 }
 
 fn aggregate_stats(index: &Index, cluster: ClusterRef<'_>) -> (usize, usize, u64) {
@@ -825,6 +893,15 @@ fn reply(req: Request, code: u16, body: &str) {
     let _ = req.respond(r.with_status_code(code));
 }
 
+fn reply_html(req: Request, code: u16, body: &str) {
+    let mut r = Response::from_string(body.to_string());
+    r.add_header(
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+            .unwrap(),
+    );
+    let _ = req.respond(r.with_status_code(code));
+}
+
 /// percent-decode ('+' = space); invalid escapes pass through raw
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -869,3 +946,122 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         (k == key).then(|| url_decode(v))
     })
 }
+
+// ---- /dashboard ------------------------------------------------------------
+
+/// catppuccin mocha: base/mantle/crust surfaces, mauve accents, teal/green/peach
+/// status dots; polls /stats and re-renders every 1.5s
+const DASHBOARD_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zap — dashboard</title>
+<style>
+:root {
+  --base: #1e1e2e; --mantle: #11111b; --crust: #181825;
+  --surface0: #313244; --surface1: #45475a; --surface2: #585b70;
+  --text: #cdd6f4; --subtext: #a6adc8; --subsubtext: #9399b2;
+  --mauve: #cba6f7; --lavender: #b4befe; --teal: #94e2d5;
+  --green: #a6e3a1; --peach: #fab387; --red: #f38ba8;
+  --blue: #89b4fa; --yellow: #f9e2af; --pink: #f5c2e7;
+}
+html, body { margin: 0; padding: 0; background: var(--base); color: var(--text);
+  font-family: ui-monospace, "JetBrains Mono", "CaskaydiaCove Nerd Font", monospace; }
+header { padding: 18px 26px 10px; display: flex; align-items: baseline; gap: 14px; }
+header h1 { font-size: 20px; margin: 0; color: var(--mauve); letter-spacing: 1px; }
+header .sub { color: var(--subtext); font-size: 12px; }
+header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green);
+  display: inline-block; margin-right: 6px; }
+header .dot.down { background: var(--red); }
+main { padding: 12px 26px 30px; }
+.chips { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+.card { background: var(--crust); border: 1px solid var(--surface0); border-radius: 10px;
+  padding: 14px 18px; min-width: 150px; box-shadow: 0 1px 0 var(--mantle) inset; }
+.card .label { color: var(--subtext); font-size: 11px; letter-spacing: .8px; text-transform: uppercase; }
+.card .value { font-size: 26px; color: var(--text); margin-top: 2px; }
+.card.docs .value { color: var(--lavender); }
+.card.segments .value { color: var(--teal); }
+.card.gen .value { color: var(--peach); }
+.card.searches .value { color: var(--mauve); }
+.card.ingested .value { color: var(--green); }
+.card.uptime .value { color: var(--yellow); font-size: 20px; }
+h2 { color: var(--subtext); font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
+  margin: 20px 0 8px; }
+table { width: 100%; border-collapse: collapse; background: var(--crust);
+  border: 1px solid var(--surface0); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 14px; font-size: 13px; border-bottom: 1px solid var(--surface0); }
+th { color: var(--subtext); font-weight: 500; background: var(--mantle); }
+tr:last-child td { border-bottom: none; }
+td.up { color: var(--green); } td.down { color: var(--red); }
+tr.shard-row:hover td { background: var(--surface0); }
+footer { color: var(--subsubtext); font-size: 11px; padding: 8px 26px; }
+#refresh { color: var(--subtext); margin-left: auto; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="health-dot"></span>
+  <h1>zap</h1>
+  <span class="sub">in-memory FTS — <code style="color:var(--lavender)">mocha</code> dashboard</span>
+  <span id="refresh">auto 1.5s</span>
+</header>
+<main>
+  <div class="chips">
+    <div class="card docs"><div class="label">docs</div><div class="value" id="v-docs">–</div></div>
+    <div class="card segments"><div class="label">segments</div><div class="value" id="v-segments">–</div></div>
+    <div class="card gen"><div class="label">generation</div><div class="value" id="v-gen">–</div></div>
+    <div class="card searches"><div class="label">searches</div><div class="value" id="v-searches">–</div></div>
+    <div class="card ingested"><div class="label">ingested</div><div class="value" id="v-ingested">–</div></div>
+    <div class="card uptime"><div class="label">uptime</div><div class="value" id="v-uptime">–</div></div>
+  </div>
+  <h2>shards</h2>
+  <table>
+    <thead><tr><th>address</th><th>docs</th><th>segments</th><th>generation</th>
+      <th>searches</th><th>ingested</th><th>uptime</th><th>state</th></tr></thead>
+    <tbody id="shard-rows"><tr><td colspan="8" style="color:var(--subtext)">loading…</td></tr></tbody>
+  </table>
+</main>
+<footer>zap — in-memory full-text search · <span style="color:var(--pink)">catppuccin</span> mocha</footer>
+<script>
+function fmt(n) { return n === null || n === undefined ? "–" : n.toLocaleString(); }
+function uptime(s) {
+  if (s === null || s === undefined) return "–";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60).toString() + "s";
+  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+}
+async function tick() {
+  try {
+    const r = await fetch("/stats");
+    const j = await r.json();
+    document.getElementById("v-docs").textContent = fmt(j.docs);
+    document.getElementById("v-segments").textContent = fmt(j.segments);
+    document.getElementById("v-gen").textContent = fmt(j.generation);
+    const self = (j.shards || []).find(x => x && x.addr && !x.down) || {};
+    document.getElementById("v-searches").textContent = fmt(self.searches);
+    document.getElementById("v-ingested").textContent = fmt(self.ingested);
+    document.getElementById("v-uptime").textContent = uptime(self.uptime_s);
+    const dot = document.getElementById("health-dot");
+    dot.className = "dot" + (j.degraded ? " down" : "");
+    const rows = (j.shards || []).map(s => {
+      if (!s || s.down) return '<tr class="shard-row"><td>' + s.addr + '</td>' +
+        '<td colspan="6" style="color:var(--subtext)">unreachable</td>' +
+        '<td class="down">DOWN</td></tr>';
+      return '<tr class="shard-row"><td style="color:var(--lavender)">' + s.addr + '</td>' +
+        '<td>' + fmt(s.docs) + '</td><td>' + fmt(s.segments) + '</td><td>' + fmt(s.generation) + '</td>' +
+        '<td style="color:var(--mauve)">' + fmt(s.searches) + '</td>' +
+        '<td style="color:var(--teal)">' + fmt(s.ingested) + '</td><td>' + uptime(s.uptime_s) + '</td>' +
+        '<td class="up">UP</td></tr>';
+    });
+    document.getElementById("shard-rows").innerHTML = rows.join("");
+  } catch (e) {
+    document.getElementById("health-dot").className = "dot down";
+  }
+}
+tick();
+setInterval(tick, 1500);
+</script>
+</body>
+</html>
+"##;

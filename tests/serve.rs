@@ -165,3 +165,19 @@ fn serve_doc_id_metadata_lifecycle() {
     let v = post_json(addr, "/search", r#"{"q":"delta","k":10}"#);
     assert_eq!(v["count"], json!(0), "{v}");
 }
+
+#[test]
+fn dashboard_served_with_mocha() {
+    // /dashboard = live HTML stats page in catppuccin mocha colors
+    let addr = start_serve();
+    let (code, body) = request_raw(addr, "GET", "/dashboard", None);
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("catppuccin"), "palette attribution missing");
+    assert!(body.contains("--base: #1e1e2e"), "mocha base color missing");
+    assert!(body.contains("--mauve: #cba6f7"), "mocha accent missing");
+    assert!(body.contains("fetch(\"/stats\")"), "live polling missing");
+    // /stats carries the shard chip + counters the dashboard renders
+    let v: Value = get_json(addr, "/stats");
+    assert!(v["shards"].as_array().is_some(), "{v}");
+    assert!(v["shards"][0]["searches"].as_u64().is_some(), "{v}");
+}
