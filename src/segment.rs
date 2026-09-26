@@ -641,14 +641,6 @@ impl SegmentReader {
             .unwrap_or(0)
     }
 
-    pub fn num_fields(&self) -> usize {
-        self.fsts.len()
-    }
-
-    pub fn num_terms(&self, fid: u32) -> usize {
-        self.fsts.get(fid as usize).map_or(0, |f| f.len())
-    }
-
     pub fn stored_doc(&self, docid: u32) -> Option<StoredDoc> {
         let block = self.store_blocks.get(docid as usize)?;
         read_stored(block)

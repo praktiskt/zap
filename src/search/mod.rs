@@ -4,8 +4,6 @@ pub mod exec;
 pub mod phrase;
 pub mod term;
 
-use roaring::RoaringBitmap;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocAddr {
     pub segment: u32,
@@ -20,12 +18,6 @@ pub struct SearchHit {
 pub struct Bm25Params {
     pub k1: f32,
     pub b: f32,
-}
-
-pub fn bm25_idf(df: u32, total_docs: u32) -> f32 {
-    let n = total_docs.max(1) as f32;
-    let d = df.max(1) as f32;
-    (1.0 + (n - d + 0.5) / (d + 0.5)).ln()
 }
 
 /// aligned docid / score series, ascending docid
@@ -120,17 +112,6 @@ pub fn union(a: &DocScores, b: &DocScores) -> DocScores {
     out.ids.extend_from_slice(&b.ids[j..]);
     out.scores.extend_from_slice(&b.scores[j..]);
     out
-}
-
-/// zero-score series from a bitmap
-pub fn from_bitmap(rb: &RoaringBitmap) -> DocScores {
-    DocScores::all(rb.iter().collect())
-}
-
-/// bitmap complement over [0, cap)
-pub fn complement(rb: &RoaringBitmap, cap: u32) -> RoaringBitmap {
-    let full = RoaringBitmap::from_iter(0..cap);
-    &full - rb
 }
 
 use std::cmp::Reverse;

@@ -15,12 +15,6 @@ pub fn write_varint(out: &mut Vec<u8>, mut v: u32) {
     }
 }
 
-/// byte length of a value's varint encoding
-pub fn u32_len(v: u32) -> usize {
-    let bits = u32::BITS - v.leading_zeros();
-    (((bits + 6).max(1)) / 7) as usize
-}
-
 /// decode one varint at `pos`, returns (value, bytes consumed)
 pub fn read_varint(bytes: &[u8], pos: usize) -> (u32, usize) {
     let mut v = 0u32;
@@ -54,14 +48,6 @@ impl PostingData {
         self.positions.push(positions);
     }
 
-    pub fn len(&self) -> usize {
-        self.docids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.docids.is_empty()
-    }
-
     /// fold a partial-merge posting list into this one; docids must already be
     /// globally sorted across the two (per-chunk docid ranges concatenate cleanly)
     pub fn absorb(&mut self, other: PostingData) {
@@ -73,7 +59,7 @@ impl PostingData {
     pub fn freeze(&self, norms: Option<&[u16]>) -> FrozenPosting {
         // R16: interleaved [delta_i][tf_i] per doc, one cursor.
         // WAND: anchors carry per-block max tf + min doc len for score-bound pruning.
-        let n = self.len();
+        let n = self.docids.len();
         let mut docids = Vec::with_capacity(n * 6);
         let mut byte_offs: Vec<u32> = Vec::with_capacity(n + 1); // doc cursor byte offsets
         let mut prev = 0u32;
@@ -119,7 +105,7 @@ impl PostingData {
         }
         let tfs: Vec<u8> = Vec::new();
         let mut pos = Vec::new();
-        let mut pos_offsets = Vec::with_capacity(self.len() + 1);
+        let mut pos_offsets = Vec::with_capacity(self.docids.len() + 1);
         pos_offsets.push(0u32);
         for plist in &self.positions {
             write_varint(&mut pos, plist.len() as u32);
@@ -241,37 +227,6 @@ impl<'a> PostingReader<'a> {
             prev_docid: 0,
             peeked: None,
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.doc_count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.doc_count == 0
-    }
-
-    /// docidx of the last doc returned by advance() (for positions()); None before the first advance
-    pub fn cur_docidx(&self) -> Option<usize> {
-        // decoded minus any still-peeked (not consumed) doc
-        let consumed = self
-            .docidx
-            .saturating_sub(usize::from(self.peeked.is_some()));
-        if consumed == 0 {
-            None
-        } else {
-            Some(consumed - 1)
-        }
-    }
-
-    /// the peeked docid, if any
-    pub fn peek_docid(&self) -> Option<u32> {
-        self.peeked.map(|(d, _)| d)
-    }
-
-    /// docidx of the doc whose positions peek_positions() would fetch (the peeked one)
-    pub fn peek_docidx(&self) -> Option<usize> {
-        self.peeked.as_ref().map(|_| self.docidx - 1)
     }
 
     /// block-max stats for the block containing the current decode position
