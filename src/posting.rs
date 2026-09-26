@@ -103,7 +103,6 @@ impl PostingData {
             skips.extend_from_slice(&tf_max.to_le_bytes());
             skips.extend_from_slice(&len_min.to_le_bytes());
         }
-        let tfs: Vec<u8> = Vec::new();
         let mut pos = Vec::new();
         let mut pos_offsets = Vec::with_capacity(self.docids.len() + 1);
         pos_offsets.push(0u32);
@@ -118,7 +117,6 @@ impl PostingData {
         }
         FrozenPosting {
             docids,
-            tfs,
             pos,
             pos_offsets,
             skips,
@@ -135,8 +133,6 @@ const SKIP_ENTRY_BYTES: usize = 16;
 pub struct FrozenPosting {
     /// varint deltas between consecutive docids
     docids: Vec<u8>,
-    /// varint tf per doc, doc order
-    tfs: Vec<u8>,
     /// concatenated per-doc position runs (varint count then varint gaps)
     pos: Vec<u8>,
     /// (len+1) byte offsets into `pos`, plain u32 LE
@@ -150,7 +146,6 @@ impl FrozenPosting {
     pub fn encode_to(mut self, blob: &mut Vec<u8>) -> TermInfo {
         let df = self.pos_offsets.len() as u32 - 1;
         let docids = write_section(blob, std::mem::take(&mut self.docids));
-        let tfs = write_section(blob, std::mem::take(&mut self.tfs));
         let pos = write_section(blob, std::mem::take(&mut self.pos));
         let mut offs = Vec::with_capacity(self.pos_offsets.len() * 4);
         for &o in &self.pos_offsets {
@@ -162,7 +157,6 @@ impl FrozenPosting {
         TermInfo {
             df,
             docids,
-            tfs,
             pos,
             pos_offsets,
             skips,
@@ -181,7 +175,6 @@ pub struct TermInfo {
     /// number of docs in the list
     pub df: u32,
     pub docids: Range<u32>,
-    pub tfs: Range<u32>,
     pub pos: Range<u32>,
     pub pos_offsets: Range<u32>,
     /// skip anchors: every SKIP_STEP docs -> (docid, delta-blob byte, tf byte), u32 LE

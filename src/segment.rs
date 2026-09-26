@@ -180,12 +180,14 @@ pub struct SegmentReader {
 
 // -- disk serialization (opt-in --disk) --------------------------------------
 
-const SEG_MAGIC: &[u8; 8] = b"zapseg1\0";
+const SEG_MAGIC: &[u8; 8] = b"zapseg2\0";
+/// v1 kept bootable: 5 info ranges (the vestigial always-empty tf section)
+const SEG_MAGIC_V1: &[u8; 8] = b"zapseg1\0";
 
 impl SegmentReader {
     /// full on-disk serialization (little-endian sections; immutable snapshot).
     /// Layout: [magic][num_docs u32][nf u32] per-field [fst len u32][fst]
-    /// [n_infos u32] per-info 44B [df u32 + 5 ranges x (start,end)]
+    /// [n_infos u32] per-info 36B [df u32 + 4 ranges x (start,end)]
     /// [blob len u32][blob] per fid [norm len u32][u16*n]
     /// [n_store u32]([len u32][bytes]) [n_ids u32]([has u8][len u32][bytes])
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -213,7 +215,7 @@ impl SegmentReader {
         push_u32(&mut out, self.infos.len() as u32);
         for i in &self.infos {
             push_u32(&mut out, i.df);
-            for r in [&i.docids, &i.tfs, &i.pos, &i.pos_offsets, &i.skips] {
+            for r in [&i.docids, &i.pos, &i.pos_offsets, &i.skips] {
                 push_u32(&mut out, r.start);
                 push_u32(&mut out, r.end);
             }
@@ -296,9 +298,10 @@ impl SegmentReader {
             }
             let df = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
             p += 4;
+            let nranges = if &bytes[..8] == SEG_MAGIC_V1 { 5 } else { 4 };
             let mut starts = [0u32; 5];
             let mut ends = [0u32; 5];
-            for s in 0..5 {
+            for s in 0..nranges {
                 if bytes.len() < p + 8 {
                     return Err("segment truncated (info ranges)".into());
                 }
@@ -306,13 +309,20 @@ impl SegmentReader {
                 ends[s] = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
                 p += 8;
             }
+            // v1 index 1 is the vestigial empty tf-stream range: skipped
+            let sh = |k: usize| -> usize {
+                if &bytes[..8] == SEG_MAGIC_V1 && k >= 1 {
+                    k + 1
+                } else {
+                    k
+                }
+            };
             infos.push(TermInfo {
                 df,
-                docids: starts[0]..ends[0],
-                tfs: starts[1]..ends[1],
-                pos: starts[2]..ends[2],
-                pos_offsets: starts[3]..ends[3],
-                skips: starts[4]..ends[4],
+                docids: starts[sh(0)]..ends[sh(0)],
+                pos: starts[sh(1)]..ends[sh(1)],
+                pos_offsets: starts[sh(2)]..ends[sh(2)],
+                skips: starts[sh(3)]..ends[sh(3)],
             });
         }
         if bytes.len() < p + 4 {
@@ -477,8 +487,6 @@ pub fn freeze_parts(
             for info in local.iter_mut() {
                 info.docids.start += base;
                 info.docids.end += base;
-                info.tfs.start += base;
-                info.tfs.end += base;
                 info.pos.start += base;
                 info.pos.end += base;
                 info.pos_offsets.start += base;
