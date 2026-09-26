@@ -480,6 +480,7 @@ impl Index {
         let base_len = segs.len();
         segs.extend(new_segs);
         let lanes = g.hot.len().max(1);
+        let mut merged_now = false;
         if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
             let masks_all: Vec<RoaringBitmap> = (0..segs.len())
                 .map(|i| g.deleted.get(&(i as u32)).cloned().unwrap_or_default())
@@ -487,15 +488,61 @@ impl Index {
             let merged = merge_segments(&segs, &masks_all, self.schema.num_fields());
             segs = vec![Arc::new(merged)];
             g.deleted.clear();
+            merged_now = true;
         }
         g.segments = segs;
         g.hot_ids.clear();
         g.generation += 1;
-        let new_from = if g.segments.len() == 1 && base_len > 1 {
-            None // merge reset the segment list: full id rescan
+        // stats maintenance happens HERE so publishes stay O(new segments):
+        // appends stream only the frozen lanes and fold their df/sums/docs into
+        // the cached envelope; merges/boot fall back to one full rescan
+        let nf = self.schema.num_fields();
+        let (sums, df, total_docs_check) = if merged_now {
+            // merge purged docids: fold from the merged segment alone
+            let mut sums = vec![0u64; nf];
+            let mut raw_df: HashMap<(u32, String), u32> = HashMap::new();
+            let mut total = 0u64;
+            for s in &g.segments {
+                total += s.num_docs as u64;
+                for fid in 0..nf as u32 {
+                    if let Some(nm) = s.norms(fid) {
+                        sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                    }
+                    for (term, info) in s.stream_terms(fid) {
+                        *raw_df.entry((fid, term)).or_insert(0) += info.df;
+                    }
+                }
+            }
+            (sums, Arc::new(raw_df), total)
         } else {
-            Some(base_len)
+            // take the mutable map back when no live snapshot still holds it;
+            // else deep-clone (a query was executing mid-commit)
+            let (mut sums, mut df_mut, mut total) = match g.stats_cache.take() {
+                Some((s, d, t)) => {
+                    let d = match Arc::try_unwrap(d) {
+                        Ok(m) => m,
+                        Err(arc) => (*arc).clone(),
+                    };
+                    (s, d, t)
+                }
+                None => (vec![0u64; nf], HashMap::<(u32, String), u32>::new(), 0u64),
+            };
+            for s in &g.segments[base_len..] {
+                total += s.num_docs as u64;
+                for fid in 0..nf as u32 {
+                    if let Some(nm) = s.norms(fid) {
+                        sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                    }
+                    for (term, info) in s.stream_terms(fid) {
+                        *df_mut.entry((fid, term)).or_insert(0) += info.df;
+                    }
+                }
+            }
+            (sums, Arc::new(df_mut), total)
         };
+        let total_docs = total_docs_check;
+        g.stats_cache = Some((sums.clone(), df, total_docs));
+        let new_from = if merged_now { None } else { Some(base_len) };
         self.publish_snapshot(g, true, new_from);
         if let Some(d) = &self.disk {
             d.persist(&g.segments, &g.deleted).expect("disk persist");
@@ -591,20 +638,28 @@ impl Index {
         let mut sums: Vec<u64> = vec![0u64; nf];
         let mut df: Arc<HashMap<(u32, String), u32>> = Arc::new(HashMap::new());
         if segment_change {
-            let mut raw_df: HashMap<(u32, String), u32> = HashMap::new();
-            for s in &g.segments {
-                total_docs += s.num_docs as u64;
-                for fid in 0..nf as u32 {
-                    if let Some(norms) = s.norms(fid) {
-                        sums[fid as usize] += norms.iter().map(|x| *x as u64).sum::<u64>();
-                    }
-                    for (term, info) in s.stream_terms(fid) {
-                        *raw_df.entry((fid, term)).or_insert(0) += info.df;
+            // commit path: the caller refreshed the envelope in commit_locked
+            // (cache stays in g — later commits fold into it); boot has none
+            if let Some((s, d, t)) = g.stats_cache.as_ref() {
+                sums = s.clone();
+                df = d.clone();
+                total_docs = *t;
+            } else {
+                let mut raw_df: HashMap<(u32, String), u32> = HashMap::new();
+                for s in &g.segments {
+                    total_docs += s.num_docs as u64;
+                    for fid in 0..nf as u32 {
+                        if let Some(norms) = s.norms(fid) {
+                            sums[fid as usize] += norms.iter().map(|x| *x as u64).sum::<u64>();
+                        }
+                        for (term, info) in s.stream_terms(fid) {
+                            *raw_df.entry((fid, term)).or_insert(0) += info.df;
+                        }
                     }
                 }
+                df = Arc::new(raw_df);
+                g.stats_cache = Some((sums.clone(), df.clone(), total_docs));
             }
-            df = Arc::new(raw_df);
-            g.stats_cache = Some((sums.clone(), df.clone(), total_docs));
         } else {
             // segments unchanged: reuse cached totals/sums/df (Arc clone, no deep copy)
             if let Some((s, d, t)) = &g.stats_cache {
