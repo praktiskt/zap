@@ -109,10 +109,10 @@ impl SegmentBuilder {
                 // R21: get-mut-first dict probe — token allocation only when the
                 // term is new to this builder (hot terms skip the per-occurrence
                 // String clone entirely)
-                let e = match self.postings[fid as usize].get_mut(tok.text.as_str()) {
+                let e = match self.postings[fid as usize].get_mut(tok.text.as_ref()) {
                     Some(e) => e,
                     None => self.postings[fid as usize]
-                        .entry(tok.text.clone())
+                        .entry(tok.text.into_owned())
                         .or_default(),
                 };
                 if e.docids.last() == Some(&docid) {

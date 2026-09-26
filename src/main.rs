@@ -234,8 +234,8 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let terms: Vec<String> = analyzer.tokenize_query(q).iter().map(|t| t.text.clone()).collect();
-                let stems: Vec<String> = analyzer.tokenize(q).iter().map(|t| t.text.clone()).collect();
+                let terms: Vec<String> = analyzer.tokenize_query(q).iter().map(|t| t.text.to_string()).collect();
+                let stems: Vec<String> = analyzer.tokenize(q).iter().map(|t| t.text.to_string()).collect();
                 let highlight: Vec<String> = terms
                     .iter()
                     .chain(stems.iter())
@@ -273,10 +273,10 @@ fn snippet_of(text: &str, terms: &[String], width: usize, plain: bool) -> String
     }
     let analyzer = Analyzer::new(AnalyzerConf::default());
     let toks = analyzer.tokenize(text);
-    let tset: HashSet<&String> = terms.iter().collect();
+    let tset: HashSet<&str> = terms.iter().map(String::as_str).collect();
     let highlight: Vec<(usize, usize)> = toks
         .iter()
-        .filter(|t| tset.contains(&t.text))
+        .filter(|t| tset.contains(t.text.as_ref()))
         .map(|t| (t.byte_start, t.byte_end))
         .collect();
     // window start: beginning of text or a bit before the first match

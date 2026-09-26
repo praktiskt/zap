@@ -202,7 +202,7 @@ fn main() {
             let segs = ix.segments_snapshot();
             let seg = &segs[0];
             let a = Analyzer::new(AnalyzerConf::default());
-            let stem = |w: &str| a.tokenize(w).first().map(|t| t.text.clone()).unwrap();
+            let stem = |w: &str| a.tokenize(w).first().map(|t| t.text.to_string()).unwrap();
             let iters = 200usize;
             let mut out = 0u64;
             // (0) direct phrase_scores call (bypasses query parse/exec tree)
