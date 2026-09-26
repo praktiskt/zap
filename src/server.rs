@@ -156,6 +156,11 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
             Some(f) => reply_html(req, 200, f.contents_utf8().unwrap_or("")),
             None => reply(req, 500, r#"{"error":"dashboard assets missing"}"#),
         },
+        (Method::Get, "/dashboard/events") => {
+            // SSE: stream stats frames to the page; each request handled on
+            // its own thread so the serve loop (and the server) stay free
+            std::thread::spawn(move || sse_stream(req));
+        }
         (Method::Get, p) if p.starts_with("/dashboard/") => {
             let rel = &p["/dashboard/".len()..];
             match dashboard_dir().get_file(url_decode(rel)) {
@@ -212,6 +217,7 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
         },
         (Method::Post, "/commit") => {
             index.commit();
+            crate::bus::notify_stats();
             if let Some(cl) = cluster {
                 push_own_stats(cl, index);
             }
@@ -540,6 +546,7 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
         let n = docs.len();
         index.add_documents(docs).map_err(|e| e.to_string())?;
         index.commit();
+        crate::bus::notify_stats();
         return Ok(n);
     };
     // bucket by ring owner; unid'd docs key on content hash for stability
@@ -589,6 +596,7 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
                 errors.push(e.to_string());
             } else {
                 index.commit();
+                crate::bus::notify_stats();
                 ok_total += batch.len();
             }
         }
@@ -634,6 +642,7 @@ fn shard_ingest(
     let n = docs.len();
     index.add_documents(docs).map_err(|e| e.to_string())?;
     index.commit();
+    crate::bus::notify_stats();
     if let Some(cl) = cluster {
         push_own_stats(cl, index);
     }
@@ -932,6 +941,40 @@ static DASHBOARD: include_dir::Dir =
 
 fn dashboard_dir() -> &'static include_dir::Dir<'static> {
     &DASHBOARD
+}
+
+// ---- dashboard push (SSE over the event bus) -------------------------------
+
+const SSE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// SSE via connection upgrade: the response carries the SSE headers, then
+/// `upgrade` hijacks the raw socket and we write frames with explicit flushes
+/// (tiny_http's internal buffering never sees frames smaller than the write
+/// threshold, so direct socket writes are required for real-time push)
+fn sse_stream(req: Request) {
+    use std::io::Write;
+    use tiny_http::Response;
+    let (id, rx) = crate::bus::subscribe();
+    let mut r: Response<std::io::Empty> = Response::empty(200);
+    for (k, v) in [
+        ("Content-Type", "text/event-stream"),
+        ("Cache-Control", "no-cache"),
+    ] {
+        if let Ok(h) = tiny_http::Header::from_bytes(k, v) {
+            r.add_header(h);
+        }
+    }
+    let mut stream = req.upgrade("zap-sse", r);
+    loop {
+        let ev = rx
+            .recv_timeout(SSE_HEARTBEAT)
+            .unwrap_or(crate::bus::EVENT_STATS);
+        let frame = format!("event: {ev}\ndata: {{}}\n\n");
+        if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+            break;
+        }
+    }
+    crate::bus::unsubscribe(id);
 }
 
 /// percent-decode ('+' = space); invalid escapes pass through raw

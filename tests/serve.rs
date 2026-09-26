@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use zap::index::Index;
@@ -189,4 +190,30 @@ fn dashboard_served_with_mocha() {
     let v: Value = get_json(addr, "/stats");
     assert!(v["shards"].as_array().is_some(), "{v}");
     assert!(v["shards"][0]["searches"].as_u64().is_some(), "{v}");
+}
+
+#[test]
+fn dashboard_sse_pushes_stats_frames() {
+    // reactive dashboard: /dashboard/events streams `event: stats` frames
+    // (heartbeat when idle, immediate on ingest/commit notifications)
+    let addr = start_serve();
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.write_all(b"GET /dashboard/events HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(2500))).ok();
+    let mut buf = [0u8; 4096];
+    let mut got = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => break,
+        }
+        if got.contains("data:") && got.contains("event: stats") {
+            break;
+        }
+    }
+    assert!(got.contains("event: stats"), "no SSE frame: {got:?}");
+    assert!(got.contains("data:"), "malformed SSE frame: {got:?}");
 }

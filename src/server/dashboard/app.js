@@ -40,4 +40,13 @@ async function tick() {
   }
 }
 tick();
-setInterval(tick, 1500);
+// reactive: pushes over Server-Sent Events drive the same render; the timer
+// stays as a slow fallback for missed events / idle-socket proxies
+if (typeof EventSource !== "undefined") {
+  const es = new EventSource("/dashboard/events");
+  es.addEventListener("stats", () => tick());
+  es.onerror = () => {
+    // EventSource auto-reconnects; nothing to do here
+  };
+}
+setInterval(tick, 8000);

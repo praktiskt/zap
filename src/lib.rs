@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod bus;
 pub mod cluster;
 pub mod index;
 pub mod posting;
