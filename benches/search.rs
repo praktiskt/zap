@@ -111,7 +111,7 @@ fn queries(c: &mut Criterion) {
         g.warm_up_time(Duration::from_secs(1))
             .measurement_time(Duration::from_secs(2))
             .sample_size(10);
-        g.throughput(Throughput::Elements(n_docs_const() as u64));
+        g.throughput(Throughput::Elements(10_000));
         for q in [
             "fox",
             "fox AND dog",
@@ -127,10 +127,6 @@ fn queries(c: &mut Criterion) {
         }
         g.finish();
     }
-}
-
-fn n_docs_const() -> usize {
-    10
 }
 
 fn topk_collect(c: &mut Criterion) {
@@ -157,8 +153,6 @@ fn query_scale(c: &mut Criterion) {
         (10000, 1000),
         (100000, 5000),
     ] {
-        let per = per_commit.max(1);
-        let _ = per;
         let ix = build_multi_segment(n, per_commit.max(1));
         for (tag, q) in [
             ("term", "fox"),

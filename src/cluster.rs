@@ -266,7 +266,7 @@ impl GlobalStats {
     }
 }
 
-/// assert-style fid:term key parser ("0:winter" -> (0, "winter"))
+/// gossip envelope key parser: "fid:term" -> (fid, term)
 pub fn parse_df_key(key: &str) -> Option<(u32, String)> {
     let (a, b) = key.split_once(':')?;
     let fid = a.parse().ok()?;

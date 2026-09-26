@@ -18,8 +18,8 @@ fn clients() -> &'static Mutex<HashMap<u64, Sender<&'static str>>> {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// hard cap on concurrent dashboard streams: each SSE client holds a blocked
-/// thread, so an unbounded subscriber set would let one browser tab farm
-/// exhaust threads. Cap keeps the I/O surface O(puts a few MB max).
+/// thread until its renderer flushes, so an unbounded subscriber set would let
+/// browser threads exhaust their pool.
 const MAX_CLIENTS: usize = 128;
 
 /// register a dashboard stream; None at capacity (caller replies 503)

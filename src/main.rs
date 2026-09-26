@@ -1,4 +1,4 @@
-//!returnzap CLI: load corpus into memory, search interactively
+//! zap CLI: load corpus into memory, search interactively
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -252,7 +252,7 @@ fn main() -> Result<()> {
                             println!("score={:.4} id={} |", hit.score, id);
                         }
                         for (name, text) in &p.fields {
-                            let snippet = snippet_of(text, &highlight, args.snippet, args.plain);
+                            let snippet = snippet_of(&analyzer, text, &highlight, args.snippet, args.plain);
                             println!("score={:.4} {} | {}", hit.score, name, snippet);
                         }
                     }
@@ -267,11 +267,16 @@ fn main() -> Result<()> {
 use std::collections::HashSet;
 
 /// snippet centered on the first matched token cluster, terms highlighted
-fn snippet_of(text: &str, terms: &[String], width: usize, plain: bool) -> String {
+fn snippet_of(
+    analyzer: &Analyzer,
+    text: &str,
+    terms: &[String],
+    width: usize,
+    plain: bool,
+) -> String {
     if plain {
         return trim_char(text, 0, width);
     }
-    let analyzer = Analyzer::new(AnalyzerConf::default());
     let toks = analyzer.tokenize(text);
     let tset: HashSet<&str> = terms.iter().map(String::as_str).collect();
     let highlight: Vec<(usize, usize)> = toks

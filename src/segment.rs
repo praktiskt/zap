@@ -446,7 +446,7 @@ pub fn freeze_parts(
     let mut fst_raws: Vec<Vec<u8>> = Vec::with_capacity(postings.len());
     for (fid, terms) in postings.iter().enumerate() {
         let norms = field_norms.get(fid).map(|v| v.as_slice());
-        // sorted by term for the FST (HashMap keeps insertion order)
+        // HashMap iteration order is arbitrary -> sort by term for the FST
         let mut sorted: Vec<(&String, &PostingData)> = terms.iter().collect();
         sorted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         // R22: parallel per-term encoding. Each worker chunk freezes+encodes

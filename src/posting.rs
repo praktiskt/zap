@@ -230,10 +230,10 @@ impl<'a> PostingReader<'a> {
     }
 
     /// block-max stats for the block containing the current decode position
-    /// returns (tf_max, len_min, next_block_first_docid); None when no anchors
-    pub fn block_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+    /// returns (tf_max, len_min); None when no anchors
+    pub fn block_bounds(&self) -> Option<(u32, u32)> {
         let skips = &self.blob[self.skips_start..self.skips_end];
-        let n = skips.len() / SKIP_ENTRY_BYTES;
+        let n = skips.len() / 16;
         if n == 0 {
             return None;
         }
@@ -246,24 +246,7 @@ impl<'a> PostingReader<'a> {
                     .unwrap(),
             )
         };
-        let prev_docid = row(0);
-        let _off = row(1);
-        let tf_max = row(2);
-        let len_min = row(3);
-        // first doc of the next block: prev_docid of the following anchor + 1
-        let _next_start = if b + 1 < n {
-            let next_row = |field: usize| {
-                u32::from_le_bytes(
-                    skips[(b + 1) * 16 + field * 4..(b + 1) * 16 + field * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                )
-            };
-            Some(next_row(0) + 1)
-        } else {
-            None
-        };
-        Some((prev_docid, _off, tf_max, len_min))
+        Some((row(2), row(3)))
     }
 
     /// block index containing the current decode position

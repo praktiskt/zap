@@ -89,8 +89,8 @@ fn glob_match(term: &str, pat: &[char]) -> bool {
     pi == m
 }
 
-/// [stemmed?, raw] variants (1 alloc max); used by stem_variants()
-/// (stemmed, raw) iteration alternates; at most 1 alloc; replaces stem_variants()
+/// [stemmed, raw] variants of one term; raw is None when the stem is identical
+/// (at most 1 alloc per call)
 fn stem_pair(ctx: &Ctx, t: &str) -> [Option<String>; 2] {
     let stem = ctx.analyzer.stem_word(t);
     if stem == t {
@@ -111,7 +111,7 @@ pub fn eval(
 }
 
 /// single-term streaming with live topk threshold (block-max WAND lite)
-/// returns true if the node was handled (plain Term); blog members pushed into `col`
+/// returns true if the node was handled (plain Term); bool members pushed into `col`
 /// `allowed`: tombstone mask complement — docs outside it are live-only probes
 pub fn eval_term_stream(
     node: &Node,
@@ -145,7 +145,7 @@ pub fn eval_term_stream(
                 let blk = r.cur_block();
                 if blk != seen_block {
                     seen_block = blk;
-                    if let Some((_, _, tf_max, len_min)) = r.block_bounds() {
+                    if let Some((tf_max, len_min)) = r.block_bounds() {
                         let tfm = tf_max.max(tf) as f32;
                         let norm_min = if len_min > 0 {
                             (1.0 - ctx.params.b)

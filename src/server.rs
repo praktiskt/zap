@@ -563,7 +563,6 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
         buckets.entry(ring[slot]).or_default().push(doc);
     }
     // split: this shard's docs commit locally (in-thread), remote owner
-    // split: this shard's docs commit locally (in-thread), remote owner
     // batches ingest concurrently so wall time = slowest peer + local commit
     let (local_batch, remote): (Option<Vec<Document>>, Vec<ShardBatch>) = {
         let (l, r): (Vec<(SocketAddr, Vec<Document>)>, Vec<_>) = buckets
