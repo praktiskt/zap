@@ -163,6 +163,8 @@ pub struct SegmentReader {
     pub num_docs: u32,
     /// per-field term dictionaries; global infos offset base is tracked per field
     fsts: Vec<Map<Vec<u8>>>,
+    /// shadow copy of the FST bytes (populated at freeze; to_bytes uses this)
+    fst_raw: Box<[Vec<u8>]>,
     infos: Vec<TermInfo>,
     blob: Box<[u8]>,
     pub field_norms: Vec<Box<[u16]>>,
@@ -171,6 +173,246 @@ pub struct SegmentReader {
     ids: Vec<Option<String>>,
     /// docids sorted by their id (binary-search forward index); empty iff ids is empty
     id_fwd: Vec<u32>,
+}
+
+// -- disk serialization (opt-in --disk) --------------------------------------
+
+const SEG_MAGIC: &[u8; 8] = b"zapseg1\0";
+
+impl SegmentReader {
+    /// full on-disk serialization (little-endian sections; immutable snapshot).
+    /// Layout: [magic][num_docs u32][nf u32] per-field [fst len u32][fst]
+    /// [n_infos u32] per-info 44B [df u32 + 5 ranges x (start,end)]
+    /// [blob len u32][blob] per fid [norm len u32][u16*n]
+    /// [n_store u32]([len u32][bytes]) [n_ids u32]([has u8][len u32][bytes])
+    pub fn to_bytes(&self) -> Vec<u8> {
+        fn push_u32(out: &mut Vec<u8>, v: u32) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn push_opt_string(out: &mut Vec<u8>, s: Option<&str>) {
+            match s {
+                Some(t) => {
+                    push_u32(out, 1);
+                    push_u32(out, t.len() as u32);
+                    out.extend_from_slice(t.as_bytes());
+                }
+                None => push_u32(out, 0),
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(SEG_MAGIC);
+        push_u32(&mut out, self.num_docs);
+        push_u32(&mut out, self.fsts.len() as u32);
+        for bytes in self.fst_raw.iter() {
+            push_u32(&mut out, bytes.len() as u32);
+            out.extend_from_slice(bytes);
+        }
+        push_u32(&mut out, self.infos.len() as u32);
+        for i in &self.infos {
+            push_u32(&mut out, i.df);
+            for r in [&i.docids, &i.tfs, &i.pos, &i.pos_offsets, &i.skips] {
+                push_u32(&mut out, r.start);
+                push_u32(&mut out, r.end);
+            }
+        }
+        push_u32(&mut out, self.blob.len() as u32);
+        out.extend_from_slice(&self.blob);
+        for norms in &self.field_norms {
+            push_u32(&mut out, norms.len() as u32);
+            for n in norms.iter() {
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+        push_u32(&mut out, self.store_blocks.len() as u32);
+        for b in &self.store_blocks {
+            push_u32(&mut out, b.len() as u32);
+            out.extend_from_slice(b);
+        }
+        push_u32(&mut out, self.ids.len() as u32);
+        for id in &self.ids {
+            push_opt_string(&mut out, id.as_deref());
+        }
+        out
+    }
+
+    /// mirror image of `to_bytes`; id_fwd is rebuilt on load
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut p = 0usize;
+        if bytes.len() < 8 || &bytes[..8] != SEG_MAGIC {
+            return Err("bad segment magic".into());
+        }
+        p += 8;
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (num_docs)".into());
+        }
+        let num_docs = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+        p += 4;
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (nf)".into());
+        }
+        let nf = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let mut fsts = Vec::with_capacity(nf);
+        let mut fst_raws: Vec<Vec<u8>> = Vec::with_capacity(nf);
+        for _ in 0..nf {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (fst len)".into());
+            }
+            let len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if bytes.len() < p + len {
+                return Err("segment truncated (fst)".into());
+            }
+            let raw = bytes[p..p + len].to_vec();
+            fsts.push(Map::new(raw.clone()).map_err(|e| format!("fst: {e}"))?);
+            fst_raws.push(raw);
+            p += len;
+        }
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (n_infos)".into());
+        }
+        let n_infos = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let mut infos = Vec::with_capacity(n_infos);
+        for _ in 0..n_infos {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (info df)".into());
+            }
+            let df = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            p += 4;
+            let mut starts = [0u32; 5];
+            let mut ends = [0u32; 5];
+            for s in 0..5 {
+                if bytes.len() < p + 8 {
+                    return Err("segment truncated (info ranges)".into());
+                }
+                starts[s] = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+                ends[s] = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
+                p += 8;
+            }
+            infos.push(TermInfo {
+                df,
+                docids: starts[0]..ends[0],
+                tfs: starts[1]..ends[1],
+                pos: starts[2]..ends[2],
+                pos_offsets: starts[3]..ends[3],
+                skips: starts[4]..ends[4],
+            });
+        }
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (blob len)".into());
+        }
+        let blob_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if bytes.len() < p + blob_len {
+            return Err("segment truncated (blob)".into());
+        }
+        let blob = bytes[p..p + blob_len].to_vec().into_boxed_slice();
+        p += blob_len;
+        let mut field_norms = Vec::with_capacity(nf);
+        for _ in 0..nf {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (norm len)".into());
+            }
+            let len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if bytes.len() < p + len * 2 {
+                return Err("segment truncated (norms)".into());
+            }
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                v.push(u16::from_le_bytes(
+                    bytes[p + i * 2..p + i * 2 + 2].try_into().unwrap(),
+                ));
+            }
+            field_norms.push(v.into_boxed_slice());
+            p += len * 2;
+        }
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (n_store)".into());
+        }
+        let n_store = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let mut store_blocks = Vec::with_capacity(n_store);
+        for _ in 0..n_store {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (store len)".into());
+            }
+            let len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if bytes.len() < p + len {
+                return Err("segment truncated (store)".into());
+            }
+            store_blocks.push(bytes[p..p + len].to_vec().into_boxed_slice());
+            p += len;
+        }
+        if bytes.len() < p + 4 {
+            return Err("segment truncated (n_ids)".into());
+        }
+        let n_ids = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let mut ids: Vec<Option<String>> = Vec::with_capacity(n_ids);
+        for _ in 0..n_ids {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (id tag)".into());
+            }
+            let has = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            p += 4;
+            if has == 1 {
+                if bytes.len() < p + 4 {
+                    return Err("segment truncated (id len)".into());
+                }
+                let len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                if bytes.len() < p + len {
+                    return Err("segment truncated (id bytes)".into());
+                }
+                let t = std::str::from_utf8(&bytes[p..p + len])
+                    .map_err(|e| e.to_string())?
+                    .to_owned();
+                ids.push(Some(t));
+                p += len;
+            } else {
+                ids.push(None);
+            }
+        }
+        let mut reader = SegmentReader {
+            num_docs,
+            fsts,
+            fst_raw: fst_raws.into_boxed_slice(),
+            infos,
+            blob,
+            field_norms,
+            store_blocks,
+            ids,
+            id_fwd: Vec::new(),
+        };
+        let fwd = rebuild_id_fwd(&reader.ids, reader.num_docs);
+        reader.id_fwd = fwd.1;
+        reader.ids = fwd.0;
+        Ok(reader)
+    }
+}
+
+/// shared by freeze_parts and from_bytes: an (ids, id_fwd) pair (ids empty = no ids)
+pub(crate) fn rebuild_id_fwd(
+    ids: &[Option<String>],
+    num_docs: u32,
+) -> (Vec<Option<String>>, Vec<u32>) {
+    let any = ids.iter().any(Option::is_some);
+    if !any {
+        return (Vec::new(), Vec::new());
+    }
+    let mut fwd: Vec<u32> = (0..num_docs)
+        .filter(|d| ids[*d as usize].is_some())
+        .collect();
+    fwd.sort_unstable_by(|a, b| {
+        ids[*a as usize]
+            .as_deref()
+            .unwrap()
+            .cmp(ids[*b as usize].as_deref().unwrap())
+    });
+    (ids.to_vec(), fwd)
 }
 
 /// shared by SegmentBuilder::freeze and segment merge
@@ -184,6 +426,7 @@ pub fn freeze_parts(
     let mut blob: Vec<u8> = Vec::new();
     let mut infos: Vec<TermInfo> = Vec::new();
     let mut fsts = Vec::with_capacity(postings.len());
+    let mut fst_raws: Vec<Vec<u8>> = Vec::with_capacity(postings.len());
     for (fid, terms) in postings.iter().enumerate() {
         let norms = field_norms.get(fid).map(|v| v.as_slice());
         // sorted by term for the FST (HashMap keeps insertion order)
@@ -234,27 +477,16 @@ pub fn freeze_parts(
                 infos.push(info.clone());
             }
         }
-        fsts.push(Map::new(map_builder.into_inner().unwrap()).unwrap());
+        let fst_bytes = map_builder.into_inner().unwrap();
+        fst_raws.push(fst_bytes.clone());
+        fsts.push(Map::new(fst_bytes).unwrap());
     }
     // forward id index: only materialized when at least one doc carries an id
-    let any_ids = ids.iter().any(Option::is_some);
-    let (ids, id_fwd) = if any_ids {
-        let mut fwd: Vec<u32> = (0..num_docs)
-            .filter(|d| ids[*d as usize].is_some())
-            .collect();
-        fwd.sort_unstable_by(|a, b| {
-            ids[*a as usize]
-                .as_deref()
-                .unwrap()
-                .cmp(ids[*b as usize].as_deref().unwrap())
-        });
-        (ids, fwd)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (ids, id_fwd) = rebuild_id_fwd(&ids, num_docs);
     SegmentReader {
         num_docs,
         fsts,
+        fst_raw: fst_raws.into_boxed_slice(),
         infos,
         blob: blob.into_boxed_slice(),
         field_norms: field_norms

@@ -52,12 +52,15 @@ zap dir/ file.md
 { echo "doc one"; echo; echo "some query"; } | zap --stdin-lines --lanes 8
 # block-max WAND needs BM25 params; defaults are k1=1.2 b=0.75
 zap --k1 1.2 --b 0.75 dir/
+# opt-in persistence: state loads from DIR at boot and every commit is
+# persisted there (segments + MANIFEST.json, atomic rewrite) — reboot-safe
+zap serve --bind 127.0.0.1:3279 --disk ./data
 ```
 
 Input docs: files/dirs (`.txt .md .rst .json .toml .csv .log .xml`; unknown extensions tried
 as text); `--stdin` = whole stdin is one doc; `--stdin-lines` = one doc per line until a
 blank line. Common flags: `-k N`, `--lanes N`, `--no-stem`, `--plain`, `--snippet N`,
-`--commit-every N`.
+`--commit-every N`, `--disk DIR`.
 
 ## Repo
 

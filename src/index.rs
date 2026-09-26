@@ -40,6 +40,129 @@ type StatsCache = (Vec<u64>, Arc<HashMap<(u32, String), u32>>, u64);
 /// per-segment merge scan: (per-field norm slices, store blocks, external ids)
 type SegScan = (Vec<Vec<u16>>, Vec<Box<[u8]>>, Vec<Option<String>>);
 
+/// opt-in disk persistence: immutable segments under DIR/segments/, plus an
+/// atomically-rewritten MANIFEST.json (tmp file + fsync + rename). Boot:
+/// read the manifest, load named segments, publish the snapshot. Uncommitted
+/// hot lanes are bounded by commit-every and ARE LOST on crash (documented).
+pub struct DiskHandle {
+    dir: std::path::PathBuf,
+}
+
+impl DiskHandle {
+    pub fn open(dir: std::path::PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(dir.join("segments"))
+            .map_err(|e| format!("disk {:?}: {e}", dir))?;
+        Ok(Self { dir })
+    }
+
+    /// persist every live segment whose file does not exist yet + rewrite manifest.
+    /// files are CONTENT-ADDRESSED (hash of the serialized bytes) so manifest
+    /// entries are unambiguous across generations without any migration step.
+    pub fn persist(
+        &self,
+        segments: &[Arc<SegmentReader>],
+        deleted: &HashMap<u32, RoaringBitmap>,
+    ) -> Result<(), String> {
+        let mut files = Vec::with_capacity(segments.len());
+        let mut seen = std::collections::HashSet::new();
+        for seg in segments {
+            let bytes = seg.to_bytes();
+            let hash = format!("{:016x}", crate::cluster::fnv64a(&bytes));
+            let name = format!("seg-{}.zap", hash);
+            let path = self.dir.join("segments").join(&name);
+            if !path.exists() && !seen.contains(&name) {
+                atomic_write(&path, &bytes)?;
+            }
+            seen.insert(name);
+            files.push(format!("seg-{}.zap", hash));
+        }
+        let mut doc = serde_json::json!({
+            "version": 1,
+            "segments": segments.len(),
+            "files": files,
+        });
+        if !deleted.is_empty() {
+            let mut tomb = serde_json::Map::new();
+            for (si, mask) in deleted {
+                if mask.is_empty() {
+                    continue;
+                }
+                tomb.insert(
+                    si.to_string(),
+                    serde_json::json!(mask.iter().collect::<Vec<u32>>()),
+                );
+            }
+            if !tomb.is_empty() {
+                doc.as_object_mut()
+                    .expect("object")
+                    .insert("tombstones".to_string(), serde_json::Value::Object(tomb));
+            }
+        }
+        let bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+        atomic_write(&self.manifest_path(), &bytes)
+    }
+
+    /// load back: files referenced by the manifest, in order
+    pub fn load(&self) -> Result<Vec<Arc<SegmentReader>>, String> {
+        let manifest = match std::fs::read(self.manifest_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("manifest: {e}")),
+        };
+        let doc: serde_json::Value =
+            serde_json::from_slice(&manifest).map_err(|e| format!("manifest parse: {e}"))?;
+        let files = doc["files"].as_array().ok_or("manifest missing files")?;
+        let mut out = Vec::with_capacity(files.len());
+        for f in files {
+            let name = f.as_str().ok_or("manifest file entry not a string")?;
+            let bytes = std::fs::read(self.dir.join("segments").join(name))
+                .map_err(|e| format!("segment {name}: {e}"))?;
+            out.push(Arc::new(SegmentReader::from_bytes(&bytes)?));
+        }
+        Ok(out)
+    }
+
+    /// rebuild tombstone map from the manifest
+    pub fn load_tombstones(&self) -> Result<HashMap<u32, RoaringBitmap>, String> {
+        let manifest = match std::fs::read(self.manifest_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(format!("manifest: {e}")),
+        };
+        let doc: serde_json::Value =
+            serde_json::from_slice(&manifest).map_err(|e| format!("manifest parse: {e}"))?;
+        let mut out = HashMap::new();
+        if let Some(t) = doc["tombstones"].as_object() {
+            for (k, v) in t {
+                let si: u32 = k.parse().map_err(|e| format!("tombstone key: {e}"))?;
+                let ids: Vec<u32> = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+                let mut bm = RoaringBitmap::new();
+                for id in ids {
+                    bm.insert(id);
+                }
+                out.insert(si, bm);
+            }
+        }
+        Ok(out)
+    }
+
+    fn manifest_path(&self) -> std::path::PathBuf {
+        self.dir.join("MANIFEST.json")
+    }
+}
+
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("open {:?}: {e}", tmp))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write {tmp:?}: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync {tmp:?}: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp:?}: {e}"))
+}
+
 /// resolved store payload for one document
 #[derive(Debug, Clone)]
 pub struct DocPayload {
@@ -61,6 +184,7 @@ pub struct IndexSnapshot {
 }
 
 pub struct Index {
+    disk: Option<DiskHandle>,
     schema: Arc<Schema>,
     analyzer: Arc<Analyzer>,
     k1: f32,
@@ -100,12 +224,40 @@ impl Index {
         b: f32,
         lanes: usize,
     ) -> Arc<Self> {
+        Self::with_lanes_disk(schema, analyzer, k1, b, lanes, None)
+    }
+
+    /// opt-in persistence: `disk_dir` set -> segments load at boot, and every
+    /// commit/merge/delete atomically rewrites the manifest under DIR
+    pub fn with_lanes_disk(
+        schema: Schema,
+        analyzer: Arc<Analyzer>,
+        k1: f32,
+        b: f32,
+        lanes: usize,
+        disk_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         let schema = Arc::new(schema);
         let lanes = lanes.max(1);
         let hot = (0..lanes)
             .map(|_| SegmentBuilder::new(schema.clone(), analyzer.clone()))
             .collect();
-        Arc::new(Self {
+        // opt-in persistence: load existing state synchronously at boot
+        let disk = match disk_dir {
+            Some(dir) => {
+                let h = DiskHandle::open(dir).expect("open disk dir");
+                let segments = h.load().expect("load disk segments");
+                let tombstones = h.load_tombstones().expect("load disk tombstones");
+                Some((h, segments, tombstones))
+            }
+            None => None,
+        };
+        let (handle, segs, tomb) = match disk {
+            Some((h, segs, t)) => (Some(h), segs, t),
+            None => (None, Vec::new(), HashMap::new()),
+        };
+        let index = Arc::new(Self {
+            disk: handle,
             schema,
             analyzer,
             k1,
@@ -120,15 +272,35 @@ impl Index {
             inner: Mutex::new(IndexInner {
                 hot,
                 next_lane: 0,
-                segments: Vec::new(),
-                deleted: HashMap::new(),
+                segments: segs,
+                deleted: tomb,
                 ids: HashMap::new(),
                 ids_arc: Arc::new(HashMap::new()),
                 stats_cache: None,
                 hot_ids: HashSet::new(),
                 generation: 0,
             }),
-        })
+        });
+        // publish the loaded snapshot + rebuild the id index on top of it
+        {
+            let mut g = index.inner.lock().unwrap();
+            if std::env::var("ZAP_DISK_TRACE").is_ok() {
+                eprintln!(
+                    "[disk] segs={} tomb={} tomblen={:?}",
+                    g.segments.len(),
+                    g.deleted.len(),
+                    g.deleted.values().map(|m| m.len()).collect::<Vec<_>>()
+                );
+            }
+            index.publish_snapshot(&mut g, true);
+            if std::env::var("ZAP_DISK_TRACE").is_ok() {
+                eprintln!(
+                    "[disk] post-publish snap total_docs={}",
+                    index.pub_stats().total_docs
+                );
+            }
+        }
+        index
     }
 
     pub fn lane_count(&self) -> usize {
@@ -293,6 +465,9 @@ impl Index {
         g.hot_ids.clear();
         g.generation += 1;
         self.publish_snapshot(g, true);
+        if let Some(d) = &self.disk {
+            d.persist(&g.segments, &g.deleted).expect("disk persist");
+        }
     }
 
     pub fn commit(&self) {
@@ -311,8 +486,15 @@ impl Index {
         let Some(old) = g.ids.remove(id) else {
             return Ok(false);
         };
+        if std::env::var("ZAP_DISK_TRACE").is_ok() {
+            eprintln!("[delete] id={id} old={:?}", old);
+        }
         g.deleted.entry(old.segment).or_default().insert(old.docid);
         self.publish_snapshot(&mut g, false);
+        if let Some(d) = &self.disk {
+            d.persist(&g.segments, &g.deleted)
+                .expect("disk persist tombstone");
+        }
         Ok(true)
     }
 

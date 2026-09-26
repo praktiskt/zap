@@ -21,6 +21,10 @@ struct Args {
     /// each stdin line becomes one document
     #[arg(long, global = true)]
     stdin_lines: bool,
+    /// opt-in persistence: load existing state from DIR at boot; every
+    /// commit atomically persists segments + manifest there (reboot-safe)
+    #[arg(long, global = true, value_name = "DIR")]
+    disk: Option<PathBuf>,
     /// number of results per query
     #[arg(short, long, default_value = "10", global = true)]
     top_k: usize,
@@ -156,7 +160,14 @@ fn main() -> Result<()> {
         max_token_len: 64,
     });
     let lanes = args.lanes.min(docs.len().max(1)).max(1);
-    let index = Index::with_lanes(schema, analyzer.clone(), args.k1, args.b, lanes);
+    let index = Index::with_lanes_disk(
+        schema,
+        analyzer.clone(),
+        args.k1,
+        args.b,
+        lanes,
+        args.disk.clone(),
+    );
     let mut chunk: Vec<Document> = Vec::with_capacity(args.commit_every);
     for text in &docs {
         chunk.push(Document::new().text("text", text.clone()));
