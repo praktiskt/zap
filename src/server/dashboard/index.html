@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zap — dashboard</title>
+<link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+<header>
+  <span class="dot" id="health-dot"></span>
+  <h1>zap</h1>
+  <span class="sub">in-memory FTS — <code class="hl">catppuccin</code> mocha dashboard</span>
+  <span id="refresh">auto 1.5s</span>
+</header>
+<main>
+  <div class="chips">
+    <div class="card docs"><div class="label">docs</div><div class="value" id="v-docs">–</div></div>
+    <div class="card segments"><div class="label">segments</div><div class="value" id="v-segments">–</div></div>
+    <div class="card gen"><div class="label">generation</div><div class="value" id="v-gen">–</div></div>
+    <div class="card searches"><div class="label">searches</div><div class="value" id="v-searches">–</div></div>
+    <div class="card ingested"><div class="label">ingested</div><div class="value" id="v-ingested">–</div></div>
+    <div class="card uptime"><div class="label">uptime</div><div class="value" id="v-uptime">–</div></div>
+  </div>
+  <h2>shards</h2>
+  <table>
+    <thead><tr><th>address</th><th>docs</th><th>segments</th><th>generation</th>
+      <th>searches</th><th>ingested</th><th>uptime</th><th>state</th></tr></thead>
+    <tbody id="shard-rows"><tr><td colspan="8" class="muted">loading…</td></tr></tbody>
+  </table>
+</main>
+<footer>zap — in-memory full-text search · <span class="pink">catppuccin</span> mocha</footer>
+<script src="/dashboard/app.js"></script>
+</body>
+</html>

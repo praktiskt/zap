@@ -168,14 +168,23 @@ fn serve_doc_id_metadata_lifecycle() {
 
 #[test]
 fn dashboard_served_with_mocha() {
-    // /dashboard = live HTML stats page in catppuccin mocha colors
+    // /dashboard = live HTML stats page in catppuccin mocha colors, assets
+    // embedded at compile time (src/server/dashboard/*)
     let addr = start_serve();
     let (code, body) = request_raw(addr, "GET", "/dashboard", None);
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("catppuccin"), "palette attribution missing");
-    assert!(body.contains("--base: #1e1e2e"), "mocha base color missing");
-    assert!(body.contains("--mauve: #cba6f7"), "mocha accent missing");
-    assert!(body.contains("fetch(\"/stats\")"), "live polling missing");
+    assert!(body.contains("/dashboard/style.css"), "css link missing");
+    assert!(body.contains("/dashboard/app.js"), "js link missing");
+    let (code, css) = request_raw(addr, "GET", "/dashboard/style.css", None);
+    assert_eq!(code, 200, "{css}");
+    assert!(css.contains("--base: #1e1e2e"), "mocha base color missing");
+    assert!(css.contains("--mauve: #cba6f7"), "mocha accent missing");
+    let (code, js) = request_raw(addr, "GET", "/dashboard/app.js", None);
+    assert_eq!(code, 200, "{js}");
+    assert!(js.contains("fetch(\"/stats\")"), "stats polling missing");
+    let (code, _) = request_raw(addr, "GET", "/dashboard/nope.css", None);
+    assert_eq!(code, 404, "unknown asset should miss");
     // /stats carries the shard chip + counters the dashboard renders
     let v: Value = get_json(addr, "/stats");
     assert!(v["shards"].as_array().is_some(), "{v}");

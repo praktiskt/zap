@@ -152,8 +152,30 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
         (Method::Get, "/health") => {
             reply(req, 200, r##"{"status":"ok"}"##);
         }
-        (Method::Get, "/dashboard") => {
-            reply_html(req, 200, DASHBOARD_HTML);
+        (Method::Get, "/dashboard") => match dashboard_dir().get_file("index.html") {
+            Some(f) => reply_html(req, 200, f.contents_utf8().unwrap_or("")),
+            None => reply(req, 500, r#"{"error":"dashboard assets missing"}"#),
+        },
+        (Method::Get, p) if p.starts_with("/dashboard/") => {
+            let rel = &p["/dashboard/".len()..];
+            match dashboard_dir().get_file(url_decode(rel)) {
+                Some(f) => {
+                    let mime = if rel.ends_with(".css") {
+                        "text/css; charset=utf-8"
+                    } else if rel.ends_with(".js") {
+                        "application/javascript"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    };
+                    let mut r = Response::from_string(f.contents_utf8().unwrap_or("").to_string());
+                    r.add_header(
+                        tiny_http::Header::from_bytes(&b"Content-Type"[..], mime.as_bytes())
+                            .unwrap(),
+                    );
+                    let _ = req.respond(r.with_status_code(200));
+                }
+                None => reply(req, 404, r#"{"error":"not found"}"#),
+            }
         }
         (Method::Get, "/stats") => stats_reply(req, index, cluster),
         (Method::Get, "/search") => match query_param(&query, "q") {
@@ -902,6 +924,16 @@ fn reply_html(req: Request, code: u16, body: &str) {
     let _ = req.respond(r.with_status_code(code));
 }
 
+// ---- /dashboard (compile-time embedded assets) -----------------------------
+
+/// embedded at compile time: src/server/dashboard/{index.html, style.css, app.js}
+static DASHBOARD: include_dir::Dir =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/server/dashboard");
+
+fn dashboard_dir() -> &'static include_dir::Dir<'static> {
+    &DASHBOARD
+}
+
 /// percent-decode ('+' = space); invalid escapes pass through raw
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -946,122 +978,3 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         (k == key).then(|| url_decode(v))
     })
 }
-
-// ---- /dashboard ------------------------------------------------------------
-
-/// catppuccin mocha: base/mantle/crust surfaces, mauve accents, teal/green/peach
-/// status dots; polls /stats and re-renders every 1.5s
-const DASHBOARD_HTML: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zap — dashboard</title>
-<style>
-:root {
-  --base: #1e1e2e; --mantle: #11111b; --crust: #181825;
-  --surface0: #313244; --surface1: #45475a; --surface2: #585b70;
-  --text: #cdd6f4; --subtext: #a6adc8; --subsubtext: #9399b2;
-  --mauve: #cba6f7; --lavender: #b4befe; --teal: #94e2d5;
-  --green: #a6e3a1; --peach: #fab387; --red: #f38ba8;
-  --blue: #89b4fa; --yellow: #f9e2af; --pink: #f5c2e7;
-}
-html, body { margin: 0; padding: 0; background: var(--base); color: var(--text);
-  font-family: ui-monospace, "JetBrains Mono", "CaskaydiaCove Nerd Font", monospace; }
-header { padding: 18px 26px 10px; display: flex; align-items: baseline; gap: 14px; }
-header h1 { font-size: 20px; margin: 0; color: var(--mauve); letter-spacing: 1px; }
-header .sub { color: var(--subtext); font-size: 12px; }
-header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green);
-  display: inline-block; margin-right: 6px; }
-header .dot.down { background: var(--red); }
-main { padding: 12px 26px 30px; }
-.chips { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
-.card { background: var(--crust); border: 1px solid var(--surface0); border-radius: 10px;
-  padding: 14px 18px; min-width: 150px; box-shadow: 0 1px 0 var(--mantle) inset; }
-.card .label { color: var(--subtext); font-size: 11px; letter-spacing: .8px; text-transform: uppercase; }
-.card .value { font-size: 26px; color: var(--text); margin-top: 2px; }
-.card.docs .value { color: var(--lavender); }
-.card.segments .value { color: var(--teal); }
-.card.gen .value { color: var(--peach); }
-.card.searches .value { color: var(--mauve); }
-.card.ingested .value { color: var(--green); }
-.card.uptime .value { color: var(--yellow); font-size: 20px; }
-h2 { color: var(--subtext); font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
-  margin: 20px 0 8px; }
-table { width: 100%; border-collapse: collapse; background: var(--crust);
-  border: 1px solid var(--surface0); border-radius: 10px; overflow: hidden; }
-th, td { text-align: left; padding: 9px 14px; font-size: 13px; border-bottom: 1px solid var(--surface0); }
-th { color: var(--subtext); font-weight: 500; background: var(--mantle); }
-tr:last-child td { border-bottom: none; }
-td.up { color: var(--green); } td.down { color: var(--red); }
-tr.shard-row:hover td { background: var(--surface0); }
-footer { color: var(--subsubtext); font-size: 11px; padding: 8px 26px; }
-#refresh { color: var(--subtext); margin-left: auto; font-size: 11px; }
-</style>
-</head>
-<body>
-<header>
-  <span class="dot" id="health-dot"></span>
-  <h1>zap</h1>
-  <span class="sub">in-memory FTS — <code style="color:var(--lavender)">mocha</code> dashboard</span>
-  <span id="refresh">auto 1.5s</span>
-</header>
-<main>
-  <div class="chips">
-    <div class="card docs"><div class="label">docs</div><div class="value" id="v-docs">–</div></div>
-    <div class="card segments"><div class="label">segments</div><div class="value" id="v-segments">–</div></div>
-    <div class="card gen"><div class="label">generation</div><div class="value" id="v-gen">–</div></div>
-    <div class="card searches"><div class="label">searches</div><div class="value" id="v-searches">–</div></div>
-    <div class="card ingested"><div class="label">ingested</div><div class="value" id="v-ingested">–</div></div>
-    <div class="card uptime"><div class="label">uptime</div><div class="value" id="v-uptime">–</div></div>
-  </div>
-  <h2>shards</h2>
-  <table>
-    <thead><tr><th>address</th><th>docs</th><th>segments</th><th>generation</th>
-      <th>searches</th><th>ingested</th><th>uptime</th><th>state</th></tr></thead>
-    <tbody id="shard-rows"><tr><td colspan="8" style="color:var(--subtext)">loading…</td></tr></tbody>
-  </table>
-</main>
-<footer>zap — in-memory full-text search · <span style="color:var(--pink)">catppuccin</span> mocha</footer>
-<script>
-function fmt(n) { return n === null || n === undefined ? "–" : n.toLocaleString(); }
-function uptime(s) {
-  if (s === null || s === undefined) return "–";
-  if (s < 60) return s + "s";
-  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60).toString() + "s";
-  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
-}
-async function tick() {
-  try {
-    const r = await fetch("/stats");
-    const j = await r.json();
-    document.getElementById("v-docs").textContent = fmt(j.docs);
-    document.getElementById("v-segments").textContent = fmt(j.segments);
-    document.getElementById("v-gen").textContent = fmt(j.generation);
-    const self = (j.shards || []).find(x => x && x.addr && !x.down) || {};
-    document.getElementById("v-searches").textContent = fmt(self.searches);
-    document.getElementById("v-ingested").textContent = fmt(self.ingested);
-    document.getElementById("v-uptime").textContent = uptime(self.uptime_s);
-    const dot = document.getElementById("health-dot");
-    dot.className = "dot" + (j.degraded ? " down" : "");
-    const rows = (j.shards || []).map(s => {
-      if (!s || s.down) return '<tr class="shard-row"><td>' + s.addr + '</td>' +
-        '<td colspan="6" style="color:var(--subtext)">unreachable</td>' +
-        '<td class="down">DOWN</td></tr>';
-      return '<tr class="shard-row"><td style="color:var(--lavender)">' + s.addr + '</td>' +
-        '<td>' + fmt(s.docs) + '</td><td>' + fmt(s.segments) + '</td><td>' + fmt(s.generation) + '</td>' +
-        '<td style="color:var(--mauve)">' + fmt(s.searches) + '</td>' +
-        '<td style="color:var(--teal)">' + fmt(s.ingested) + '</td><td>' + uptime(s.uptime_s) + '</td>' +
-        '<td class="up">UP</td></tr>';
-    });
-    document.getElementById("shard-rows").innerHTML = rows.join("");
-  } catch (e) {
-    document.getElementById("health-dot").className = "dot down";
-  }
-}
-tick();
-setInterval(tick, 1500);
-</script>
-</body>
-</html>
-"##;
