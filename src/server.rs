@@ -1,30 +1,92 @@
-//! HTTP serve mode: NDJSON ingest + /search endpoints over the in-memory index
+//! HTTP serve mode: NDJSON ingest + search + cluster fan-out endpoints.
 //!
 //! The engine is CPU-bound and sync, so the HTTP layer stays threaded
-//! (`tiny_http`); no async runtime is involved. Endpoints:
-//! - `GET  /health`            liveness
-//! - `GET  /stats`             docs / segments / generation
-//! - `GET  /search?q=..&k=..`  query string search
-//! - `POST /search`  `{"q":..,"k":..}` body search
-//! - `POST /ingest`   NDJSON `{"text":..}` lines or a JSON array of them
-//! - `POST /commit`   explicit segment commit
+//! (`tiny_http`); no async runtime is involved. Public endpoints:
+//! - `GET  /health`            liveness (local shard)
+//! - `GET  /stats`             docs / segments / generation (cluster-summed)
+//! - `GET/POST /search` {q,k}  fan-out to all shards, merged top-k
+//! - `POST /ingest`   NDJSON   {"id"?, "text", "metadata"?} — routed by ring
+//! - `POST /commit`            local shard commit (auto-commits on ingest too)
+//! - `GET/DELETE /doc/{id}`    get / tombstone one external id (ring-routed)
+//!
+//! Cluster-internal endpoints (never routed onward; always local shard work):
+//! - `POST   /__zap/gossip`       StatsEnvelope merge (delta or full)
+//! - `GET    /__zap/gossip_full`  this shard's absolute envelope
+//! - `POST   /__zap/shard_search` local search with merged global stats
+//! - `POST   /__zap/shard_ingest` local ingest (owner already chose us)
+//! - `GET    /__zap/shard_stats`  live counts for the aggregate /stats
 
 use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tiny_http::{Method, Request, Response, Server};
 
+use crate::cluster::{
+    encode_df_key, http_delete, http_get, http_post, parse_df_key, LocalCluster, PeerCache,
+    PeerConfig, StatsEnvelope,
+};
 use crate::index::Index;
 use crate::schema::Document;
+use crate::search::exec::Stats;
 
 const MAX_BODY: usize = 64 << 20; // 64 MB ingest ceiling per request
+
+/// owned cluster runtime; None = single node (routes unchanged)
+pub type ClusterOpt = Option<Arc<LocalCluster>>;
+/// borrowed cluster handle (internal plumbing)
+pub type ClusterRef<'a> = Option<&'a Arc<LocalCluster>>;
+
+/// build Stats from an envelope
+fn stats_from_envelope(env: StatsEnvelope) -> Stats {
+    let nf = env.sums.len();
+    let mut avg = Vec::with_capacity(nf);
+    for s in &env.sums {
+        avg.push(if env.docs > 0 {
+            *s as f32 / env.docs as f32
+        } else {
+            1.0
+        });
+    }
+    let mut df = std::collections::HashMap::new();
+    for (k, v) in env.df {
+        if let Some((fid, term)) = parse_df_key(&k) {
+            df.insert((fid, term), v);
+        }
+    }
+    Stats {
+        total_docs: env.docs,
+        avg_len: avg,
+        df: Arc::new(df),
+    }
+}
+
+/// absolute envelope from engine stats; sums recomputed from live norms
+fn envelope_from_stats(index: &Index, stats: &Stats) -> StatsEnvelope {
+    let sums = index.field_sums();
+    let mut df = std::collections::HashMap::new();
+    for ((fid, term), v) in stats.df.iter() {
+        df.insert(encode_df_key(*fid, term), *v);
+    }
+    StatsEnvelope {
+        docs: stats.total_docs,
+        sums,
+        df,
+        full: false,
+    }
+}
+
+/// this shard's absolute envelope
+fn own_envelope(index: &Index) -> StatsEnvelope {
+    envelope_from_stats(index, &index.pub_stats())
+}
 
 /// run the HTTP listener until `shutdown` flips; returns the bound address
 pub fn serve(
     index: Arc<Index>,
     bind: &str,
+    cluster: Option<PeerConfig>,
     shutdown: &'static AtomicBool,
 ) -> Result<SocketAddr, String> {
     let server = Server::http(bind).map_err(|e| format!("bind {bind}: {e}"))?;
@@ -32,6 +94,25 @@ pub fn serve(
         .server_addr()
         .to_ip()
         .ok_or_else(|| format!("unsupported bind address: {bind}"))?;
+    let served: ClusterOpt = cluster.map(|c| {
+        Arc::new(LocalCluster {
+            cache: Mutex::new(PeerCache::new(c)),
+            view: Mutex::new(crate::cluster::ClusterView::default()),
+            last_pushed: Mutex::new(None),
+        })
+    });
+    // join: pull every peer's absolute envelope once so this node starts from
+    // a converged global view (one roundtrip per peer, at startup only)
+    if let Some(cl) = &served {
+        let peers = cl.cache.lock().unwrap().peers();
+        for peer in peers {
+            if let Some((_, body)) = http_get(peer, "/__zap/gossip_full") {
+                if let Ok(env) = serde_json::from_str::<StatsEnvelope>(&body) {
+                    cl.view.lock().unwrap().merge_peer(peer, env);
+                }
+            }
+        }
+    }
     std::thread::spawn(move || loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -39,7 +120,7 @@ pub fn serve(
         match server.recv() {
             Ok(req) => {
                 let index = index.clone();
-                handle(req, &index);
+                handle(req, &index, served.as_ref());
             }
             Err(e) => {
                 eprintln!("[zap serve] recv error: {e}");
@@ -50,7 +131,7 @@ pub fn serve(
     Ok(addr)
 }
 
-fn handle(mut req: Request, index: &Index) {
+fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
     let url = req.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -61,31 +142,88 @@ fn handle(mut req: Request, index: &Index) {
         (Method::Get, "/health") => {
             reply(req, 200, r##"{"status":"ok"}"##);
         }
-        (Method::Get, "/stats") => {
-            let body = serde_json::json!({
-                "docs": index.num_docs(),
-                "segments": index.num_segments(),
-                "generation": index.generation(),
-            })
-            .to_string();
-            reply(req, 200, &body);
-        }
+        (Method::Get, "/stats") => stats_reply(req, index, cluster),
         (Method::Get, "/search") => match query_param(&query, "q") {
             Some(q) => {
                 let k = query_param(&query, "k")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(10);
-                search_reply(req, index, q, k);
+                search_reply(req, index, cluster, q, k);
             }
             None => {
                 reply(req, 400, r#"{"error":"missing `q`"}"#);
             }
         },
         (Method::Post, "/search") => match read_body(&mut req).and_then(|b| json_search(&b)) {
-            Ok((q, k)) => search_reply(req, index, q, k),
+            Ok((q, k)) => search_reply(req, index, cluster, q, k),
             Err(msg) => reply(req, 400, &msg),
         },
-        (Method::Post, "/ingest") => match ingest(&mut req, index) {
+        (Method::Post, "/ingest") => match ingest(&mut req, index, cluster) {
+            Ok(n) => {
+                let body = serde_json::json!({
+                    "accepted": n,
+                    "docs": docs_total(index, cluster),
+                    "committed": true,
+                })
+                .to_string();
+                reply(req, 200, &body);
+            }
+            Err(msg) => reply(req, 400, &serde_json::json!({"error": msg}).to_string()),
+        },
+        (Method::Post, "/commit") => {
+            index.commit();
+            if let Some(cl) = cluster {
+                push_own_stats(cl, index);
+            }
+            let body = serde_json::json!({ "committed": true, "docs": docs_total(index, cluster) })
+                .to_string();
+            reply(req, 200, &body);
+        }
+        (Method::Get, p) if p.starts_with("/doc/") => {
+            let id = url_decode(&p["/doc/".len()..]);
+            doc_get_reply(req, index, cluster, &id);
+        }
+        (Method::Delete, p) if p.starts_with("/doc/") => {
+            let id = url_decode(&p["/doc/".len()..]);
+            doc_delete_reply(req, index, cluster, &id);
+        }
+
+        // ---- cluster internals (never forwarded; always local shard) ----
+        (Method::Post, "/__zap/gossip") => {
+            let peer = query_param(&query, "peer").and_then(|p| p.parse::<SocketAddr>().ok());
+            match (read_body(&mut req), peer) {
+                (Ok(b), Some(peer)) => match serde_json::from_str::<StatsEnvelope>(&b) {
+                    Ok(env) => {
+                        gossip_handle(cluster, peer, env);
+                        reply(req, 200, r#"{"ok":true}"#);
+                    }
+                    Err(e) => reply(
+                        req,
+                        400,
+                        &serde_json::json!({"error": format!("bad envelope: {e}")}).to_string(),
+                    ),
+                },
+                _ => reply(
+                    req,
+                    400,
+                    &serde_json::json!({"error": "missing ?peer or bad body"}).to_string(),
+                ),
+            }
+        }
+        (Method::Get, "/__zap/gossip_full") => {
+            let env = own_envelope(index);
+            match serde_json::to_string(&env) {
+                Ok(s) => reply(req, 200, &s),
+                Err(e) => reply(req, 500, &format!("serialize: {e}")),
+            }
+        }
+        (Method::Post, "/__zap/shard_search") => {
+            match read_body(&mut req).and_then(|b| json_search(&b)) {
+                Ok((q, k)) => shard_search_reply(req, index, cluster, q, k),
+                Err(msg) => reply(req, 400, &msg),
+            }
+        }
+        (Method::Post, "/__zap/shard_ingest") => match shard_ingest(&mut req, index, cluster) {
             Ok(n) => {
                 let body = serde_json::json!({
                     "accepted": n,
@@ -97,79 +235,192 @@ fn handle(mut req: Request, index: &Index) {
             }
             Err(msg) => reply(req, 400, &serde_json::json!({"error": msg}).to_string()),
         },
-        (Method::Post, "/commit") => {
-            index.commit();
-            let body =
-                serde_json::json!({ "committed": true, "docs": index.num_docs() }).to_string();
+        (Method::Get, "/__zap/shard_stats") => {
+            let body = serde_json::json!({
+                "docs": index.num_docs(),
+                "segments": index.num_segments(),
+                "generation": index.generation(),
+            })
+            .to_string();
             reply(req, 200, &body);
         }
-        (Method::Get, p) if p.starts_with("/doc/") => {
-            let id = url_decode(&p["/doc/".len()..]);
-            match index.get(&id) {
-                Some(p) => {
-                    let mut v = serde_json::json!({
-                        "id": p.id,
-                        "fields": p.fields,
-                    });
-                    if let Some(meta) = p.metadata {
-                        v["metadata"] = meta;
-                    }
-                    reply(req, 200, &v.to_string());
-                }
-                None => reply(req, 404, r#"{"error":"not found"}"#),
-            }
-        }
-        (Method::Delete, p) if p.starts_with("/doc/") => {
-            let id = url_decode(&p["/doc/".len()..]);
-            match index.delete(&id) {
-                Ok(true) => reply(
-                    req,
-                    200,
-                    &serde_json::json!({ "deleted": true, "docs": index.num_docs() }).to_string(),
-                ),
-                Ok(false) => reply(req, 404, r#"{"error":"not found"}"#),
-                Err(e) => reply(req, 400, &e.to_string()),
-            }
-        }
+
         _ => {
             reply(req, 404, r#"{"error":"not found"}"#);
         }
     }
 }
 
-fn search_reply(req: Request, index: &Index, q: String, k: usize) {
-    match index.search(&q, k) {
+fn search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String, k: usize) {
+    let Some(cl) = cluster else {
+        return match index.search(&q, k) {
+            Ok(hits) => {
+                let results: Vec<serde_json::Value> =
+                    hits.iter().filter_map(|h| hit_row(index, h)).collect();
+                reply(
+                    req,
+                    200,
+                    &serde_json::json!({"results": results, "count": results.len()}).to_string(),
+                );
+            }
+            Err(e) => reply(req, 400, &e.to_string()),
+        };
+    };
+    let (code, body) = cluster_search(index, cl, &q, k);
+    reply(req, code, &body);
+}
+
+// ---- search fan-out helpers -----------------------------------------------
+
+/// one merged result row on the wire
+#[derive(Debug, Clone)]
+struct MergedRow {
+    score: f32,
+    id: Option<String>,
+    docid: u32,
+    doc: String,
+    metadata: Option<serde_json::Value>,
+}
+
+fn merged_cmp(a: &MergedRow, b: &MergedRow) -> std::cmp::Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.docid.cmp(&b.docid))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// wire row for one search hit (payload resolved through the doc store)
+fn hit_row(index: &Index, h: &crate::search::SearchHit) -> Option<serde_json::Value> {
+    let p = index.doc_payload(h.addr)?;
+    let doc = p
+        .fields
+        .iter()
+        .map(|(_name, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut v = serde_json::json!({
+        "score": h.score,
+        "id": p.id,
+        "docid": h.addr.docid,
+        "doc": doc,
+    });
+    if let Some(meta) = p.metadata {
+        v["metadata"] = meta;
+    }
+    Some(v)
+}
+
+fn row_to_json(r: MergedRow) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "score": r.score,
+        "id": r.id,
+        "docid": r.docid,
+        "doc": r.doc,
+    });
+    if let Some(m) = r.metadata {
+        v["metadata"] = m;
+    }
+    v
+}
+
+fn row_from_json(v: &serde_json::Value) -> MergedRow {
+    MergedRow {
+        score: v["score"].as_f64().unwrap_or(0.0) as f32,
+        id: v["id"].as_str().map(|s| s.to_owned()),
+        docid: v["docid"].as_u64().unwrap_or(0) as u32,
+        doc: v["doc"].as_str().unwrap_or("").to_owned(),
+        metadata: v.get("metadata").cloned().filter(|m| !m.is_null()),
+    }
+}
+
+/// coordinator: run the local shard with the merged global view, fan out to
+/// every peer, merge rows, truncate to k
+fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, String) {
+    let mut rows = own_rows(index, cl, q, k);
+    let mut degraded = false;
+    for peer in cl.cache.lock().unwrap().peers() {
+        match fanout_rows(peer, q, k) {
+            Ok(mut part) => rows.append(&mut part),
+            Err(_) => degraded = true,
+        }
+    }
+    rows.sort_by(merged_cmp);
+    rows.truncate(k);
+    let results: Vec<serde_json::Value> = rows.into_iter().map(row_to_json).collect();
+    let n = results.len();
+    (
+        200,
+        serde_json::json!({"results": results, "count": n, "degraded": degraded}).to_string(),
+    )
+}
+
+/// local shard rows scored with the merged global view
+fn own_rows(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> Vec<MergedRow> {
+    let stats: Stats = {
+        let mut view = cl.view.lock().unwrap();
+        let env = global_to_envelope(view.stats());
+        stats_from_envelope(env)
+    };
+    match index.search_with_stats(q, k, stats) {
+        Ok(hits) => hits
+            .into_iter()
+            .filter_map(|h| hit_row(index, &h))
+            .map(|v| row_from_json(&v))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// merged global view on the wire
+fn global_to_envelope(g: crate::cluster::GlobalStats) -> StatsEnvelope {
+    let mut df = std::collections::HashMap::new();
+    for ((fid, term), v) in g.df {
+        df.insert(encode_df_key(fid, &term), v);
+    }
+    StatsEnvelope {
+        docs: g.total_docs,
+        sums: g.sums,
+        df,
+        full: false,
+    }
+}
+
+/// fan-out one query to a shard; returns its top-k rows
+fn fanout_rows(peer: SocketAddr, q: &str, k: usize) -> Result<Vec<MergedRow>, String> {
+    let body = serde_json::json!({"q": q, "k": k}).to_string();
+    let (_, resp) = http_post(peer, "/__zap/shard_search", &body)
+        .ok_or_else(|| "peer unreachable".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("peer bad json: {e}"))?;
+    let items = v
+        .as_object()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .ok_or("peer response missing results")?;
+    Ok(items.iter().map(row_from_json).collect())
+}
+
+/// shard-side handler: score ONLY our shard with OUR global view
+fn shard_search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String, k: usize) {
+    let env: StatsEnvelope = match cluster {
+        Some(cl) => global_to_envelope(cl.view.lock().unwrap().stats()),
+        None => {
+            let snap = index.pub_stats();
+            envelope_from_stats(index, &snap)
+        }
+    };
+    let stats = stats_from_envelope(env);
+    match index.search_with_stats(&q, k, stats) {
         Ok(hits) => {
-            let results: Vec<serde_json::Value> = hits
-                .iter()
-                .filter_map(|h| {
-                    let p = index.doc_payload(h.addr)?;
-                    let doc = p
-                        .fields
-                        .iter()
-                        .map(|(_name, text)| text)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let mut v = serde_json::json!({
-                        "score": h.score,
-                        "id": p.id,
-                        "docid": h.addr.docid,
-                        "doc": doc,
-                    });
-                    if let Some(meta) = p.metadata {
-                        v["metadata"] = meta;
-                    }
-                    Some(v)
-                })
-                .collect();
+            let results: Vec<serde_json::Value> =
+                hits.iter().filter_map(|h| hit_row(index, h)).collect();
             reply(
                 req,
                 200,
-                &serde_json::json!({ "results": results, "count": results.len() }).to_string(),
+                &serde_json::json!({"results": results, "count": results.len()}).to_string(),
             );
         }
-        Err(e) => reply(req, 400, &e.to_string()),
+        Err(e) => reply(req, 200, &e.to_string()),
     }
 }
 
@@ -189,10 +440,10 @@ fn json_search(body: &str) -> Result<(String, usize), String> {
     Ok((q, k))
 }
 
-/// NDJSON (one `{"text": ...}` per line) or a JSON array of such objects.
-/// Optional per doc: `"id"` (string, unique — duplicates replace) and
-/// `"metadata"` (arbitrary JSON, stored-only).
-fn ingest(req: &mut Request, index: &Index) -> Result<usize, String> {
+/// NDJSON (one `{"text": ...}` per line) or a JSON array. Optional per doc:
+/// `"id"` (string, unique — duplicates replace) and `"metadata"`.
+/// Cluster mode routes every doc by ring slot to its owning shard.
+fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<usize, String> {
     let body = read_body(req)?;
     if body.is_empty() {
         return Err("empty ingest body".into());
@@ -218,9 +469,78 @@ fn ingest(req: &mut Request, index: &Index) -> Result<usize, String> {
     if docs.is_empty() {
         return Err("no documents supplied".into());
     }
+    let Some(cl) = cluster else {
+        let n = docs.len();
+        index.add_documents(docs).map_err(|e| e.to_string())?;
+        index.commit();
+        return Ok(n);
+    };
+    // bucket by ring owner; unid'd docs key on content hash for stability
+    let ring = cl.cache.lock().unwrap().ring();
+    let self_addr = cl.cache.lock().unwrap().self_addr();
+    let mut buckets: std::collections::HashMap<SocketAddr, Vec<Document>> =
+        std::collections::HashMap::new();
+    for doc in docs {
+        let key = doc.id.clone().unwrap_or_else(|| {
+            let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
+            format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
+        });
+        let slot = crate::cluster::ring_owner(&ring, &key).unwrap_or(0);
+        buckets.entry(ring[slot]).or_default().push(doc);
+    }
+    let mut total = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (owner, batch) in buckets {
+        let n = batch.len();
+        if owner == self_addr {
+            index.add_documents(batch).map_err(|e| e.to_string())?;
+            index.commit();
+        } else {
+            let body = serde_json::json!({"docs": batch}).to_string();
+            match http_post(owner, "/__zap/shard_ingest", &body) {
+                Some((200, _)) => {}
+                Some((code, b)) => errors.push(format!("shard {owner}: {code} {b}")),
+                None => errors.push(format!("shard {owner} unreachable")),
+            }
+        }
+        total += n;
+    }
+    push_own_stats(cl, index);
+    if errors.is_empty() {
+        Ok(total)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// internal shard ingest (ring already chose this shard; never re-routed)
+fn shard_ingest(
+    req: &mut Request,
+    index: &Index,
+    cluster: ClusterRef<'_>,
+) -> Result<usize, String> {
+    let body = read_body(req)?;
+    if body.is_empty() {
+        return Err("empty ingest body".into());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let arr = v
+        .get("docs")
+        .and_then(|d| d.as_array())
+        .ok_or("missing docs array")?;
+    let mut docs = Vec::with_capacity(arr.len());
+    for it in arr {
+        docs.push(parse_doc(it)?);
+    }
+    if docs.is_empty() {
+        return Err("no documents supplied".into());
+    }
     let n = docs.len();
     index.add_documents(docs).map_err(|e| e.to_string())?;
     index.commit();
+    if let Some(cl) = cluster {
+        push_own_stats(cl, index);
+    }
     Ok(n)
 }
 
@@ -241,6 +561,175 @@ fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
         }
     }
     Ok(doc)
+}
+
+// ---- id routing (ring owners own /doc/{id}) -------------------------------
+
+fn doc_get_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str) {
+    let Some(cl) = cluster else {
+        return doc_get(req, index, id);
+    };
+    let (_, owner) = cl.cache.lock().unwrap().owner_of(id);
+    if owner == cl.cache.lock().unwrap().self_addr() {
+        return doc_get(req, index, id);
+    }
+    match http_get(owner, &format!("/doc/{}", url_escape(id))) {
+        Some((code, body)) => reply(req, code, &body),
+        None => reply(
+            req,
+            502,
+            &serde_json::json!({"error": "owner shard unreachable"}).to_string(),
+        ),
+    }
+}
+
+fn doc_get(req: Request, index: &Index, id: &str) {
+    match index.get(id) {
+        Some(p) => {
+            let mut v = serde_json::json!({
+                "id": p.id,
+                "fields": p.fields,
+            });
+            if let Some(meta) = p.metadata {
+                v["metadata"] = meta;
+            }
+            reply(req, 200, &v.to_string());
+        }
+        None => reply(req, 404, r#"{"error":"not found"}"#),
+    }
+}
+
+fn doc_delete_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str) {
+    let Some(cl) = cluster else {
+        return doc_delete(req, index, id);
+    };
+    let (_, owner) = cl.cache.lock().unwrap().owner_of(id);
+    if owner == cl.cache.lock().unwrap().self_addr() {
+        return doc_delete(req, index, id);
+    }
+    match http_delete(owner, &format!("/doc/{}", url_escape(id))) {
+        Some((code, body)) => reply(req, code, &body),
+        None => reply(
+            req,
+            502,
+            &serde_json::json!({"error": "owner shard unreachable"}).to_string(),
+        ),
+    }
+}
+
+fn doc_delete(req: Request, index: &Index, id: &str) {
+    match index.delete(id) {
+        Ok(true) => reply(
+            req,
+            200,
+            &serde_json::json!({"deleted": true, "docs": index.num_docs()}).to_string(),
+        ),
+        Ok(false) => reply(req, 404, r#"{"error":"not found"}"#),
+        Err(e) => reply(req, 400, &e.to_string()),
+    }
+}
+
+/// minimal percent-escape for a path component
+fn url_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// ---- gossip ---------------------------------------------------------------
+
+/// merge a peer's envelope; a previously unseen peer triggers a one-time full
+/// resync pull from that peer so deltas land on a converged base
+fn gossip_handle(cluster: ClusterRef<'_>, peer: SocketAddr, env: StatsEnvelope) {
+    let Some(cl) = cluster else {
+        return;
+    };
+    let mut view = cl.view.lock().unwrap();
+    let fresh = view.is_new_peer(&peer);
+    view.merge_peer(peer, env);
+    if fresh {
+        if let Some((_, body)) = http_get(peer, "/__zap/gossip_full") {
+            if let Ok(full) = serde_json::from_str::<StatsEnvelope>(&body) {
+                view.merge_peer(peer, full);
+            }
+        }
+    }
+}
+
+/// cluster gossip push after a local commit: df-diff to every peer (spawned;
+/// failures tolerated — the delta exchange is eventually-consistent)
+fn push_own_stats(cl: &LocalCluster, index: &Index) {
+    let env = own_envelope(index);
+    let first = cl.last_pushed.lock().unwrap().is_none();
+    let send = StatsEnvelope {
+        docs: env.docs,
+        sums: env.sums.clone(),
+        df: if first {
+            env.df.clone()
+        } else {
+            let last = cl.last_pushed.lock().unwrap();
+            let base = last.as_ref().expect("just checked");
+            let mut diff = std::collections::HashMap::new();
+            for (k, v) in &env.df {
+                if base.df.get(k) != Some(v) {
+                    diff.insert(k.clone(), *v);
+                }
+            }
+            diff
+        },
+        full: first,
+    };
+    *cl.last_pushed.lock().unwrap() = Some(env);
+    let self_addr = cl.cache.lock().unwrap().self_addr();
+    let payload = serde_json::to_string(&send).unwrap_or_default();
+    for peer in cl.cache.lock().unwrap().peers() {
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            let _ = http_post(peer, &format!("/__zap/gossip?peer={self_addr}"), &payload);
+        });
+    }
+}
+
+// ---- /stats ---------------------------------------------------------------
+
+fn stats_reply(req: Request, index: &Index, cluster: ClusterRef<'_>) {
+    let (docs, segments, generation) = aggregate_stats(index, cluster);
+    let body = serde_json::json!({
+        "docs": docs,
+        "segments": segments,
+        "generation": generation,
+    })
+    .to_string();
+    reply(req, 200, &body);
+}
+
+fn aggregate_stats(index: &Index, cluster: ClusterRef<'_>) -> (usize, usize, u64) {
+    let mut docs = index.num_docs();
+    let mut segments = index.num_segments();
+    let mut generation = index.generation();
+    if let Some(cl) = cluster {
+        for peer in cl.cache.lock().unwrap().peers() {
+            if let Some((_, b)) = http_get(peer, "/__zap/shard_stats") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&b) {
+                    docs += v["docs"].as_u64().unwrap_or(0) as usize;
+                    segments += v["segments"].as_u64().unwrap_or(0) as usize;
+                    generation = generation.max(v["generation"].as_u64().unwrap_or(0));
+                }
+            }
+        }
+    }
+    (docs, segments, generation)
+}
+
+fn docs_total(index: &Index, cluster: ClusterRef<'_>) -> usize {
+    aggregate_stats(index, cluster).0
 }
 
 fn read_body(req: &mut Request) -> Result<String, String> {

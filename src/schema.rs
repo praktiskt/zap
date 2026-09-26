@@ -90,6 +90,57 @@ pub struct Document {
     pub fields: HashMap<String, String>,
 }
 
+impl serde::Serialize for Document {
+    /// wire shape: {"id": ..., "metadata": ..., "<field>": "<text>", ...}
+    /// (the ingest parsers read flat `text`; internal fields are flattened)
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = ser.serialize_map(None)?;
+        if let Some(id) = &self.id {
+            map.serialize_entry("id", id)?;
+        }
+        if let Some(meta) = &self.metadata {
+            map.serialize_entry("metadata", meta)?;
+        }
+        for (k, v) in &self.fields {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Document {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(de)?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| D::Error::custom("doc must be an object"))?;
+        let mut doc = Document::default();
+        if let Some(id) = obj.get("id") {
+            let id = id
+                .as_str()
+                .ok_or_else(|| D::Error::custom("id must be a string"))?;
+            doc.id = Some(id.to_owned());
+        }
+        if let Some(meta) = obj.get("metadata") {
+            if !meta.is_null() {
+                doc.metadata = Some(meta.clone());
+            }
+        }
+        for (k, val) in obj {
+            if k == "id" || k == "metadata" {
+                continue;
+            }
+            let text = val
+                .as_str()
+                .ok_or_else(|| D::Error::custom(format!("`{k}` must be a string")))?;
+            doc.fields.insert(k.clone(), text.to_owned());
+        }
+        Ok(doc)
+    }
+}
+
 impl Document {
     pub fn new() -> Self {
         Self::default()

@@ -56,6 +56,12 @@ enum Command {
         /// host:port to bind
         #[arg(long, default_value = "127.0.0.1:3279")]
         bind: String,
+        /// cluster peers as CSV name:port (empty = single-node, zero overhead)
+        #[arg(long, global = true, default_value = "")]
+        peers: String,
+        /// this node's ring address (defaults to the bind address)
+        #[arg(long, global = true, default_value = "")]
+        announce: String,
         /// files or directories to index before serving (also HTTP /ingest)
         inputs: Vec<PathBuf>,
     },
@@ -168,9 +174,17 @@ fn main() -> Result<()> {
         index.num_docs(),
         index.num_segments()
     );
-    if let Some(Command::Serve { bind, .. }) = &args.command {
+    if let Some(Command::Serve {
+        bind,
+        peers,
+        announce,
+        ..
+    }) = &args.command
+    {
         let idx = index.clone();
-        match zap::server::serve(idx, &bind.clone(), &SHUTDOWN) {
+        let cluster =
+            zap::cluster::build_peer_config(bind, peers, announce).map_err(anyhow::Error::msg)?;
+        match zap::server::serve(idx, &bind.clone(), cluster, &SHUTDOWN) {
             Ok(addr) => eprintln!("[zap serving] http://{addr}"),
             Err(e) => {
                 eprintln!("[zap serve] {e}");

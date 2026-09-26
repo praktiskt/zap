@@ -457,6 +457,18 @@ impl Index {
     }
 
     pub fn search(&self, q: &str, k: usize) -> Result<Vec<SearchHit>, IndexError> {
+        let snap = self.snap.load();
+        self.search_with_stats(q, k, snap.stats.clone())
+    }
+
+    /// evaluate with an externally supplied Stats (cluster global df/totals);
+    /// identical eval tree, identical tie-order, one source of stats influence
+    pub fn search_with_stats(
+        &self,
+        q: &str,
+        k: usize,
+        stats: crate::search::exec::Stats,
+    ) -> Result<Vec<SearchHit>, IndexError> {
         let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
         let snap = self.snap.load();
         let params = crate::search::Bm25Params {
@@ -487,7 +499,7 @@ impl Index {
                             let thr = move || unsafe { (*col).threshold() };
                             let ctx = crate::search::exec::Ctx {
                                 schema: &self.schema,
-                                stats: &snap.stats,
+                                stats: &stats,
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
@@ -516,7 +528,7 @@ impl Index {
                             };
                             let ctx = crate::search::exec::Ctx {
                                 schema: &self.schema,
-                                stats: &snap.stats,
+                                stats: &stats,
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
@@ -569,6 +581,30 @@ impl Index {
 
     pub fn num_docs(&self) -> usize {
         self.snap.load().stats.total_docs as usize
+    }
+
+    /// current snapshot stats copy (Arc df + avg lens); cheap for callers
+    pub fn pub_stats(&self) -> crate::search::exec::Stats {
+        self.snap.load().stats.clone()
+    }
+
+    /// live per-field token sums (tombstoned docs excluded)
+    pub fn field_sums(&self) -> Vec<u64> {
+        let nf = self.schema.num_fields();
+        let mut sums = vec![0u64; nf];
+        let snap = self.snap.load();
+        for (si, s) in snap.segments.iter().enumerate() {
+            let mask = snap.deleted.get(&(si as u32));
+            for (fid, norms) in s.field_norms.iter().enumerate() {
+                sums[fid] += norms
+                    .iter()
+                    .enumerate()
+                    .filter(|(d, _)| !mask.is_some_and(|m| m.contains(*d as u32)))
+                    .map(|(_, v)| *v as u64)
+                    .sum::<u64>();
+            }
+        }
+        sums
     }
 
     pub fn num_segments(&self) -> usize {

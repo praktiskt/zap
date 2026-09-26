@@ -17,6 +17,7 @@ use crate::search::{Bm25Params, DocScores};
 pub const MAX_EXPANSIONS: usize = 512;
 
 /// global corpus stats for ranking
+#[derive(Clone)]
 pub struct Stats {
     pub total_docs: u32,
     /// field id -> average doc length
