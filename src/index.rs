@@ -206,7 +206,7 @@ pub struct IndexSnapshot {
     /// per-segment tombstone masks (segment index -> deleted docids)
     pub deleted: Arc<HashMap<u32, RoaringBitmap>>,
     /// live external id -> address (tombstoned docs excluded)
-    pub ids: Arc<HashMap<String, DocAddr>>,
+    pub ids: Arc<im::HashMap<String, DocAddr>>,
     pub generation: u64,
 }
 
@@ -227,10 +227,11 @@ struct IndexInner {
     segments: Vec<Arc<SegmentReader>>,
     /// tombstones over `segments` (segment index -> deleted docids); purged at merge
     deleted: HashMap<u32, RoaringBitmap>,
-    /// live external id -> committed address (hot ids live in `hot_ids` until commit)
-    ids: HashMap<String, DocAddr>,
-    /// Arc-shared id map for tombstone-only snapshot publishes (no segment change)
-    ids_arc: Arc<HashMap<String, DocAddr>>,
+    /// live external id -> committed address, PERSISTENT im::HashMap Arc-shared
+    /// with the published snapshot: deletes rewrite in place (O(log n)), commits
+    /// extend via O(1) clone + O(log n) update per appended doc — no copy of the
+    /// map per commit. Hot ids live in `hot_ids` until commit.
+    ids_arc: Arc<im::HashMap<String, DocAddr>>,
     /// (sums, df, total_docs) cached between segment changes (tombstone-only publishes)
     stats_cache: Option<StatsCache>,
     /// ids of docs pending in hot lanes (uncommitted, invisible to readers)
@@ -293,7 +294,7 @@ impl Index {
                 segments: Vec::new(),
                 stats: Stats::empty(),
                 deleted: Arc::new(HashMap::new()),
-                ids: Arc::new(HashMap::new()),
+                ids: Arc::new(im::HashMap::new()),
                 generation: 0,
             }),
             inner: Mutex::new(IndexInner {
@@ -301,8 +302,7 @@ impl Index {
                 next_lane: 0,
                 segments: segs,
                 deleted: tomb,
-                ids: HashMap::new(),
-                ids_arc: Arc::new(HashMap::new()),
+                ids_arc: Arc::new(im::HashMap::new()),
                 stats_cache: None,
                 hot_ids: HashSet::new(),
                 generation: 0,
@@ -319,7 +319,7 @@ impl Index {
                     g.deleted.values().map(|m| m.len()).collect::<Vec<_>>()
                 );
             }
-            index.publish_snapshot(&mut g, true);
+            index.publish_snapshot(&mut g, true, None);
             if std::env::var("ZAP_DISK_TRACE").is_ok() {
                 eprintln!(
                     "[disk] post-publish snap total_docs={}",
@@ -372,9 +372,9 @@ impl Index {
                 // old version still hot: flush it so it can be tombstoned
                 self.commit_locked(g);
             }
-            if let Some(old) = g.ids.get(id).copied() {
+            if let Some(old) = g.ids_arc.get(id).copied() {
                 g.deleted.entry(old.segment).or_default().insert(old.docid);
-                g.ids.remove(id);
+                g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
             }
         }
         let lane = g.next_lane % g.hot.len();
@@ -412,7 +412,7 @@ impl Index {
             let g = self.inner.lock().unwrap();
             deduped.iter().any(|d| {
                 d.id.as_ref()
-                    .is_some_and(|id| g.hot_ids.contains(id) || g.ids.contains_key(id))
+                    .is_some_and(|id| g.hot_ids.contains(id) || g.ids_arc.contains_key(id))
             })
         };
         if collides {
@@ -478,6 +478,7 @@ impl Index {
                 .collect()
         };
         let mut segs = std::mem::take(&mut g.segments);
+        let base_len = segs.len();
         segs.extend(new_segs);
         let lanes = g.hot.len().max(1);
         if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
@@ -491,7 +492,12 @@ impl Index {
         g.segments = segs;
         g.hot_ids.clear();
         g.generation += 1;
-        self.publish_snapshot(g, true);
+        let new_from = if g.segments.len() == 1 && base_len > 1 {
+            None // merge reset the segment list: full id rescan
+        } else {
+            Some(base_len)
+        };
+        self.publish_snapshot(g, true, new_from);
         if let Some(d) = &self.disk {
             d.persist(&g.segments, &g.deleted).expect("disk persist");
         }
@@ -510,14 +516,15 @@ impl Index {
             // uncommitted: flush so the doc becomes tombstoneable
             self.commit_locked(&mut g);
         }
-        let Some(old) = g.ids.remove(id) else {
+        let Some(old) = g.ids_arc.get(id).copied() else {
             return Ok(false);
         };
         if std::env::var("ZAP_DISK_TRACE").is_ok() {
             eprintln!("[delete] id={id} old={:?}", old);
         }
         g.deleted.entry(old.segment).or_default().insert(old.docid);
-        self.publish_snapshot(&mut g, false);
+        g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
+        self.publish_snapshot(&mut g, false, None);
         if let Some(d) = &self.disk {
             d.persist(&g.segments, &g.deleted)
                 .expect("disk persist tombstone");
@@ -572,7 +579,7 @@ impl Index {
     /// publish a snapshot. `segment_change`: segments were added/merged — recompute
     /// df stats and rebuild the id map. Tombstone-only publishes (delete) reuse the
     /// cached stats (Arc-shared df) + id map; readers mask via `deleted`.
-    fn publish_snapshot(&self, g: &mut IndexInner, segment_change: bool) {
+    fn publish_snapshot(&self, g: &mut IndexInner, segment_change: bool, new_from: Option<usize>) {
         let nf = self.schema.num_fields();
         let deleted: HashMap<u32, RoaringBitmap> = g
             .deleted
@@ -607,19 +614,29 @@ impl Index {
                 total_docs = *t;
             }
         }
-        // live external id -> address. Rebuilt only when segments change: readers
-        // mask tombstoned entries through `deleted`, so delete publishes are O(1).
+        // live external id -> address over a persistent im::HashMap: deletes
+        // remove in place (delete/replace); segment-change publishes extend via
+        // O(1) clone + O(log n) update per appended doc (`segs.extend` appends,
+        // so old addresses stay valid). Merges/boot reset segment indices ->
+        // full rescan (O(live), amortized over the rare merge).
         let any_ids = !g.hot_ids.is_empty() || g.segments.iter().any(|s| s.has_ids());
-        let ids: Arc<HashMap<String, DocAddr>> = if segment_change && any_ids {
-            let mut ids: HashMap<String, DocAddr> = HashMap::with_capacity(g.ids.len());
-            for (si, s) in g.segments.iter().enumerate() {
+        let ids: Arc<im::HashMap<String, DocAddr>> = if segment_change && any_ids {
+            let nf = new_from.unwrap_or(0);
+            let base: im::HashMap<String, DocAddr> = if nf == 0 {
+                im::HashMap::new()
+            } else {
+                (*g.ids_arc).clone()
+            };
+            let mut ids = base;
+            for si in nf..g.segments.len() {
+                let s = &g.segments[si];
                 let mask = deleted.get(&(si as u32));
                 for docid in 0..s.num_docs {
                     if mask.is_some_and(|m| m.contains(docid)) {
                         continue;
                     }
                     if let Some(id) = s.id_of(docid) {
-                        ids.insert(
+                        ids = ids.update(
                             id.to_owned(),
                             DocAddr {
                                 segment: si as u32,
@@ -630,15 +647,13 @@ impl Index {
                 }
             }
             let ids = Arc::new(ids);
-            g.ids = ids.as_ref().clone();
             g.ids_arc = ids.clone();
             ids
         } else if segment_change {
-            g.ids = HashMap::new();
-            g.ids_arc = Arc::new(HashMap::new());
+            g.ids_arc = Arc::new(im::HashMap::new());
             g.ids_arc.clone()
         } else {
-            // tombstone-only publish: previous id map stays valid (masked by `deleted`)
+            // tombstone-only publish: deletes already rewrote the shared map
             g.ids_arc.clone()
         };
         let live = total_docs - tombstoned;
