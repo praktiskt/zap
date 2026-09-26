@@ -1,5 +1,4 @@
-/* catppuccin mocha: base/crust/mantle surfaces, mauve accents, lavender/teal/
-   peach metric colors, green UP / red DOWN states */
+/* palette: dark surfaces, purple accent, teal/peach metrics, green UP / red DOWN */
 :root {
   --base: #1e1e2e; --mantle: #11111b; --crust: #181825;
   --surface0: #313244; --surface1: #45475a; --surface2: #585b70;

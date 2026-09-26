@@ -123,7 +123,7 @@ zap serve --bind 127.0.0.1:3279 --stdin-lines   # empty index, ingest via HTTP
 | `/stats` | GET | live docs / segments / generation + per-shard chips |
 | `/search?q=..&k=N` | GET | query string search (percent-encoded) |
 | `/search` | POST | `{"q":"..","k":N}` body search |
-| `/dashboard` | GET | live stats page (catppuccin mocha) |
+| `/dashboard` | GET | live stats page |
 | `/ingest` | POST | NDJSON `{"text":..}` lines or a JSON array of them (auto-commit) |
 | `/commit` | POST | explicit segment commit |
 | `/doc/{id}` | GET | stored fields + metadata for one external id |

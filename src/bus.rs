@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
 /// event name the SSE clients listen for
@@ -17,12 +17,21 @@ fn clients() -> &'static Mutex<HashMap<u64, Sender<&'static str>>> {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// register a dashboard stream; returns (id, receiver)
-pub fn subscribe() -> (u64, Receiver<&'static str>) {
+/// hard cap on concurrent dashboard streams: each SSE client holds a blocked
+/// thread, so an unbounded subscriber set would let one browser tab farm
+/// exhaust threads. Cap keeps the I/O surface O(puts a few MB max).
+const MAX_CLIENTS: usize = 128;
+
+/// register a dashboard stream; None at capacity (caller replies 503)
+pub fn subscribe() -> Option<(u64, std::sync::mpsc::Receiver<&'static str>)> {
+    let mut map = clients().lock().unwrap();
+    if map.len() >= MAX_CLIENTS {
+        return None;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    clients().lock().unwrap().insert(id, tx);
-    (id, rx)
+    map.insert(id, tx);
+    Some((id, rx))
 }
 
 /// drop one subscriber (called when its stream closes)

@@ -15,7 +15,7 @@
 //! - `POST   /__zap/shard_search` local search with merged global stats
 //! - `POST   /__zap/shard_ingest` local ingest (owner already chose us)
 //! - `GET    /__zap/shard_stats`  live counts for the aggregate /stats
-//! - `GET    /dashboard`          live HTML stats page (catppuccin mocha)
+//! - `GET    /dashboard`          live HTML stats page
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -954,7 +954,16 @@ const SSE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
 fn sse_stream(req: Request) {
     use std::io::Write;
     use tiny_http::Response;
-    let (id, rx) = crate::bus::subscribe();
+    // hard cap: refuse beyond MAX_CLIENTS (thread-per-client bound)
+    let Some((id, rx)) = crate::bus::subscribe() else {
+        let mut r: Response<std::io::Empty> = Response::empty(503);
+        if let Ok(h) = tiny_http::Header::from_bytes("Retry-After", "5") {
+            r.add_header(h);
+        }
+        let _ = req.respond(r);
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     let mut r: Response<std::io::Empty> = Response::empty(200);
     for (k, v) in [
         ("Content-Type", "text/event-stream"),
@@ -966,6 +975,10 @@ fn sse_stream(req: Request) {
     }
     let mut stream = req.upgrade("zap-sse", r);
     loop {
+        // force-cycle after 1h: browsers auto-reconnect (no zombie threads)
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let ev = rx
             .recv_timeout(SSE_HEARTBEAT)
             .unwrap_or(crate::bus::EVENT_STATS);
