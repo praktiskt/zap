@@ -339,14 +339,18 @@ fn merged_cmp(a: &MergedRow, b: &MergedRow) -> std::cmp::Ordering {
 }
 
 /// wire row for one search hit (payload resolved through the doc store)
-fn hit_row(index: &Index, h: &crate::search::SearchHit) -> Option<serde_json::Value> {
-    let p = index.doc_payload(h.addr)?;
-    let doc = p
-        .fields
+/// concatenated text of a payload's stored fields (the search surface's "doc")
+fn joined_fields(p: &crate::index::DocPayload) -> String {
+    p.fields
         .iter()
         .map(|(_name, text)| text.as_str())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn hit_row(index: &Index, h: &crate::search::SearchHit) -> Option<serde_json::Value> {
+    let p = index.doc_payload(h.addr)?;
+    let doc = joined_fields(&p);
     let mut v = serde_json::json!({
         "score": h.score,
         "id": p.id,
@@ -430,16 +434,12 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
 /// direct row from a hit (no JSON roundtrip for the local shard)
 fn row_of_hit(index: &Index, h: &crate::search::SearchHit) -> Option<MergedRow> {
     let p = index.doc_payload(h.addr)?;
+    let doc = joined_fields(&p);
     Some(MergedRow {
         score: h.score,
         id: p.id,
         docid: h.addr.docid,
-        doc: p
-            .fields
-            .iter()
-            .map(|(_name, text)| text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        doc,
         metadata: p.metadata,
     })
 }
@@ -920,18 +920,17 @@ fn read_body(req: &mut Request) -> Result<String, String> {
 }
 
 fn reply(req: Request, code: u16, body: &str) {
-    let mut r = Response::from_string(body.to_string());
-    r.add_header(
-        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-    );
-    let _ = req.respond(r.with_status_code(code));
+    respond_body(req, code, body, "application/json");
 }
 
 fn reply_html(req: Request, code: u16, body: &str) {
+    respond_body(req, code, body, "text/html; charset=utf-8");
+}
+
+fn respond_body(req: Request, code: u16, body: &str, content_type: &str) {
     let mut r = Response::from_string(body.to_string());
     r.add_header(
-        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-            .unwrap(),
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap(),
     );
     let _ = req.respond(r.with_status_code(code));
 }

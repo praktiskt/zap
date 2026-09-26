@@ -381,7 +381,6 @@ impl Index {
         g.next_lane += 1;
         g.hot[lane]
             .add_document(doc)
-            .map(|_| ())
             .map_err(IndexError::UnknownField)?;
         if let Some(id) = &doc.id {
             g.hot_ids.insert(id.clone());
@@ -695,10 +694,7 @@ impl Index {
     ) -> Result<Vec<SearchHit>, IndexError> {
         let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
         let snap = self.snap.load();
-        let params = crate::search::Bm25Params {
-            k1: self.k1,
-            b: self.b,
-        };
+        let params = self.params();
         // single Term: streaming walk with a live topk threshold (block-max WAND);
         // generic nodes: dense arrays + collector push. Tombstoned docs are masked
         // through the `allowed` probe (zero cost when no tombstones exist).
@@ -746,6 +742,9 @@ impl Index {
                                     if matches!(**inner, Node::Phrase { .. }));
                             let col: *mut TopK = &mut collector as *mut TopK;
                             let thr: Box<dyn Fn() -> f32> = if phrase_root {
+                                // same shared-view contract as the Term path above:
+                                // col outlives every read because it only escapes
+                                // inside this scope
                                 Box::new(move || unsafe { (*col).threshold() })
                             } else {
                                 Box::new(|| 0.0)

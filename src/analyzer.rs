@@ -77,11 +77,11 @@ impl Analyzer {
             // move the lemma cow out of the token: borrowed cows point into
             // `text` (zero alloc), owned cows are normalization rewrites and
             // keep their allocation
-            let lemma_anow: Cow<'_, str> = tok.lemma;
-            if lemma_anow.chars().count() > self.conf.max_token_len {
+            let lemma_cow: Cow<'_, str> = tok.lemma;
+            if lemma_cow.chars().count() > self.conf.max_token_len {
                 continue;
             }
-            let text_out = match lemma_anow {
+            let text_out = match lemma_cow {
                 Cow::Borrowed(lemma) => match (&self.stemmer, lemma.is_ascii()) {
                     (Some(s), true) => s.stem(lemma),
                     _ => Cow::Borrowed(lemma),
@@ -120,9 +120,9 @@ impl Analyzer {
             if !tok.is_word() {
                 continue;
             }
-            let lemma_anow: Cow<'_, str> = tok.lemma;
+            let lemma_cow: Cow<'_, str> = tok.lemma;
             out.push(Token {
-                text: lemma_anow,
+                text: lemma_cow,
                 pos,
                 byte_start: tok.byte_start,
                 byte_end: tok.byte_end,
@@ -149,8 +149,8 @@ mod tests {
         // positions are compacted over word tokens
         for (i, t) in toks.iter().enumerate() {
             assert_eq!(t.pos, i as u32);
-            assert_eq!(toks.len(), 5);
         }
+        assert_eq!(toks.len(), 5);
     }
 
     #[test]

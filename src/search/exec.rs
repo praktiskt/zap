@@ -248,8 +248,7 @@ pub fn eval_allowed(
                     p.find('*').unwrap_or(p.len())
                 };
                 let head = &p[..head_end];
-                let pattern: Vec<char> = p.chars().collect();
-                let pat = pattern.clone();
+                let pat: Vec<char> = p.chars().collect();
                 let mut pairs = seg.stream_prefix(fid, head, MAX_EXPANSIONS);
                 if !prefix {
                     pairs.retain(|(t, _)| glob_match(t, &pat));

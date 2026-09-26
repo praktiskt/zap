@@ -79,13 +79,14 @@ fn ingest_lanes(c: &mut Criterion) {
     g.finish();
 }
 
-fn build_multi_segment(n: usize, commits: usize) -> Arc<Index> {
+fn build_multi_segment(n: usize, commits: usize, words: Option<usize>) -> Arc<Index> {
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
     let analyzer = Analyzer::new(AnalyzerConf::default());
     let lanes = 8;
     let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, lanes);
-    let words = if n >= 1_000_000 { 50 } else { 200 };
+    // doc-length floors: 50w keeps the 1M tier's memory budget; default 200w
+    let words = words.unwrap_or(if n >= 1_000_000 { 50 } else { 200 });
     let docs = corpus(n, words);
     let per = (n / commits.max(1)).max(1);
     let mut chunk: Vec<Document> = Vec::with_capacity(per);
@@ -104,8 +105,8 @@ fn build_multi_segment(n: usize, commits: usize) -> Arc<Index> {
 }
 
 fn queries(c: &mut Criterion) {
-    let index = build_multi_segment(10000, 10);
-    let single = build_multi_segment(10000, 1);
+    let index = build_multi_segment(10000, 10, None);
+    let single = build_multi_segment(10000, 1, None);
     for (name, ix) in [("q1seg", single), ("q10seg", index)] {
         let mut g = c.benchmark_group("queries");
         g.warm_up_time(Duration::from_secs(1))
@@ -130,7 +131,7 @@ fn queries(c: &mut Criterion) {
 }
 
 fn topk_collect(c: &mut Criterion) {
-    let index = build_multi_segment(10000, 10);
+    let index = build_multi_segment(10000, 10, None);
     {
         let mut g = c.benchmark_group("topk");
         g.warm_up_time(Duration::from_secs(1))
@@ -153,7 +154,7 @@ fn query_scale(c: &mut Criterion) {
         (10000, 1000),
         (100000, 5000),
     ] {
-        let ix = build_multi_segment(n, per_commit.max(1));
+        let ix = build_multi_segment(n, per_commit.max(1), None);
         for (tag, q) in [
             ("term", "fox"),
             ("phrase", "\"winter storm\""),
@@ -202,7 +203,7 @@ fn doc_length(c: &mut Criterion) {
                 });
             },
         );
-        let ix = build_multi_segment_len(n_docs, 10, wl);
+        let ix = build_multi_segment(n_docs, 10, Some(wl));
         for (tag, q) in [
             ("hot_term", "fox"),
             ("phrase", "\"winter storm\""),
@@ -216,28 +217,6 @@ fn doc_length(c: &mut Criterion) {
         }
     }
     g.finish();
-}
-
-fn build_multi_segment_len(n: usize, commits: usize, words: usize) -> Arc<Index> {
-    let mut schema = Schema::default();
-    schema.add_text("text", 1.0);
-    let analyzer = Analyzer::new(AnalyzerConf::default());
-    let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 8);
-    let docs = corpus(n, words);
-    let per = (n / commits.max(1)).max(1);
-    let mut slice: Vec<Document> = Vec::with_capacity(n);
-    for d in docs {
-        slice.push(Document::new().text("text", d));
-        if slice.len() == per {
-            index.add_documents(std::mem::take(&mut slice)).unwrap();
-            index.commit();
-        }
-    }
-    if !slice.is_empty() {
-        index.add_documents(slice).unwrap();
-    }
-    index.commit();
-    index
 }
 
 criterion_group!(
