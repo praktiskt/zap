@@ -1,42 +1,11 @@
 //! cluster roundtrip: 3 real zap processes, ring-routed ingest/replace/delete,
 //! fan-out search from any node, score convergence after gossip deltas
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    let mut raw = format!("{method} {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n");
-    if let Some(b) = body {
-        raw += &format!("Content-Length: {}\r\n\r\n{b}", b.len());
-    } else {
-        raw += "\r\n";
-    }
-    s.write_all(raw.as_bytes()).expect("write");
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).expect("read");
-    let t = String::from_utf8_lossy(&resp).into_owned();
-    let code: u16 = t
-        .split_whitespace()
-        .nth(1)
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(0);
-    let body = t
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_owned())
-        .unwrap_or_default();
-    (code, body)
-}
-
-fn get(port: u16, path: &str) -> (u16, String) {
-    request(port, "GET", path, None)
-}
-
-fn post(port: u16, path: &str, body: &str) -> (u16, String) {
-    request(port, "POST", path, Some(body))
-}
+mod common;
+use common::{get, post, request};
 
 fn delete(port: u16, path: &str) -> (u16, String) {
     request(port, "DELETE", path, None)
@@ -76,7 +45,7 @@ fn wait_ready(ports: &[u16]) {
     }
 }
 
-pub struct Guard(Vec<Child>);
+struct Guard(Vec<Child>);
 impl std::ops::Drop for Guard {
     fn drop(&mut self) {
         for k in &mut self.0 {
@@ -106,7 +75,6 @@ fn spawn_cluster(ports: [u16; 3]) -> Guard {
             eprintln!("[cluster-test] CRASH: shard {p} exited immediately");
         }
         kids.push(kid);
-        let _ = i;
     }
     Guard(kids)
 }
@@ -117,7 +85,6 @@ fn cluster_of_three() {
     let _guard = spawn_cluster(ports);
     wait_ready(&ports);
 
-    // one-node ring sanity: the three-node aggregate sees all 3 shards
     let n0 = ports[0];
 
     // --- ingest spread over the ring, through ONE node (port 0) ---

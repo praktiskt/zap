@@ -13,33 +13,8 @@ fn atomic_leak() -> &'static AtomicBool {
     Box::leak(Box::new(AtomicBool::new(false)))
 }
 
-/// tiny sync HTTP client: returns (status_code, body)
-fn request_raw(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).expect("connect");
-    let mut raw = format!("{method} {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n");
-    if let Some(b) = body {
-        raw += &format!("Content-Length: {}\r\n", b.len());
-    }
-    raw += "\r\n";
-    if let Some(b) = body {
-        raw += b;
-    }
-    s.write_all(raw.as_bytes()).expect("write request");
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).expect("read response");
-    let text = String::from_utf8_lossy(&resp).into_owned();
-    // status line + headers + body
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_owned())
-        .unwrap_or_default();
-    (status, body)
-}
+mod common;
+use common::request_raw;
 
 fn get_json(addr: SocketAddr, path: &str) -> Value {
     let (code, body) = request_raw(addr, "GET", path, None);
