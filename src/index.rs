@@ -66,15 +66,28 @@ impl DiskHandle {
         let mut files = Vec::with_capacity(segments.len());
         let mut seen = std::collections::HashSet::new();
         for seg in segments {
-            let bytes = seg.to_bytes();
-            let hash = format!("{:016x}", crate::cluster::fnv64a(&bytes));
-            let name = format!("seg-{}.zap", hash);
-            let path = self.dir.join("segments").join(&name);
-            if !path.exists() && !seen.contains(&name) {
-                atomic_write(&path, &bytes)?;
+            // memoized hash: known segments never re-serialize on delete/merge
+            let hash = match seg.content_hash() {
+                Some(h) => h,
+                None => {
+                    let bytes = seg.to_bytes(); // primes the memo inside the reader
+                    let h = crate::cluster::fnv64a(&bytes);
+                    let name = format!("seg-{:016x}.zap", h);
+                    if !self.dir.join("segments").join(&name).exists() {
+                        atomic_write(&self.dir.join("segments").join(&name), &bytes)?;
+                    }
+                    seen.insert(name.clone());
+                    files.push(name);
+                    continue;
+                }
+            };
+            let name = format!("seg-{:016x}.zap", hash);
+            if !seen.contains(&name) && !self.dir.join("segments").join(&name).exists() {
+                let bytes = seg.to_bytes();
+                atomic_write(&self.dir.join("segments").join(&name), &bytes)?;
             }
-            seen.insert(name);
-            files.push(format!("seg-{}.zap", hash));
+            seen.insert(name.clone());
+            files.push(name);
         }
         let mut doc = serde_json::json!({
             "version": 1,
@@ -102,7 +115,9 @@ impl DiskHandle {
         atomic_write(&self.manifest_path(), &bytes)
     }
 
-    /// load back: files referenced by the manifest, in order
+    /// load back: files referenced by the manifest, in order. Reads + decodes
+    /// in parallel (segments are independent); primes the content-hash memo
+    /// from the file bytes so the first delete pays zero serialization.
     pub fn load(&self) -> Result<Vec<Arc<SegmentReader>>, String> {
         let manifest = match std::fs::read(self.manifest_path()) {
             Ok(b) => b,
@@ -112,12 +127,24 @@ impl DiskHandle {
         let doc: serde_json::Value =
             serde_json::from_slice(&manifest).map_err(|e| format!("manifest parse: {e}"))?;
         let files = doc["files"].as_array().ok_or("manifest missing files")?;
-        let mut out = Vec::with_capacity(files.len());
-        for f in files {
-            let name = f.as_str().ok_or("manifest file entry not a string")?;
-            let bytes = std::fs::read(self.dir.join("segments").join(name))
-                .map_err(|e| format!("segment {name}: {e}"))?;
-            out.push(Arc::new(SegmentReader::from_bytes(&bytes)?));
+        let names: Vec<&str> = files.iter().filter_map(|f| f.as_str()).collect();
+        let loaded: Vec<Result<Arc<SegmentReader>, String>> = {
+            use rayon::prelude::*;
+            names
+                .par_iter()
+                .map(|name| {
+                    let bytes = std::fs::read(self.dir.join("segments").join(name))
+                        .map_err(|e| format!("segment {name}: {e}"))?;
+                    let hash = crate::cluster::fnv64a(&bytes);
+                    let seg = SegmentReader::from_bytes(&bytes)?;
+                    seg.prime_content_hash(hash);
+                    Ok(Arc::new(seg))
+                })
+                .collect()
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for r in loaded {
+            out.push(r?);
         }
         Ok(out)
     }

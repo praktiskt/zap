@@ -146,3 +146,40 @@ fn no_disk_writes_nothing() {
     let v: serde_json::Value = serde_json::from_str(&get(port, "/search?q=ephemeral").1).unwrap();
     assert_eq!(v["count"], 1);
 }
+
+#[test]
+fn segment_hash_memo_is_stable() {
+    use zap::cluster::fnv64a;
+    use zap::segment::SegmentBuilder;
+    let mut schema = zap::schema::Schema::default();
+    schema.add_text("text", 1.0);
+    let mut b = SegmentBuilder::new(
+        std::sync::Arc::new(schema),
+        zap::analyzer::Analyzer::new(zap::analyzer::AnalyzerConf::default()),
+    );
+    b.add_document(
+        &zap::schema::Document::new()
+            .id("h1")
+            .text("text", "hash memo fox"),
+    )
+    .unwrap();
+    let seg = b.freeze();
+    let bytes1 = seg.to_bytes();
+    let h = seg.content_hash().expect("hash primed by to_bytes");
+    // same bytes -> same hash, byte-identical re-serialize
+    let bytes2 = seg.to_bytes();
+    assert_eq!(
+        bytes1, bytes2,
+        "immutable segment must serialize identically"
+    );
+    assert_eq!(seg.content_hash(), Some(h));
+    // mirror image decodes to the same content (nd + ids intact)
+    let loaded = zap::segment::SegmentReader::from_bytes(&bytes1).expect("decode");
+    assert_eq!(loaded.num_docs, seg.num_docs);
+    assert_eq!(loaded.id_of(0), Some("h1"));
+    // priming at load time: hash matches what persist would compute
+    loaded.prime_content_hash(h);
+    assert_eq!(loaded.content_hash(), Some(h));
+    // cross-check: hash equals fnv of the serialization
+    assert_eq!(h, fnv64a(&bytes1));
+}

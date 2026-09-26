@@ -165,6 +165,9 @@ pub struct SegmentReader {
     fsts: Vec<Map<Vec<u8>>>,
     /// shadow copy of the FST bytes (populated at freeze; to_bytes uses this)
     fst_raw: Box<[Vec<u8>]>,
+    /// memoized content hash (fnv64 of to_bytes): segments are immutable, so
+    /// the disk layer can address files without re-serializing on every call
+    content_hash: std::sync::OnceLock<u64>,
     infos: Vec<TermInfo>,
     blob: Box<[u8]>,
     pub field_norms: Vec<Box<[u16]>>,
@@ -232,7 +235,20 @@ impl SegmentReader {
         for id in &self.ids {
             push_opt_string(&mut out, id.as_deref());
         }
+        self.content_hash.set(crate::cluster::fnv64a(&out)).ok();
         out
+    }
+
+    /// memoized content hash; None until the first to_bytes (or a priming
+    /// call at load time — segments are immutable so the value is stable)
+    pub fn content_hash(&self) -> Option<u64> {
+        self.content_hash.get().copied()
+    }
+
+    /// prime the memoized hash from already-known serialized bytes (load path:
+    /// the file bytes ARE the to_bytes output, free hash without re-serializing)
+    pub fn prime_content_hash(&self, hash: u64) {
+        self.content_hash.set(hash).ok();
     }
 
     /// mirror image of `to_bytes`; id_fwd is rebuilt on load
@@ -386,6 +402,7 @@ impl SegmentReader {
             store_blocks,
             ids,
             id_fwd: Vec::new(),
+            content_hash: std::sync::OnceLock::new(),
         };
         let fwd = rebuild_id_fwd(&reader.ids, reader.num_docs);
         reader.id_fwd = fwd.1;
@@ -496,6 +513,7 @@ pub fn freeze_parts(
         store_blocks,
         ids,
         id_fwd,
+        content_hash: std::sync::OnceLock::new(),
     }
 }
 
