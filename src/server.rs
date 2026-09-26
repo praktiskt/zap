@@ -803,23 +803,63 @@ fn push_own_stats(cl: &LocalCluster, index: &Index) {
 
 // ---- /stats ---------------------------------------------------------------
 
+/// ONE concurrent fan-out per peer-contact moment: (peer, parsed stats-or-None)
+fn fetch_peer_stats(cl: &LocalCluster) -> Vec<(SocketAddr, Option<serde_json::Value>)> {
+    let peers = cl.cache.lock().unwrap().peers();
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = peers
+            .iter()
+            .map(|peer| scope.spawn(move || (*peer, http_get(*peer, "/__zap/shard_stats"))))
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().expect("peer stats fetch thread"))
+            .map(|(peer, resp)| (peer, resp.and_then(|(_, b)| serde_json::from_str(&b).ok())))
+            .collect()
+    })
+}
+
+/// totals over self + live peers (docs, segments, max generation)
+fn aggregate_stats(index: &Index, cluster: ClusterRef<'_>) -> (usize, usize, u64) {
+    let mut docs = index.num_docs();
+    let mut segments = index.num_segments();
+    let mut generation = index.generation();
+    if let Some(cl) = cluster {
+        for (_, v) in fetch_peer_stats(cl)
+            .into_iter()
+            .filter_map(|(a, v)| v.map(|v| (a, v)))
+        {
+            docs += v["docs"].as_u64().unwrap_or(0) as usize;
+            segments += v["segments"].as_u64().unwrap_or(0) as usize;
+            generation = generation.max(v["generation"].as_u64().unwrap_or(0));
+        }
+    }
+    (docs, segments, generation)
+}
+
 fn stats_reply(req: Request, index: &Index, cluster: ClusterRef<'_>) {
-    let (docs, segments, generation) = aggregate_stats(index, cluster);
-    // per-shard chips (self first, then peers that answered in time)
+    // per-shard chips (self first, then peers that answered in time);
+    // totals reuse the same single fan-out — one fetch per peer per request
+    let (docs, segments, generation) = (index.num_docs(), index.num_segments(), index.generation());
+    let mut docs_tot = docs as u64;
+    let mut segments_tot = segments as u64;
+    let mut generation_tot = generation;
     let mut shards: Vec<serde_json::Value> = vec![serde_json::json!({
         "addr": local_addr_of(cluster).unwrap_or_else(|| "self".to_string()),
-        "docs": index.num_docs(),
-        "segments": index.num_segments(),
-        "generation": index.generation(),
+        "docs": docs as u64,
+        "segments": segments as u64,
+        "generation": generation,
         "searches": SEARCHES.load(Ordering::Relaxed),
         "ingested": INGESTED.load(Ordering::Relaxed),
         "uptime_s": uptime_secs(),
     })];
     let mut degraded = false;
     if let Some(cl) = cluster {
-        for peer in cl.cache.lock().unwrap().peers() {
-            if let Some((_, b)) = http_get(peer, "/__zap/shard_stats") {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&b) {
+        for (peer, v) in fetch_peer_stats(cl) {
+            match v {
+                Some(v) => {
+                    docs_tot += v["docs"].as_u64().unwrap_or(0);
+                    segments_tot += v["segments"].as_u64().unwrap_or(0);
+                    generation_tot = generation_tot.max(v["generation"].as_u64().unwrap_or(0));
                     shards.push(serde_json::json!({
                         "addr": peer.to_string(),
                         "docs": v["docs"].as_u64().unwrap_or(0),
@@ -830,22 +870,23 @@ fn stats_reply(req: Request, index: &Index, cluster: ClusterRef<'_>) {
                         "uptime_s": v["uptime_s"].as_u64().unwrap_or(0),
                     }));
                 }
-            } else {
-                degraded = true;
-                shards.push(serde_json::json!({
-                    "addr": peer.to_string(),
-                    "docs": null, "segments": null,
-                    "generation": null, "searches": null,
-                    "ingested": null, "uptime_s": null,
-                    "down": true,
-                }));
+                None => {
+                    degraded = true;
+                    shards.push(serde_json::json!({
+                        "addr": peer.to_string(),
+                        "docs": null, "segments": null,
+                        "generation": null, "searches": null,
+                        "ingested": null, "uptime_s": null,
+                        "down": true,
+                    }));
+                }
             }
         }
     }
     let body = serde_json::json!({
-        "docs": docs,
-        "segments": segments,
-        "generation": generation,
+        "docs": docs_tot as usize,
+        "segments": segments_tot as usize,
+        "generation": generation_tot,
         "shards": shards,
         "degraded": degraded,
     })
@@ -862,43 +903,6 @@ fn uptime_secs() -> u64 {
 
 fn local_addr_of(cluster: ClusterRef<'_>) -> Option<String> {
     cluster.map(|c| c.cache.lock().unwrap().self_addr().to_string())
-}
-
-fn aggregate_stats(index: &Index, cluster: ClusterRef<'_>) -> (usize, usize, u64) {
-    let mut docs = index.num_docs();
-    let mut segments = index.num_segments();
-    let mut generation = index.generation();
-    let Some(cl) = cluster else {
-        return (docs, segments, generation);
-    };
-    let peers = cl.cache.lock().unwrap().peers();
-    let parts: Vec<Option<(u64, u64, u64)>> = std::thread::scope(|scope| {
-        let mut jobs = Vec::new();
-        for peer in &peers {
-            jobs.push(scope.spawn(move || {
-                http_get(*peer, "/__zap/shard_stats")
-                    .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(&b).ok())
-                    .map(|v| {
-                        (
-                            v["docs"].as_u64().unwrap_or(0),
-                            v["segments"].as_u64().unwrap_or(0),
-                            v["generation"].as_u64().unwrap_or(0),
-                        )
-                    })
-            }));
-        }
-        let mut out = Vec::with_capacity(jobs.len());
-        for jh in jobs {
-            out.push(jh.join().unwrap_or(None));
-        }
-        out
-    });
-    for (d, s, g) in parts.into_iter().flatten() {
-        docs += d as usize;
-        segments += s as usize;
-        generation = generation.max(g);
-    }
-    (docs, segments, generation)
 }
 
 fn docs_total(index: &Index, cluster: ClusterRef<'_>) -> usize {

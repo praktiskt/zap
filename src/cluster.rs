@@ -277,49 +277,47 @@ pub fn encode_df_key(fid: u32, term: &str) -> String {
     format!("{fid}:{term}")
 }
 
-/// push one envelope to a peer over keep-one HTTP (no client deps)
+/// minimal HTTP/1.1 request over a fresh connection (no client deps);
 /// returns (status_code, body)
-pub fn http_post(addr: SocketAddr, path: &str, body: &str) -> Option<(u16, String)> {
+pub fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
     use std::io::{Read, Write};
     let mut stream =
         std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(750)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(3000)));
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: z\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let req = match body {
+        Some(b) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: cluster\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+            b.len()
+        ),
+        None => format!("{method} {path} HTTP/1.1\r\nHost: cluster\r\nConnection: close\r\n\r\n"),
+    };
     stream.write_all(req.as_bytes()).ok()?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp).ok()?;
     Some((status_of(resp.as_str()), http_body(&resp)))
 }
 
+/// POST JSON (pub used by tests-free internal call sites)
+#[inline]
+pub fn http_post(addr: SocketAddr, path: &str, body: &str) -> Option<(u16, String)> {
+    http_request(addr, "POST", path, Some(body))
+}
+
+#[inline]
 pub fn http_get(addr: SocketAddr, path: &str) -> Option<(u16, String)> {
-    use std::io::{Read, Write};
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(750)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(3000)));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: cluster\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut resp = String::new();
-    stream.read_to_string(&mut resp).ok()?;
-    Some((status_of(resp.as_str()), http_body(&resp)))
+    http_request(addr, "GET", path, None)
 }
 
 /// minimal DELETE over keep-one HTTP; returns (status_code, body)
+#[inline]
 pub fn http_delete(addr: SocketAddr, path: &str) -> Option<(u16, String)> {
-    use std::io::{Read, Write};
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(750)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(3000)));
-    let req = format!("DELETE {path} HTTP/1.1\r\nHost: cluster\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut resp = String::new();
-    stream.read_to_string(&mut resp).ok()?;
-    Some((status_of(resp.as_str()), http_body(&resp)))
+    http_request(addr, "DELETE", path, None)
 }
 
 fn status_of(resp: &str) -> u16 {
