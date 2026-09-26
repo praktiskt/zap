@@ -182,6 +182,7 @@ pub struct ClusterView {
 }
 
 /// merged cluster stats fed into the engine's scoring ctx
+#[derive(Clone)]
 pub struct GlobalStats {
     pub total_docs: u32,
     pub sums: Vec<u64>,
@@ -252,17 +253,17 @@ impl ClusterView {
                 df,
             });
         }
-        self.global.as_ref().expect("just built").clone_global()
+        self.global.as_ref().expect("just built").clone()
     }
-}
 
-impl GlobalStats {
-    fn clone_global(&self) -> GlobalStats {
-        GlobalStats {
-            total_docs: self.total_docs,
-            sums: self.sums.clone(),
-            df: self.df.clone(),
-        }
+    /// true when this peer address has never been seen: unknown peers trigger a
+    /// one-time full resync pull at gossip time
+    pub fn is_new_peer(&self, peer: &SocketAddr) -> bool {
+        !self.peers.contains_key(peer)
+    }
+
+    pub fn count_peers(&self) -> usize {
+        self.peers.len()
     }
 }
 
@@ -332,20 +333,6 @@ pub fn http_body(resp: &str) -> String {
     match resp.split_once("\r\n\r\n") {
         Some((_h, b)) => b.to_owned(),
         None => String::new(),
-    }
-}
-
-impl ClusterView {
-    /// true when this peer address has never been seen: unknown peers trigger a
-    /// one-time full resync pull at gossip time
-    pub fn is_new_peer(&self, peer: &SocketAddr) -> bool {
-        !self.peers.contains_key(peer)
-    }
-}
-
-impl ClusterView {
-    pub fn count_peers(&self) -> usize {
-        self.peers.len()
     }
 }
 
