@@ -38,6 +38,9 @@ pub type ClusterOpt = Option<Arc<LocalCluster>>;
 /// borrowed cluster handle (internal plumbing)
 pub type ClusterRef<'a> = Option<&'a Arc<LocalCluster>>;
 
+/// per-shard ingest batch: owner address -> docs routed to that shard
+type ShardBatch = (SocketAddr, Vec<Document>);
+
 /// build Stats from an envelope
 fn stats_from_envelope(env: StatsEnvelope) -> Stats {
     let nf = env.sums.len();
@@ -333,17 +336,41 @@ fn row_from_json(v: &serde_json::Value) -> MergedRow {
     }
 }
 
-/// coordinator: run the local shard with the merged global view, fan out to
-/// every peer, merge rows, truncate to k
+/// coordinator: score the local shard and fan out to every peer CONCURRENTLY
+/// (wall time = slowest peer + local eval, not the sum of all peers);
+/// merge rows, truncate to k
 fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, String) {
-    let mut rows = own_rows(index, cl, q, k);
-    let mut degraded = false;
-    for peer in cl.cache.lock().unwrap().peers() {
-        match fanout_rows(peer, q, k) {
-            Ok(mut part) => rows.append(&mut part),
-            Err(_) => degraded = true,
+    let stats: Stats = {
+        let mut view = cl.view.lock().unwrap();
+        let env = global_to_envelope(view.stats());
+        stats_from_envelope(env)
+    };
+    let peers = cl.cache.lock().unwrap().peers();
+    let q_owned = q.to_owned();
+    let (mut rows, degraded) = std::thread::scope(|scope| {
+        let mut jobs: Vec<std::thread::ScopedJoinHandle<'_, Result<Vec<MergedRow>, String>>> =
+            Vec::new();
+        for peer in &peers {
+            let q2 = q_owned.clone();
+            jobs.push(scope.spawn(move || fanout_rows(*peer, &q2, k)));
         }
-    }
+        // own shard runs on this thread while peers fan out
+        let mut rows = match index.search_with_stats(q, k, stats) {
+            Ok(hits) => hits
+                .into_iter()
+                .filter_map(|h| row_of_hit(index, &h))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut degraded = false;
+        for jh in jobs {
+            match jh.join() {
+                Ok(Ok(mut part)) => rows.append(&mut part),
+                Ok(Err(_)) | Err(_) => degraded = true,
+            }
+        }
+        (rows, degraded)
+    });
     rows.sort_by(merged_cmp);
     rows.truncate(k);
     let results: Vec<serde_json::Value> = rows.into_iter().map(row_to_json).collect();
@@ -354,21 +381,21 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
     )
 }
 
-/// local shard rows scored with the merged global view
-fn own_rows(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> Vec<MergedRow> {
-    let stats: Stats = {
-        let mut view = cl.view.lock().unwrap();
-        let env = global_to_envelope(view.stats());
-        stats_from_envelope(env)
-    };
-    match index.search_with_stats(q, k, stats) {
-        Ok(hits) => hits
-            .into_iter()
-            .filter_map(|h| hit_row(index, &h))
-            .map(|v| row_from_json(&v))
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+/// direct row from a hit (no JSON roundtrip for the local shard)
+fn row_of_hit(index: &Index, h: &crate::search::SearchHit) -> Option<MergedRow> {
+    let p = index.doc_payload(h.addr)?;
+    Some(MergedRow {
+        score: h.score,
+        id: p.id,
+        docid: h.addr.docid,
+        doc: p
+            .fields
+            .iter()
+            .map(|(_name, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        metadata: p.metadata,
+    })
 }
 
 /// merged global view on the wire
@@ -488,23 +515,52 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
         let slot = crate::cluster::ring_owner(&ring, &key).unwrap_or(0);
         buckets.entry(ring[slot]).or_default().push(doc);
     }
-    let mut total = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-    for (owner, batch) in buckets {
-        let n = batch.len();
-        if owner == self_addr {
-            index.add_documents(batch).map_err(|e| e.to_string())?;
-            index.commit();
-        } else {
-            let body = serde_json::json!({"docs": batch}).to_string();
-            match http_post(owner, "/__zap/shard_ingest", &body) {
-                Some((200, _)) => {}
-                Some((code, b)) => errors.push(format!("shard {owner}: {code} {b}")),
-                None => errors.push(format!("shard {owner} unreachable")),
+    // split: this shard's docs commit locally (in-thread), remote owner
+    // split: this shard's docs commit locally (in-thread), remote owner
+    // batches ingest concurrently so wall time = slowest peer + local commit
+    let (local_batch, remote): (Option<Vec<Document>>, Vec<ShardBatch>) = {
+        let (l, r): (Vec<(SocketAddr, Vec<Document>)>, Vec<_>) = buckets
+            .into_iter()
+            .partition(|(owner, _)| *owner == self_addr);
+        let local = l.into_iter().next().map(|(_, b)| b);
+        (local, r)
+    };
+    // remote fan-out uses the same thread-scope pattern as /search; the local
+    // commit overlaps with the peer POSTs inside the scope
+    let (total, errors) = std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for (owner, batch) in &remote {
+            let (owner, batch) = (*owner, batch.clone());
+            jobs.push(scope.spawn(move || {
+                let n = batch.len();
+                let body = serde_json::json!({"docs": batch}).to_string();
+                match http_post(owner, "/__zap/shard_ingest", &body) {
+                    Some((200, _)) => Ok(n),
+                    Some((code, b)) => Err(format!("shard {owner}: {code} {b}")),
+                    None => Err(format!("shard {owner} unreachable")),
+                }
+            }));
+        }
+        // local commit runs on this thread while peers ingest
+        let mut ok_total = 0usize;
+        let mut errors = Vec::new();
+        if let Some(batch) = &local_batch {
+            if let Err(e) = index.add_documents(batch.clone()) {
+                errors.push(e.to_string());
+            } else {
+                index.commit();
+                ok_total += batch.len();
             }
         }
-        total += n;
-    }
+        for jh in jobs {
+            match jh.join() {
+                Ok(Ok(n)) => ok_total += n,
+                Ok(Err(e)) => errors.push(e),
+                Err(_) => errors.push("fanout thread panicked".to_string()),
+            }
+        }
+        (ok_total, errors)
+    });
     push_own_stats(cl, index);
     if errors.is_empty() {
         Ok(total)
@@ -714,16 +770,35 @@ fn aggregate_stats(index: &Index, cluster: ClusterRef<'_>) -> (usize, usize, u64
     let mut docs = index.num_docs();
     let mut segments = index.num_segments();
     let mut generation = index.generation();
-    if let Some(cl) = cluster {
-        for peer in cl.cache.lock().unwrap().peers() {
-            if let Some((_, b)) = http_get(peer, "/__zap/shard_stats") {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&b) {
-                    docs += v["docs"].as_u64().unwrap_or(0) as usize;
-                    segments += v["segments"].as_u64().unwrap_or(0) as usize;
-                    generation = generation.max(v["generation"].as_u64().unwrap_or(0));
-                }
-            }
+    let Some(cl) = cluster else {
+        return (docs, segments, generation);
+    };
+    let peers = cl.cache.lock().unwrap().peers();
+    let parts: Vec<Option<(u64, u64, u64)>> = std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for peer in &peers {
+            jobs.push(scope.spawn(move || {
+                http_get(*peer, "/__zap/shard_stats")
+                    .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(&b).ok())
+                    .map(|v| {
+                        (
+                            v["docs"].as_u64().unwrap_or(0),
+                            v["segments"].as_u64().unwrap_or(0),
+                            v["generation"].as_u64().unwrap_or(0),
+                        )
+                    })
+            }));
         }
+        let mut out = Vec::with_capacity(jobs.len());
+        for jh in jobs {
+            out.push(jh.join().unwrap_or(None));
+        }
+        out
+    });
+    for (d, s, g) in parts.into_iter().flatten() {
+        docs += d as usize;
+        segments += s as usize;
+        generation = generation.max(g);
     }
     (docs, segments, generation)
 }
