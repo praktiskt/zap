@@ -54,7 +54,7 @@ impl<'a> TermCursor<'a> {
     }
 
     /// positions of current doc into `buf` (reused across docs); consumes the doc
-    pub fn drain_positions_pub(&mut self, buf: &mut Vec<u32>) {
+    pub fn drain_positions(&mut self, buf: &mut Vec<u32>) {
         buf.clear();
         self.r.peek_positions_into(buf);
         self.r.advance();
@@ -116,7 +116,7 @@ fn verify_doc(
         c.seek_to(doc);
     }
     for (c, l) in cursors.iter_mut().zip(lists.iter_mut()) {
-        c.drain_positions_pub(l);
+        c.drain_positions(l);
     }
     min_span(lists, slop)
 }
@@ -190,7 +190,7 @@ pub fn phrase_scores(
             }
             if all_eq {
                 for (c, l) in cursors.iter_mut().zip(lists.iter_mut()) {
-                    c.drain_positions_pub(l);
+                    c.drain_positions(l);
                 }
                 if let Some(span) = min_span(&lists, slop) {
                     out.ids.push(hi);

@@ -275,7 +275,7 @@ fn snippet_of(
     plain: bool,
 ) -> String {
     if plain {
-        return trim_char(text, 0, width);
+        return trim_char(text, width);
     }
     let toks = analyzer.tokenize(text);
     let tset: HashSet<&str> = terms.iter().map(String::as_str).collect();
@@ -316,10 +316,9 @@ fn snippet_of(
     out
 }
 
-fn trim_char(text: &str, start: usize, width: usize) -> String {
-    let s = floor_char(text, start);
-    let e = floor_char(text, (s + width).min(text.len()));
-    text[s..e].to_string()
+fn trim_char(text: &str, width: usize) -> String {
+    let e = floor_char(text, width.min(text.len()));
+    text[..e].to_string()
 }
 
 /// snap a byte index back to a char boundary (or 0)

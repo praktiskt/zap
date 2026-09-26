@@ -242,8 +242,8 @@ fn main() {
                         ca.seek_to(hi);
                         cb.seek_to(hi);
                         if ca.doc() == Some(hi) && cb.doc() == Some(hi) {
-                            ca.drain_positions_pub(&mut lists[0]);
-                            cb.drain_positions_pub(&mut lists[1]);
+                            ca.drain_positions(&mut lists[0]);
+                            cb.drain_positions(&mut lists[1]);
                             if let Some(span) = zap::search::phrase::min_span(&lists, 0) {
                                 n += span as u64;
                             } else {

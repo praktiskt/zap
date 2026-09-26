@@ -620,14 +620,14 @@ impl Index {
         // full rescan (O(live), amortized over the rare merge).
         let any_ids = !g.hot_ids.is_empty() || g.segments.iter().any(|s| s.has_ids());
         let ids: Arc<im::HashMap<String, DocAddr>> = if segment_change && any_ids {
-            let nf = new_from.unwrap_or(0);
-            let base: im::HashMap<String, DocAddr> = if nf == 0 {
+            let from = new_from.unwrap_or(0);
+            let base: im::HashMap<String, DocAddr> = if from == 0 {
                 im::HashMap::new()
             } else {
                 (*g.ids_arc).clone()
             };
             let mut ids = base;
-            for si in nf..g.segments.len() {
+            for si in from..g.segments.len() {
                 let s = &g.segments[si];
                 let mask = deleted.get(&(si as u32));
                 for docid in 0..s.num_docs {
