@@ -443,7 +443,12 @@ fn and_two_infos(
     let mut r_oth = seg.reader(&oth.2);
     let norms_drv = seg.norms(drv.0);
     let norms_oth = seg.norms(oth.0);
+    // intersect size <= min(df): pre-reserve so dense-AND pushes never regrow
     let mut out = DocScores::default();
+    out.ids
+        .reserve(usize::min(drv.2.df as usize, oth.2.df as usize));
+    out.scores
+        .reserve(usize::min(drv.2.df as usize, oth.2.df as usize));
     while let Some((doc, tf_d)) = r_drv.advance() {
         if let Some(al) = allowed {
             if !al.contains(doc) {

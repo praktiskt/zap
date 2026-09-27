@@ -3,6 +3,17 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::time::Duration;
 
+/// ZAP_BENCH_QUICK=1 shaves every group to a ~1s loop: times still rank
+/// reliably (min-of-20 on hot paths), 5-8x faster wall per criterion pass.
+/// Real numbers for perf: commits still use the default run.
+fn cfg_quick(g: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
+    if std::env::var("ZAP_BENCH_QUICK").is_ok() {
+        g.warm_up_time(Duration::from_millis(200))
+            .measurement_time(Duration::from_millis(400))
+            .sample_size(10);
+    }
+}
+
 use std::sync::Arc;
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
@@ -56,7 +67,11 @@ fn ingest_lanes(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2))
         .sample_size(10);
-    for n in [1000_usize, 10000] {
+    cfg_quick(&mut g);
+    // quick mode: 1000 docs only — the 10k tier rebuilds a full index per iteration
+    let quick = std::env::var("ZAP_BENCH_QUICK").is_ok();
+    let tiers: &[usize] = if quick { &[1000] } else { &[1000, 10000] };
+    for n in tiers.iter().copied() {
         let docs = corpus(n, 200);
         g.throughput(Throughput::Bytes(
             docs.iter().map(|s| s.len() as u64).sum::<u64>(),
@@ -112,6 +127,7 @@ fn queries(c: &mut Criterion) {
         g.warm_up_time(Duration::from_secs(1))
             .measurement_time(Duration::from_secs(2))
             .sample_size(10);
+        cfg_quick(&mut g);
         g.throughput(Throughput::Elements(10_000));
         for q in [
             "fox",
@@ -137,6 +153,7 @@ fn topk_collect(c: &mut Criterion) {
         g.warm_up_time(Duration::from_secs(1))
             .measurement_time(Duration::from_secs(2))
             .sample_size(10);
+        cfg_quick(&mut g);
         g.bench_function("topk_union_broad", |b| b.iter(|| index.search("shot", 10)));
     }
 }
@@ -147,13 +164,17 @@ fn query_scale(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
+    cfg_quick(&mut g);
+    // quick mode drops the 100k tier: the corpus BUILD (not the sampling) has
+    // dominated this group's wall; quick runs target the 10k tier only.
     // 1M tier runs via examples/big.rs (criterion OOM-safe), see bench logs
-    for (n, per_commit) in [
-        (100usize, 100usize),
-        (1000, 250),
-        (10000, 1000),
-        (100000, 5000),
-    ] {
+    let quick = std::env::var("ZAP_BENCH_QUICK").is_ok();
+    let tiers: &[(usize, usize)] = if quick {
+        &[(100, 100), (10000, 1000)]
+    } else {
+        &[(100, 100), (1000, 250), (10000, 1000), (100000, 5000)]
+    };
+    for &(n, per_commit) in tiers {
         let ix = build_multi_segment(n, per_commit.max(1), None);
         for (tag, q) in [
             ("term", "fox"),
@@ -176,7 +197,15 @@ fn doc_length(c: &mut Criterion) {
     g.warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    for wl in [100usize, 170, 1000, 5000, 20000, 160000] {
+    cfg_quick(&mut g);
+    // big tiers take the wall; quick mode keeps the 100w..5w brackets
+    let quick = std::env::var("ZAP_BENCH_QUICK").is_ok();
+    let tiers = if quick {
+        vec![100usize, 170, 1000, 5000]
+    } else {
+        vec![100usize, 170, 1000, 5000, 20000, 160000]
+    };
+    for wl in tiers {
         let n_docs = if wl >= 50000 { 16 } else { 1000 };
         let docs = corpus(n_docs, wl);
         g.throughput(Throughput::Bytes(

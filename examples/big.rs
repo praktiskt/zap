@@ -82,6 +82,21 @@ fn main() {
         hits.len(),
         t2.elapsed().as_secs_f32() * 1e3
     );
+    // dense term + AND at scale (both df ~1M): the top-k wall the WAND path has to beat
+    let dt = std::time::Instant::now();
+    let hits = index.search("fox", 10).unwrap();
+    println!(
+        "term fox (df~1M) hits={} in {:.2} ms",
+        hits.len(),
+        dt.elapsed().as_secs_f32() * 1e3
+    );
+    let da = std::time::Instant::now();
+    let hits = index.search("fox AND dog", 10).unwrap();
+    println!(
+        "and2 fox AND dog (df~1M) hits={} in {:.2} ms",
+        hits.len(),
+        da.elapsed().as_secs_f32() * 1e3
+    );
     let t3 = std::time::Instant::now();
     let hits = index.search("\"quixotic fox\"", 10).unwrap();
     println!(
