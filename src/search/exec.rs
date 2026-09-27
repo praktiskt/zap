@@ -439,6 +439,18 @@ fn and_two_infos(
         (b, idf_b, a, idf_a)
     };
     let (drv, idf_drv, oth, idf_oth) = drive;
+    // large-df dense AND: one galloping pass over ~min(df) docs is a rayon-wall
+    // (postprobe dr+seek ~21ns/doc => single-threaded ~10ms at df 650k, and the
+    // merged leading segment usually IS that big — this task then dominates the
+    // per-segment parallelism). Two-pass: decode docid_vecs (1.4ns/doc),
+    // split the driver list over the worker pool, each chunk runs the same
+    // gallop independently inside [chunk_start, chunk_end). Small-df keeps the
+    // fused single-pass walk (the R18 small-corpus invariant).
+    if usize::min(drv.2.df as usize, oth.2.df as usize) >= 65_536 {
+        return Some(and_two_infos_par(
+            drv, idf_drv, oth, idf_oth, seg, ctx, allowed,
+        ));
+    }
     let mut r_drv = seg.reader(&drv.2);
     let mut r_oth = seg.reader(&oth.2);
     let norms_drv = seg.norms(drv.0);
@@ -484,6 +496,157 @@ fn and_two_infos(
         out.scores.push(w_d + w_o);
     }
     Some(out)
+}
+
+/// two-pass large-df AND: docid_vec decode, driver list split into P chunks,
+/// per-chunk independent gallop over [chunk_start, chunk_end)
+fn and_two_infos_par(
+    drv: &(u32, String, TermInfo),
+    idf_drv: f32,
+    oth: &(u32, String, TermInfo),
+    idf_oth: f32,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    allowed: Option<&roaring::RoaringBitmap>,
+) -> DocScores {
+    // pass 1: docid_vecs are cheap decodes (postprobe 1.4ns/doc) and give exact
+    // chunk boundaries for both cursors
+    let drv_vec = seg.reader(&drv.2).docid_vec();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let p = threads.min(drv_vec.len() / 4096).max(1);
+    let per = drv_vec.len().div_ceil(p);
+    // chunk boundaries include the start doc of each chunk (inclusive-lo) and
+    // the next chunk's start doc (exclusive-hi); tail chunk closes past max
+    let bounds: Vec<u32> = (0..=p)
+        .map(|i| {
+            let idx = i * per;
+            if idx >= drv_vec.len() {
+                // tail bound: past the last known driver doc + 1
+                drv_vec
+                    .last()
+                    .copied()
+                    .map_or(u32::MAX, |d| d.saturating_add(1))
+            } else {
+                drv_vec[idx]
+            }
+        })
+        .collect();
+    let chunk_results: Vec<DocScores> = std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for ci in 0..p {
+            let lo = bounds[ci];
+            let hi = bounds[ci + 1]; // exclusive docid bound
+            if lo >= hi {
+                continue;
+            }
+            let chunk_slice = &drv_vec[ci * per..((ci + 1) * per).min(drv_vec.len())];
+            // the pool's live threshold closure is not Sync; each chunk builds
+            // its own idle-threshold ctx (dense-AND scoring never consults it)
+            let shared = (ctx.schema, ctx.stats, ctx.params, ctx.analyzer);
+            jobs.push(scope.spawn(move || {
+                let (schema, stats, params, analyzer) = shared;
+                let zero_thr = || 0.0f32;
+                let cctx = Ctx {
+                    schema,
+                    stats,
+                    params,
+                    analyzer,
+                    threshold: &zero_thr,
+                };
+                and_chunk(
+                    lo,
+                    hi,
+                    chunk_slice,
+                    drv,
+                    idf_drv,
+                    oth,
+                    idf_oth,
+                    seg,
+                    &cctx,
+                    allowed,
+                )
+            }));
+        }
+        jobs.into_iter()
+            .map(|j| j.join().unwrap_or_default())
+            .collect()
+    });
+    DocScores {
+        ids: chunk_results
+            .iter()
+            .flat_map(|c| c.ids.iter().copied())
+            .collect(),
+        scores: chunk_results
+            .iter()
+            .flat_map(|c| c.scores.iter().copied())
+            .collect(),
+    }
+}
+
+/// gallop one [lo, hi) driver chunk; identical scoring to the fused pass
+#[allow(clippy::too_many_arguments)]
+fn and_chunk(
+    lo: u32,
+    hi: u32,
+    drv_slice: &[u32],
+    drv: &(u32, String, TermInfo),
+    idf_drv: f32,
+    oth: &(u32, String, TermInfo),
+    idf_oth: f32,
+    seg: &crate::segment::SegmentReader,
+    ctx: &Ctx,
+    allowed: Option<&roaring::RoaringBitmap>,
+) -> DocScores {
+    let mut out = DocScores::default();
+    out.ids.reserve(drv_slice.len());
+    out.scores.reserve(drv_slice.len());
+    let mut r_drv = seg.reader(&drv.2);
+    let mut r_oth = seg.reader(&oth.2);
+    r_drv.seek_to(lo);
+    r_oth.seek_to(lo);
+    let norms_drv = seg.norms(drv.0);
+    let norms_oth = seg.norms(oth.0);
+    while let Some((doc, tf_d)) = r_drv.advance() {
+        if doc >= hi {
+            break;
+        }
+        if let Some(al) = allowed {
+            if !al.contains(doc) {
+                continue;
+            }
+        }
+        r_oth.seek_to(doc);
+        let Some((d2, tf_o)) = r_oth.peek() else {
+            continue;
+        };
+        if d2 != doc {
+            continue;
+        }
+        let w_d = idf_drv * (tf_d as f32 * (ctx.params.k1 + 1.0))
+            / (tf_d as f32
+                + ctx.params.k1
+                    * crate::search::term::norm_ratio(
+                        norms_drv,
+                        doc,
+                        ctx.stats.avg_of(drv.0),
+                        ctx.params.b,
+                    ));
+        let w_o = idf_oth * (tf_o as f32 * (ctx.params.k1 + 1.0))
+            / (tf_o as f32
+                + ctx.params.k1
+                    * crate::search::term::norm_ratio(
+                        norms_oth,
+                        doc,
+                        ctx.stats.avg_of(oth.0),
+                        ctx.params.b,
+                    ));
+        out.ids.push(doc);
+        out.scores.push(w_d + w_o);
+    }
+    out
 }
 
 /// score only docs inside the bitmap

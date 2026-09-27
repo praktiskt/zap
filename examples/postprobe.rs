@@ -89,5 +89,52 @@ fn probe(seg: &zap::segment::SegmentReader, info: &zap::posting::TermInfo) {
         t.elapsed().as_secs_f64() * 1e6 / iters as f64,
         t.elapsed().as_secs_f64() * 1e9 / (iters * info.df as usize) as f64
     );
+    // (c) advance + monotone self-seek (mirrors the co-linear intersect walk:
+    // every doc: advance the driver, then seek_to(doc) on a second cursor)
+    let t = Instant::now();
+    for _ in 0..iters {
+        let mut r = seg.reader(info);
+        let mut q = seg.reader(info);
+        let mut n = 0usize;
+        while let Some((d, _tf)) = r.advance() {
+            q.seek_to(d);
+            if let Some((d2, _)) = q.peek() {
+                if d2 == d {
+                    n += 1;
+                }
+            }
+        }
+        black_box(n);
+    }
+    println!(
+        "dr+seek     {:9.1} us  ({:.2} ns/doc)",
+        t.elapsed().as_secs_f64() * 1e6 / iters as f64,
+        t.elapsed().as_secs_f64() * 1e9 / (iters * info.df as usize) as f64
+    );
+    // (d) advance + seek + score-only (adds the norm fetch + 2 divisions)
+    let t = Instant::now();
+    let _norms = seg.norms(0);
+    let avg = 50.0f32;
+    for _ in 0..iters {
+        let mut r = seg.reader(info);
+        let mut q = seg.reader(info);
+        let mut sink2 = 0f32;
+        while let Some((d, tf)) = r.advance() {
+            q.seek_to(d);
+            if let Some((d2, tf_o)) = q.peek() {
+                if d2 == d {
+                    let w1 = tf as f32 * 2.0 / (tf as f32 + 1.2 * (1.0 + (d as f32 / avg)));
+                    let w2 = tf_o as f32 * 2.0 / (tf_o as f32 + 1.2 * (1.0));
+                    sink2 += w1 + w2;
+                }
+            }
+        }
+        black_box(sink2);
+    }
+    println!(
+        "dr+seek+score {:7.1} us  ({:.2} ns/doc)",
+        t.elapsed().as_secs_f64() * 1e6 / iters as f64,
+        t.elapsed().as_secs_f64() * 1e9 / (iters * info.df as usize) as f64
+    );
     black_box(sink);
 }
