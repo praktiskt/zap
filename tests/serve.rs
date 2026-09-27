@@ -34,7 +34,7 @@ fn start_serve() -> SocketAddr {
     schema.add_text("text", 1.0);
     let analyzer = zap::analyzer::Analyzer::new(zap::analyzer::AnalyzerConf::default());
     let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 2);
-    zap::server::serve(index, "127.0.0.1:0", None, atomic_leak()).expect("bind :0")
+    zap::server::serve(index, "127.0.0.1:0", None, atomic_leak(), false).expect("bind :0")
 }
 
 #[test]

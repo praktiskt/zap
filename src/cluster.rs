@@ -90,6 +90,11 @@ impl PeerConfig {
         ring.dedup();
         ring
     }
+
+    /// raw configured sockets (no DNS expansion), for /__zap/peers queries
+    pub fn peers_csv(&self) -> Vec<String> {
+        self.peers.iter().map(|p| p.to_string()).collect()
+    }
 }
 
 /// lazily-resolvable set cached for LIST_TTL to avoid per-query DNS storms
@@ -143,6 +148,23 @@ impl PeerCache {
     /// is `addr` this node's own announcement?
     pub fn is_self(&self, addr: &SocketAddr) -> bool {
         addr == &self.config.announce
+    }
+
+    /// rebuild the peer list in place (dynamic rejoin / ring repartition);
+    /// the announce stays fixed, only the members change
+    pub fn set_peers(&mut self, peers_csv: &str) -> Result<(), String> {
+        let announce = self.config.announce;
+        let cfg = PeerConfig::parse(peers_csv, announce)?;
+        self.config = cfg;
+        self.cached.clear();
+        self.cached_at = Instant::now() - LIST_TTL;
+        Ok(())
+    }
+
+    /// comma-separated peer CSV of the current config (empty = single node)
+    pub fn peers_csv(&self) -> String {
+        let names = self.config.peers_csv();
+        names.join(",")
     }
 }
 

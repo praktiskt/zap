@@ -599,6 +599,55 @@ impl Index {
         self.payload_of(&snap, addr)
     }
 
+    /// live-doc scan page for handoff: documents strictly after the cursor
+    /// address `(segment, docid)` in segment/docid order, literal docs up to
+    /// `limit` rows as the FLAT ingest wire shape, plus the next cursor
+    /// (None = the snapshot is exhausted). Tombstoned docs are skipped.
+    pub fn docs_page(
+        &self,
+        after: Option<(u32, u32)>,
+        limit: usize,
+    ) -> (Vec<serde_json::Value>, Option<(u32, u32)>) {
+        let snap = self.snap.load();
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut cursor = after;
+        for (si, seg) in snap.segments.iter().enumerate() {
+            let mask = snap.deleted.get(&(si as u32));
+            for docid in 0..seg.num_docs {
+                let addr = (si as u32, docid);
+                if let Some(cur) = cursor {
+                    if addr <= cur {
+                        continue;
+                    }
+                }
+                if mask.is_some_and(|m| m.contains(docid)) {
+                    continue;
+                }
+                let Some(stored) = seg.stored_doc(docid) else {
+                    continue;
+                };
+                let mut row = serde_json::Map::new();
+                if let Some(id) = stored.id {
+                    row.insert("id".to_string(), serde_json::Value::String(id));
+                }
+                if let Some(meta) = stored.metadata {
+                    row.insert("metadata".to_string(), meta);
+                }
+                for (fid, text) in stored.fields {
+                    if let Some(f) = self.schema.field(fid) {
+                        row.insert(f.name.clone(), serde_json::Value::String(text));
+                    }
+                }
+                out.push(serde_json::Value::Object(row));
+                cursor = Some(addr);
+                if out.len() >= limit {
+                    return (out, cursor);
+                }
+            }
+        }
+        (out, None)
+    }
+
     fn payload_of(&self, snap: &IndexSnapshot, addr: DocAddr) -> Option<DocPayload> {
         let seg = snap.segments.get(addr.segment as usize)?;
         let stored: StoredDoc = seg.stored_doc(addr.docid)?;

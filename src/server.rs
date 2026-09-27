@@ -97,13 +97,10 @@ pub fn serve(
     bind: &str,
     cluster: Option<PeerConfig>,
     shutdown: &'static AtomicBool,
+    resync: bool,
 ) -> Result<SocketAddr, String> {
     let server = Server::http(bind).map_err(|e| format!("bind {bind}: {e}"))?;
     SERVE_STARTED.set(std::time::Instant::now()).ok();
-    let addr: SocketAddr = server
-        .server_addr()
-        .to_ip()
-        .ok_or_else(|| format!("unsupported bind address: {bind}"))?;
     let served: ClusterOpt = cluster.map(|c| {
         Arc::new(LocalCluster {
             cache: Mutex::new(PeerCache::new(c)),
@@ -123,25 +120,148 @@ pub fn serve(
             }
         }
     }
-    std::thread::spawn(move || loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
+    Ok(served_maps(server, index, served, shutdown, resync))
+}
+
+fn served_maps(
+    server: Server,
+    index: Arc<Index>,
+    served: ClusterOpt,
+    shutdown: &'static AtomicBool,
+    resync: bool,
+) -> SocketAddr {
+    let addr: SocketAddr = server
+        .server_addr()
+        .to_ip()
+        .expect("server addr already resolved");
+    if resync {
+        if let Some(s) = &served {
+            let idx = index.clone();
+            let scar = s.clone();
+            std::thread::spawn(move || {
+                // yield the listener a moment so the cluster can talk to us
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if idx.num_docs() == 0 {
+                    let n = pull_own_range(&idx, &scar, true);
+                    if n == 0 {
+                        eprintln!("[handoff] boot resync: no owned docs returned by peers");
+                    } else {
+                        eprintln!("[handoff] boot resync moved {n} docs");
+                    }
+                }
+            });
         }
-        match server.recv() {
-            Ok(req) => {
-                let index = index.clone();
-                handle(req, &index, served.as_ref());
-            }
-            Err(e) => {
-                eprintln!("[zap serve] recv error: {e}");
-                break;
+    }
+    std::thread::spawn(move || {
+        while !shutdown.load(Ordering::SeqCst) {
+            match server.recv() {
+                Ok(req) => {
+                    let index = index.clone();
+                    handle(req, &index, served.as_ref());
+                }
+                Err(e) => {
+                    eprintln!("[zap serve] recv error: {e}");
+                    break;
+                }
             }
         }
     });
-    Ok(addr)
+    addr
 }
 
-fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
+/// pull this shard's segment of the ring back from the peers: pages through
+/// each peer's `/__zap/handoff` stream, re-ingests the rows locally and
+/// ack-deletes the id-carrying ones on the source. For shard movement /
+/// empty-node recovery; unid rows are re-ingested but not ack-deleted.
+pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> usize {
+    let peers = cluster.cache.lock().unwrap().peers();
+    let ring = cluster.cache.lock().unwrap().ring();
+    let self_addr = cluster.cache.lock().unwrap().self_addr();
+    let mut moved = 0usize;
+    for peer in peers {
+        let mut cursor: Option<String> = None;
+        loop {
+            let path = match &cursor {
+                Some(c) => format!("/__zap/handoff?after={c}&limit=200"),
+                None => "/__zap/handoff?limit=200".to_string(),
+            };
+            let Some((_, body)) = http_get(peer, &path) else {
+                if verbose {
+                    eprintln!("[handoff] peer {peer} unreachable, stopping this source");
+                }
+                break;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                break;
+            };
+            let docs: Vec<serde_json::Value> = v
+                .get("docs")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let next = v
+                .get("next")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+            if docs.is_empty() {
+                break;
+            }
+            let mut batch: Vec<Document> = Vec::with_capacity(docs.len());
+            let mut ids: Vec<String> = Vec::with_capacity(docs.len());
+            for d in docs {
+                // only re-home rows this node now owns (ring key = id, or
+                // content hash for unid'd docs); the source keeps the copies
+                // until the id-ack deletes them
+                match serde_json::from_value::<Document>(d.clone()) {
+                    Ok(doc) => {
+                        let key = doc.id.clone().unwrap_or_else(|| {
+                            let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
+                            format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
+                        });
+                        let slot = crate::cluster::ring_owner(&ring, &key).unwrap_or(usize::MAX);
+                        if ring.get(slot) != Some(&self_addr) {
+                            continue;
+                        }
+                        if let Some(id) = &doc.id {
+                            ids.push(id.clone());
+                        }
+                        batch.push(doc);
+                    }
+                    Err(e) if verbose => eprintln!("[handoff] row skipped: {e}"),
+                    Err(_) => {}
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let pulled = batch.len();
+            if index.add_documents(batch).is_err() {
+                break;
+            }
+            index.commit();
+            moved += pulled;
+            if verbose {
+                eprintln!("[handoff] pulled {pulled} docs from {peer}");
+            }
+            if !ids.is_empty() {
+                let body = serde_json::json!({ "ids": ids }).to_string();
+                if let Some((code, _)) = http_post(peer, "/__zap/handoff_delete", &body) {
+                    if verbose && code != 200 {
+                        eprintln!("[handoff] source delete failed: {code}");
+                    }
+                }
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    crate::bus::notify_stats();
+    moved
+}
+
+fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
     let url = req.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -293,6 +413,130 @@ fn handle(mut req: Request, index: &Index, cluster: ClusterRef<'_>) {
             .to_string();
             reply(req, 200, &body);
         }
+        // handoff: paginated live-doc stream of this shard (shard movement +
+        // recovery pull). `after` = "seg:docid" cursor, `limit` max 500 rows.
+        (Method::Get, "/__zap/handoff") => {
+            let url = req.url().to_string();
+            let mut after = None;
+            let mut limit = 200usize;
+            for kv in url
+                .split('?')
+                .nth(1)
+                .map(|q| q.split('&'))
+                .into_iter()
+                .flatten()
+            {
+                let (k, val) = kv.split_once('=').unwrap_or((kv, ""));
+                match k {
+                    "after" if !val.is_empty() => {
+                        after = val
+                            .split_once(':')
+                            .and_then(|(s, d)| Some((s.parse().ok()?, d.parse().ok()?)));
+                    }
+                    "limit" => {
+                        if let Ok(n) = val.parse::<usize>() {
+                            limit = n.clamp(1, 500);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (docs, next) = index.docs_page(after, limit);
+            let body = serde_json::json!({
+                "docs": docs,
+                "next": next.map(|(s, d)| format!("{s}:{d}")),
+            })
+            .to_string();
+            reply(req, 200, &body);
+        }
+        // delete this shard's copies of the migrated ids once the puller acked
+        (Method::Post, "/__zap/handoff_delete") => match read_body(&mut req) {
+            Ok(body) => {
+                let v = match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        reply(
+                            req,
+                            400,
+                            &serde_json::json!({"error": e.to_string()}).to_string(),
+                        );
+                        return;
+                    }
+                };
+                let ids: Vec<&str> = v
+                    .get("ids")
+                    .and_then(|i| i.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let mut n = 0u32;
+                for id in ids {
+                    if index.delete(id).is_ok_and(|r| r) {
+                        n += 1;
+                    }
+                }
+                crate::bus::notify_stats();
+                reply(req, 200, &serde_json::json!({"deleted": n}).to_string());
+            }
+            Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
+        },
+        // trigger a resync pull of this node's ring range from the peers
+        // (post-boot shard movement / recovery; runs in the background)
+        (Method::Post, "/__zap/resync") => match cluster.map(Arc::clone) {
+            Some(cl) => {
+                let idx = index.clone();
+                let handle = std::thread::Builder::new()
+                    .name("handoff-resync".into())
+                    .spawn(move || {
+                        let n = pull_own_range(&idx, &cl, true);
+                        eprintln!("[handoff] resync moved {n} docs");
+                    });
+                if handle.is_err() {
+                    reply(req, 500, r#"{"error":"thread spawn failed"}"#);
+                    return;
+                }
+                reply(req, 202, r#"{"resync":"started"}"#);
+            }
+            None => reply(req, 400, r#"{"error":"single-node (no peers)"}"#),
+        },
+        // ring repartition: replace this node's peer list in place. Every node
+        // must apply the SAME membership or the ring views diverge; the caller
+        // (operator or the new member's boot) fans this out before a resync.
+        (Method::Get, "/__zap/peers") => match cluster {
+            Some(cl) => {
+                let cache = cl.cache.lock().unwrap();
+                let cfg = serde_json::json!({
+                    "self": cache.self_addr().to_string(),
+                    "peers": cache.peers_csv(),
+                });
+                reply(req, 200, &cfg.to_string());
+            }
+            None => reply(req, 200, r#"{"peers":""}"#),
+        },
+        (Method::Post, "/__zap/peers") => match cluster {
+            Some(cl) => match read_body(&mut req) {
+                Ok(body) => {
+                    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                    let csv = v
+                        .get("peers")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut cache = cl.cache.lock().unwrap();
+                    match cache.set_peers(&csv) {
+                        Ok(()) => {
+                            let cfg = serde_json::json!({
+                                "self": cache.self_addr().to_string(),
+                                "peers": cache.peers_csv(),
+                            });
+                            reply(req, 200, &cfg.to_string());
+                        }
+                        Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
+                    }
+                }
+                Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
+            },
+            None => reply(req, 400, r#"{"error":"single-node (no cluster runtime)"}"#),
+        },
 
         _ => {
             reply(req, 404, r#"{"error":"not found"}"#);

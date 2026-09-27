@@ -68,6 +68,10 @@ enum Command {
         announce: String,
         /// files or directories to index before serving (also HTTP /ingest)
         inputs: Vec<PathBuf>,
+        /// boot empty and pull this node's ring share from the peers once
+        /// serving (shard movement / empty-node recovery)
+        #[arg(long)]
+        resync: bool,
     },
 }
 
@@ -189,13 +193,14 @@ fn main() -> Result<()> {
         bind,
         peers,
         announce,
+        resync,
         ..
     }) = &args.command
     {
         let idx = index.clone();
         let cluster =
             zap::cluster::build_peer_config(bind, peers, announce).map_err(anyhow::Error::msg)?;
-        match zap::server::serve(idx, bind, cluster, &SHUTDOWN) {
+        match zap::server::serve(idx, bind, cluster, &SHUTDOWN, *resync) {
             Ok(addr) => eprintln!("[zap serving] http://{addr}"),
             Err(e) => {
                 eprintln!("[zap serve] {e}");

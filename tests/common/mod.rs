@@ -18,8 +18,20 @@ pub fn request_raw(
     send(&mut s, method, path, body)
 }
 
+/// connect with retry: shard processes do not listen within the first ~300ms
+/// after spawn, and booting a disk-backed index can take longer
 pub fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut s = None;
+    for _ in 0..40 {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(sock) => {
+                s = Some(sock);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let mut s = s.expect("connect after retries");
     send(&mut s, method, path, body)
 }
 
