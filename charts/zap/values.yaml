@@ -35,6 +35,13 @@ cluster:
   # name of a headless Service whose endpoints are the shards
   peersService: ""
   resync: true
+  # disk-backed shards: kind flips to StatefulSet with a PVC per pod mounted
+  # at /zap-data (--disk); a rebooted pod reboots onto its own segment files
+  # (MANIFEST.json lifecycle). Requires the storage class to provision RWO PVs.
+  disk:
+    enabled: false
+    size: "4Gi"
+    storageClass: ""   # "" = cluster default
 
 
 extraArgs: []

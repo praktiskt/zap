@@ -1,13 +1,19 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ if .Values.cluster.disk.enabled }}StatefulSet{{ else }}Deployment{{ end }}
 metadata:
   name: {{ .Release.Name }}
   labels:
     app: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if .Values.cluster.disk.enabled }}
+  # stateful shards: stable ordinal identities + a PV per pod (--disk), so a
+  # rebooted pod reboots onto its disk (same announce, same data)
+  serviceName: {{ if .Values.cluster.peersService }}{{ .Values.cluster.peersService }}{{ else }}{{ .Release.Name }}-hs{{ end }}
+  {{- else }}
   strategy:
     {{- toYaml .Values.strategy | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Release.Name }}
@@ -63,14 +69,9 @@ spec:
             {{- if and .Values.cluster.enabled .Values.cluster.peersService }}
             - --peers={{ .Values.cluster.peersService }}:{{ .Values.service.targetPort }}
             - --announce=$(POD_IP):{{ .Values.service.targetPort }}
-            {{- if and .Values.cluster.resync .Values.corpus.configMap }}
-            {{- /* a corpus-backed pod is never empty at boot, so --resync would
-                  be skipped by the engine's empty check — only add the flag on
-                  corpus-free shards where a join actually pulls the ring share */}}
             {{- end }}
-            {{- if and .Values.cluster.resync (not .Values.corpus.configMap) }}
-            - --resync
-            {{- end }}
+            {{- if .Values.cluster.disk.enabled }}
+            - --disk=/zap-data
             {{- end }}
             {{- if .Values.corpus.configMap }}
             - /corpus
@@ -78,11 +79,17 @@ spec:
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
-          {{- if .Values.corpus.configMap }}
+          {{- if or .Values.corpus.configMap .Values.cluster.disk.enabled }}
           volumeMounts:
+            {{- if .Values.corpus.configMap }}
             - name: corpus
               mountPath: /corpus
               readOnly: true
+            {{- end }}
+            {{- if .Values.cluster.disk.enabled }}
+            - name: zap-data
+              mountPath: /zap-data
+            {{- end }}
           {{- end }}
           {{- with .Values.health.livenessProbe }}
           livenessProbe:
@@ -98,3 +105,16 @@ spec:
           configMap:
             name: {{ .Values.corpus.configMap }}
       {{- end }}
+{{- if .Values.cluster.disk.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: zap-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.cluster.disk.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.cluster.disk.size }}
+{{- end }}

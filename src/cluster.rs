@@ -169,6 +169,19 @@ impl PeerCache {
         Ok(())
     }
 
+    /// membership MERGE: add one announced address (idempotent, self-ignored)
+    /// without touching existing members; used when a new node announces
+    /// itself at boot and by any client that widens the cluster
+    pub fn join_peer(&mut self, addr: SocketAddr) -> bool {
+        if addr == self.config.announce || self.config.peers.contains(&addr) {
+            return false;
+        }
+        self.config.peers.push(addr);
+        self.cached.clear();
+        self.cached_at = Instant::now() - LIST_TTL;
+        true
+    }
+
     /// comma-separated peer CSV of the current config (empty = single node)
     pub fn peers_csv(&self) -> String {
         let names = self.config.peers_csv();

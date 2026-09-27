@@ -81,21 +81,33 @@ examples/big.rs   1M-doc probe   example: wand.rs: skew probe   example: smoke.r
 
 ## Distributed mode
 
-Three+ replicas can form a static ring: search fans out to every shard and
-merges top-k (scores stay comparable because each replica gossips its BM25
-stats deltas at commit); ingest ring-routes each doc by hash of its external id
-(unid'd docs: content hash), and `GET/DELETE /doc/{id}` route to the owning
-shard. Ids stay unique + replaceable; replicas are plain shards (no replication
-factor, no resharding — resizing requires re-ingest).
+Three+ replicas can form a slot ring (1024 slots, `id → slot % N`): search
+fans out to every shard and merges top-k (scores stay comparable because each
+replica gossips its BM25 stats deltas at commit); ingest ring-routes each doc
+by hash of its external id (unid'd docs: content hash), and
+`GET/DELETE /doc/{id}` route to the owning shard. Ids stay unique +
+replaceable; replicas are plain shards (no replication factor).
 
 ```sh
 zap serve --bind 127.0.0.1:3279 --announce 127.0.0.1:3279 --peers addr1:3279,addr2:3279
 ```
 
+Membership: a booting node announces itself to its configured peers
+(join merge, idempotent), and boots `--resync` to pull its ring share via
+paginated handoff when it starts empty. Ring repartition of pre-existing
+nodes: `POST /__zap/peers {"peers":"a,b"}` per node (or `{"join":"ip:port"}`
+to widen one member). `GET /__zap/handoff?after=<seg>:<docid>` streams a
+shard's live docs for movement/recovery. Shards can persist state with
+`--disk DIR` (segments + MANIFEST.json; uncommitted hot lanes are lost on a
+crash). A lost disk-backed shard reboots onto its PV; a lost RAM-only shard
+loses its copy unless another node holds its range.
+
 Any node acts as the query coordinator (`/search` fan-out); a dead peer shows
 up as `"degraded": true`. Cluster-internal routes live under `/__zap/…`
-(gossip, shard_search, shard_ingest, shard_stats). Helm: `cluster.enabled=true`
-plus a **headless** service (`zap-headless`) wires the ring automatically.
+(gossip, shard_search, shard_ingest, shard_stats, peers, handoff, resync).
+Helm: `cluster.enabled=true` plus a **headless** service (`zap-headless`)
+wires the ring automatically; `cluster.disk.enabled=true` renders a
+StatefulSet with a PVC per pod (`--disk`), so pod restarts keep their data.
 
 ## Packaging
 

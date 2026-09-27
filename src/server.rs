@@ -134,13 +134,36 @@ fn served_maps(
         .server_addr()
         .to_ip()
         .expect("server addr already resolved");
+    // membership announcement: a joining node tells every configured peer
+    // its announce address (join merge), so the existing nodes' rings widen
+    // without operator action; idempotent on the peer side
+    if let Some(s) = &served {
+        let scar = s.clone();
+        std::thread::spawn(move || {
+            // yield the listener a moment so peers can talk back
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let me = scar.cache.lock().unwrap().self_addr();
+            let peers = scar.cache.lock().unwrap().peers();
+            for peer in peers {
+                let body = serde_json::json!({ "join": me.to_string() }).to_string();
+                if let Some((code, resp)) = http_post(peer, "/__zap/peers", &body) {
+                    if code != 200 {
+                        eprintln!("[join] peer {peer} rejected join: {resp}");
+                    }
+                } else {
+                    eprintln!("[join] peer {peer} unreachable at join announce");
+                }
+            }
+        });
+    }
     if resync {
         if let Some(s) = &served {
             let idx = index.clone();
             let scar = s.clone();
             std::thread::spawn(move || {
-                // yield the listener a moment so the cluster can talk to us
-                std::thread::sleep(std::time::Duration::from_millis(1500));
+                // the resync pull runs AFTER the announced joins: peers must
+                // know us (and our slot ownership) before we take over docs
+                std::thread::sleep(std::time::Duration::from_millis(1800));
                 if idx.num_docs() == 0 {
                     let n = pull_own_range(&idx, &scar, true);
                     if n == 0 {
@@ -516,21 +539,48 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
             Some(cl) => match read_body(&mut req) {
                 Ok(body) => {
                     let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
-                    let csv = v
-                        .get("peers")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     let mut cache = cl.cache.lock().unwrap();
-                    match cache.set_peers(&csv) {
-                        Ok(()) => {
+                    let outcome = if let Some(join) = v.get("join").and_then(|p| p.as_str()) {
+                        // membership merge: one announced address joins the
+                        // ring (new node boot fan-out / manual widen)
+                        match join.parse::<SocketAddr>() {
+                            Ok(addr) => {
+                                let added = cache.join_peer(addr);
+                                Some(Ok(("joined", added)))
+                            }
+                            Err(e) => Some(Err(e.to_string())),
+                        }
+                    } else {
+                        // full repartition: replace the peer list in place
+                        let csv = v
+                            .get("peers")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        match cache.set_peers(&csv) {
+                            Ok(()) => Some(Ok(("replaced", true))),
+                            Err(e) => Some(Err(e)),
+                        }
+                    };
+                    match outcome {
+                        None => {
                             let cfg = serde_json::json!({
                                 "self": cache.self_addr().to_string(),
                                 "peers": cache.peers_csv(),
                             });
                             reply(req, 200, &cfg.to_string());
                         }
-                        Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
+                        Some(Ok((kind, _added))) => {
+                            let cfg = serde_json::json!({
+                                "self": cache.self_addr().to_string(),
+                                "peers": cache.peers_csv(),
+                                "result": kind,
+                            });
+                            reply(req, 200, &cfg.to_string());
+                        }
+                        Some(Err(e)) => {
+                            reply(req, 400, &serde_json::json!({"error": e}).to_string())
+                        }
                     }
                 }
                 Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
