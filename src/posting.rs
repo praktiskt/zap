@@ -298,36 +298,7 @@ impl<'a> PostingReader<'a> {
             return;
         }
         self.peeked = None;
-        // forward monotone seek stays cheap when the target lies in the SAME
-        // block the cursor already occupies: decode straight from the current
-        // position instead of bouncing back to the block anchor (a dense
-        // co-linear intersect/phrase walk used to re-decode up to SKIP_STEP
-        // docs per seek). Outside the block, or backward seeks, take the
-        let mut same_block = false;
-        if self.docidx < self.doc_count && self.docid_c < self.docids_end {
-            let skips = &self.blob[self.skips_start..self.skips_end];
-            let n = skips.len() / SKIP_ENTRY_BYTES;
-            let read = |i: usize| -> u32 {
-                u32::from_le_bytes(
-                    skips[i * SKIP_ENTRY_BYTES..i * SKIP_ENTRY_BYTES + 4]
-                        .try_into()
-                        .unwrap(),
-                )
-            };
-            // row(i).prev_docid = last docid of doc-order block i (row 0's
-            // anchor is written at the first boundary, so row b exists iff
-            // the cursor sits in block 1..: block 0 has no upper row unless
-            // n > 0 and its boundary is... blocked below by requiring b >= 1)
-            let b = self.docidx / SKIP_STEP;
-            if b >= 1 && b < n {
-                let up = read(b);
-                let down = read(b - 1);
-                same_block = target > down && target <= up;
-            }
-        }
-        if !same_block {
-            self.reset_to_anchor(target);
-        }
+        self.reset_to_anchor(target);
         loop {
             match self.decode_next() {
                 Some(p) if p.0 < target => {
