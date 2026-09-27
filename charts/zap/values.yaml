@@ -23,15 +23,18 @@ serve:
 corpus:
   configMap: ""
 
-# distributed mode: pods form a static ring via a headless service. replicaCount
+# distributed mode: pods form a slot ring via a headless service. replicaCount
 # > 1 + peersService set -> each pod announces itself and discovers peers via
 # DNS; search fans out to every shard, ingest ring-routes by external id hash.
-# NOTE the ring is static: resizing replicas requires re-ingesting (shards are
-# RAM-only; there is no migration machinery).
+# resync: a booting shard starts EMPTY and pulls its ring share from the peers
+# (handoff). Note ring repartition on replica changes still needs POST
+# /__zap/peers on every pre-existing node; RAM-only shards cannot rehydrate
+# lost ranges.
 cluster:
   enabled: false
   # name of a headless Service whose endpoints are the shards
   peersService: ""
+  resync: true
 
 
 extraArgs: []

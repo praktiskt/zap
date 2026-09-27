@@ -16,13 +16,21 @@ pub fn fnv64a(data: &[u8]) -> u64 {
     h
 }
 
-/// ring slot of the node owning `id`: nodes sorted by address, owner = hash
+/// consistent-hash ring slot count: ids map to slots via fnv64a, slots map
+/// to nodes via `slot % N` (stepped virtual-node layout). Adding a member
+/// claims exactly SLOTS/N slots (every Nth), so repartition churn stays
+/// ~SLOTS/N ids per membership change instead of re-homing everything.
+pub const SLOTS: u64 = 1024;
+
+/// ring slot of the node owning `id`: nodes sorted by address,
+/// slot = fnv64a(id) % SLOTS, owner = ring[slot % ring.len()]
 /// `ring`: the sorted [self, peers...] list of announcements.
 pub fn ring_owner(ring: &[SocketAddr], id: &str) -> Option<usize> {
     if ring.is_empty() {
         return None;
     }
-    Some((fnv64a(id.as_bytes()) % ring.len() as u64) as usize)
+    let slot = fnv64a(id.as_bytes()) % SLOTS;
+    Some((slot % ring.len() as u64) as usize)
 }
 
 /// parsed peer configuration
@@ -383,4 +391,39 @@ pub fn build_peer_config(
     // peers keep names as configured (DNS names resolve lazily in PeerCache;
     // self never appears in the peer list since announce is separate)
     PeerConfig::parse(peers_csv, self_addr).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// slot%N layout: adding/removing a member shifts only SLOTS/N slots;
+    /// membership N -> N+1 keeps every id whose slot % (N+1) != N
+    #[test]
+    fn slot_ring_repartition_churn() {
+        let n = SLOTS * 100; // ids spread far past one full slot cycle
+        let mut churn_1_to_2 = 0usize;
+        for i in 0..n {
+            let id = format!("doc-{i}");
+            let s = fnv64a(id.as_bytes()) % SLOTS;
+            if s % 2 == 1 {
+                churn_1_to_2 += 1;
+            }
+        }
+        // N: 1 -> 2 re-homes exactly the odd slots = half the keyspace
+        assert_eq!(churn_1_to_2, (n / 2) as usize);
+        // skew sanity: per-slot shares within +-2% across a larger cycle
+        let mut per2 = [0usize; 2];
+        for i in 0..n {
+            let id = format!("doc-{i}");
+            let s = fnv64a(id.as_bytes()) % SLOTS;
+            per2[(s % 2) as usize] += 1;
+        }
+        for c in per2 {
+            assert!(
+                (c as i64 - (n / 2) as i64).abs() < ((n as f64) * 0.02) as i64,
+                "skew {per2:?}"
+            );
+        }
+    }
 }

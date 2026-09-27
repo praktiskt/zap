@@ -63,6 +63,14 @@ spec:
             {{- if and .Values.cluster.enabled .Values.cluster.peersService }}
             - --peers={{ .Values.cluster.peersService }}:{{ .Values.service.targetPort }}
             - --announce=$(POD_IP):{{ .Values.service.targetPort }}
+            {{- if and .Values.cluster.resync .Values.corpus.configMap }}
+            {{- /* a corpus-backed pod is never empty at boot, so --resync would
+                  be skipped by the engine's empty check — only add the flag on
+                  corpus-free shards where a join actually pulls the ring share */}}
+            {{- end }}
+            {{- if and .Values.cluster.resync (not .Values.corpus.configMap) }}
+            - --resync
+            {{- end }}
             {{- end }}
             {{- if .Values.corpus.configMap }}
             - /corpus
