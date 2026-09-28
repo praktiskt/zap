@@ -134,11 +134,17 @@ fn served_maps(
         .server_addr()
         .to_ip()
         .expect("server addr already resolved");
-    // membership announcement: a joining node tells every configured peer
-    // its announce address (join merge), so the existing nodes' rings widen
-    // without operator action; idempotent on the peer side
+    // membership announcement + boot survey: a joining node tells every
+    // configured peer its announce address (join merge, idempotent), then
+    // under --resync runs its OWN owned-range pull. The pull is unconditional
+    // (NOT gated on an empty index): ring-routed ingests can land rows on a
+    // joining node BEFORE its own pull runs, and rows ingested before the
+    // join may still sit on the pre-join owner's stale copy — the survey
+    // fetches owned rows from the peers and ack-deletes them there; the
+    // nodes that already hold their share just re-ingest (replace semantics)
     if let Some(s) = &served {
         let scar = s.clone();
+        let idx2 = index.clone();
         std::thread::spawn(move || {
             // yield the listener a moment so peers can talk back
             std::thread::sleep(std::time::Duration::from_millis(800));
@@ -154,26 +160,22 @@ fn served_maps(
                     eprintln!("[join] peer {peer} unreachable at join announce");
                 }
             }
-        });
-    }
-    if resync {
-        if let Some(s) = &served {
-            let idx = index.clone();
-            let scar = s.clone();
-            std::thread::spawn(move || {
-                // the resync pull runs AFTER the announced joins: peers must
-                // know us (and our slot ownership) before we take over docs
-                std::thread::sleep(std::time::Duration::from_millis(1800));
-                if idx.num_docs() == 0 {
-                    let n = pull_own_range(&idx, &scar, true);
-                    if n == 0 {
-                        eprintln!("[handoff] boot resync: no owned docs returned by peers");
-                    } else {
-                        eprintln!("[handoff] boot resync moved {n} docs");
-                    }
+            if resync {
+                // the peers must know us (and our slot ownership) before we
+                // can survey our owned range. The survey is unconditional:
+                // rows may already have arrived via ring-routed ingest AND
+                // rows from before the join may sit on a pre-join owner's
+                // stale copy; pull_own_range replaces owned rows (no-op) and
+                // ack-deletes the stale source copies
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let n = pull_own_range(&idx2, &scar, true);
+                if n > 0 {
+                    eprintln!("[handoff] boot resync moved {n} docs");
+                } else {
+                    eprintln!("[handoff] boot resync: nothing to move");
                 }
-            });
-        }
+            }
+        });
     }
     std::thread::spawn(move || {
         while !shutdown.load(Ordering::SeqCst) {
@@ -540,6 +542,9 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
                 Ok(body) => {
                     let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
                     let mut cache = cl.cache.lock().unwrap();
+                    // did the membership actually change? joins/replacements
+                    // that don't alter the ring skip the re-pull below
+                    let (peer_count, _self_addr) = (cache.peers_csv().len(), cache.self_addr());
                     let outcome = if let Some(join) = v.get("join").and_then(|p| p.as_str()) {
                         // membership merge: one announced address joins the
                         // ring (new node boot fan-out / manual widen)
@@ -562,26 +567,49 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
                             Err(e) => Some(Err(e)),
                         }
                     };
-                    match outcome {
+                    let changed = match &outcome {
+                        Some(Ok((_, _added))) => cache.peers_csv().len() != peer_count,
+                        _ => false,
+                    };
+                    drop(cache);
+                    let body = match outcome {
                         None => {
-                            let cfg = serde_json::json!({
+                            let cache = cl.cache.lock().unwrap();
+                            serde_json::json!({
                                 "self": cache.self_addr().to_string(),
                                 "peers": cache.peers_csv(),
-                            });
-                            reply(req, 200, &cfg.to_string());
+                            })
                         }
-                        Some(Ok((kind, _added))) => {
-                            let cfg = serde_json::json!({
+                        Some(Ok((kind, _))) => {
+                            let cache = cl.cache.lock().unwrap();
+                            serde_json::json!({
                                 "self": cache.self_addr().to_string(),
                                 "peers": cache.peers_csv(),
                                 "result": kind,
-                            });
-                            reply(req, 200, &cfg.to_string());
+                            })
                         }
                         Some(Err(e)) => {
-                            reply(req, 400, &serde_json::json!({"error": e}).to_string())
+                            reply(req, 400, &serde_json::json!({"error": e}).to_string());
+                            return;
                         }
+                    };
+                    // a real membership change re-partitions the ring: rows
+                    // this node newly owns may sit on any peer's stale copy —
+                    // re-pull the owned range until the ownership settles
+                    if changed {
+                        let idx = index.clone();
+                        let cl2 = Arc::clone(cl);
+                        let _ = std::thread::Builder::new()
+                            .name("membership-resync".into())
+                            .spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(1000));
+                                let n = pull_own_range(&idx, &cl2, false);
+                                if n > 0 {
+                                    eprintln!("[handoff] membership change pulled {n} docs");
+                                }
+                            });
                     }
+                    reply(req, 200, &body.to_string());
                 }
                 Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
             },
@@ -971,7 +999,16 @@ fn doc_get_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str)
     if owner == cl.cache.lock().unwrap().self_addr() {
         return doc_get(req, index, id);
     }
-    match http_get(owner, &format!("/doc/{}", url_escape(id))) {
+    let path = format!("/doc/{}", url_escape(id));
+    // one quick retry: the owner is a single-threaded tiny_http shard, and
+    // under concurrent load a connect can transiently refuse (pull threads,
+    // search hammering, ingest fan-outs) — the second attempt pays for itself
+    let mut attempt = http_get(owner, &path);
+    if attempt.is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        attempt = http_get(owner, &path);
+    }
+    match attempt {
         Some((code, body)) => reply(req, code, &body),
         None => reply(
             req,
@@ -1005,7 +1042,13 @@ fn doc_delete_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &s
     if owner == cl.cache.lock().unwrap().self_addr() {
         return doc_delete(req, index, id);
     }
-    match http_delete(owner, &format!("/doc/{}", url_escape(id))) {
+    let path = format!("/doc/{}", url_escape(id));
+    let mut attempt = http_delete(owner, &path);
+    if attempt.is_none() {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        attempt = http_delete(owner, &path);
+    }
+    match attempt {
         Some((code, body)) => reply(req, code, &body),
         None => reply(
             req,

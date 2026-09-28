@@ -44,6 +44,12 @@ pub fn post(port: u16, path: &str, body: &str) -> (u16, String) {
 }
 
 fn send(s: &mut TcpStream, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    use std::time::Duration;
+    // bound both sides so a wedged shard handler cannot freeze a test
+    // process: a /doc forwarded into a dead ring leg can stall one of the
+    // single-threaded tiny_http workers for arbitrarily long
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
     let mut raw = format!("{method} {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n");
     if let Some(b) = body {
         raw += &format!("Content-Length: {}\r\n\r\n{b}", b.len());
@@ -52,7 +58,9 @@ fn send(s: &mut TcpStream, method: &str, path: &str, body: Option<&str>) -> (u16
     }
     s.write_all(raw.as_bytes()).expect("write request");
     let mut resp = Vec::new();
-    s.read_to_end(&mut resp).expect("read response");
+    // timeout-terminated reads surface as Err: a partial response maps to a
+    // 0-status (0xx) rather than an infinite block
+    let _ = s.read_to_end(&mut resp);
     let t = String::from_utf8_lossy(&resp).into_owned();
     let code: u16 = t
         .split_whitespace()
