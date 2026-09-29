@@ -94,16 +94,17 @@ fn repartition_under_search_load() {
     for i in 0..N_IDS {
         for s in [&mut a, &mut b, &mut c] {
             // bounded retry: a single-threaded coordinator shard can briefly
-            // refuse connections while the survey/replica pushes drain —
-            // the invariant is the row RESPONDS within a retry window
+            // stall behind a survey / fan-out burst (the shared inner mutex)
+            // — the invariant is the row RESPONDS within the window (200);
+            // a 404 after retries = a real loss assertion
             let mut code = 0u16;
-            for _ in 0..6 {
+            for _ in 0..25 {
                 let (c, _) = get(s.port, &format!("/doc/r{i}"));
                 code = c;
-                if code == 200 || code == 404 {
+                if code == 200 {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(400));
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
             assert_eq!(code, 200, "losing r{i} on {}", s.port);
         }

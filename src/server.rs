@@ -205,8 +205,7 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
     // boot surveys would double-commit their batches AND storm the peers'
     // single-threaded tiny_http accept loop (that storm showed as transient
     // connection refusals on the receiving shards during repartitions)
-    static SURVEYING: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static SURVEYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SURVEYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return 0;
     }
@@ -273,10 +272,20 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
                 break;
             }
             let pulled = batch.len();
-            if index.add_documents(batch).is_err() {
-                break;
+            // the engine's add_documents holds the inner mutex for the WHOLE
+            // batch (tokenization happens under the lock). A 150-doc page at
+            // once stalled the single-threaded tiny_http accept loop for
+            // seconds and starved every handler including /health undo. Feed
+            // the survey's page into the engine in small groups so concurrent
+            // /ingest + /search handlers interleave between groups.
+            for chunk_slice in batch.chunks(12) {
+                if index.add_documents(chunk_slice.to_vec()).is_err() {
+                    SURVEYING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    crate::bus::notify_stats();
+                    return moved;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            index.commit();
             moved += pulled;
             if verbose {
                 eprintln!("[handoff] pulled {pulled} docs from {peer}");
@@ -287,6 +296,11 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
             }
         }
     }
+    // ONE commit per survey (not per page): publish_snapshot re-partitions
+    // caller-visible snapshots; per-page commits under the survey's own
+    // add_documents contention blocked the single-threaded accept loop long
+    // enough for connection refusals on the receiving shards
+    index.commit();
     SURVEYING.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::bus::notify_stats();
     moved
