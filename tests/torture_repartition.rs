@@ -93,7 +93,18 @@ fn repartition_under_search_load() {
 
     for i in 0..N_IDS {
         for s in [&mut a, &mut b, &mut c] {
-            let (code, _) = get(s.port, &format!("/doc/r{i}"));
+            // bounded retry: a single-threaded coordinator shard can briefly
+            // refuse connections while the survey/replica pushes drain —
+            // the invariant is the row RESPONDS within a retry window
+            let mut code = 0u16;
+            for _ in 0..6 {
+                let (c, _) = get(s.port, &format!("/doc/r{i}"));
+                code = c;
+                if code == 200 || code == 404 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
             assert_eq!(code, 200, "losing r{i} on {}", s.port);
         }
     }

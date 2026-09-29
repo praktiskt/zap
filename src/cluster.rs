@@ -22,6 +22,18 @@ pub fn fnv64a(data: &[u8]) -> u64 {
 /// ~SLOTS/N ids per membership change instead of re-homing everything.
 pub const SLOTS: u64 = 1024;
 
+/// replication factor: every doc lives on the slot owner + (REPLICA_FACTOR-1)
+/// ring successors, so R-1 members may die without losing that doc's copy.
+/// R=1 = no replication; R=2 = one backup per doc.
+pub const REPLICA_FACTOR: usize = 2;
+
+/// placement for a ring slot: [owner, replica...]: owner = ring[slot % N],
+/// replica k = ring[(slot + k) % N] — the next R-1 ring members in rotation
+pub fn replica_slots(slot: u64, ring_len: usize) -> Vec<usize> {
+    let r = REPLICA_FACTOR.min(ring_len).max(1);
+    (0..r).map(|k| ((slot as usize) + k) % ring_len).collect()
+}
+
 /// ring slot of the node owning `id`: nodes sorted by address,
 /// slot = fnv64a(id) % SLOTS, owner = ring[slot % ring.len()]
 /// `ring`: the sorted [self, peers...] list of announcements.
@@ -31,6 +43,15 @@ pub fn ring_owner(ring: &[SocketAddr], id: &str) -> Option<usize> {
     }
     let slot = fnv64a(id.as_bytes()) % SLOTS;
     Some((slot % ring.len() as u64) as usize)
+}
+
+/// the router set for `id`: [owner, replicas...] as ring INDICES
+pub fn ring_holder_indices(ring: &[SocketAddr], id: &str) -> Vec<usize> {
+    if ring.is_empty() {
+        return Vec::new();
+    }
+    let slot = fnv64a(id.as_bytes()) % SLOTS;
+    replica_slots(slot, ring.len())
 }
 
 /// parsed peer configuration

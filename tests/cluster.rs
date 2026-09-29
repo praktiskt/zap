@@ -24,8 +24,8 @@ fn spawn_serve(bind: u16, announce: u16, peers: &str) -> Child {
             "--lanes",
             "2",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(format!("/tmp/zdtest-{bind}.stderr")).expect("log"))
         .spawn()
         .expect("spawn zap serve")
 }
@@ -101,7 +101,9 @@ fn cluster_of_three() {
     let (code, body) = get(n0, "/stats");
     assert_eq!(code, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["docs"], 3, "{body}");
+    // R=2: every doc lives on the owner + one replica => the stored-row sum
+    // across the ring counts each doc twice
+    assert_eq!(v["docs"], 6, "{body}");
 
     // --- search ANY node duplicates results across the ring ---
     let hits_a = search(n0, "fox");
@@ -122,7 +124,8 @@ fn cluster_of_three() {
     assert_eq!(v["fields"][0][1], "replaced entirely");
     // total count stays 3
     let v: serde_json::Value = serde_json::from_str(&get(n0, "/stats").1).unwrap();
-    assert_eq!(v["docs"], 3, "{v}");
+    // replacement keeps the stored-row sum at 3 docs x R=2 holders
+    assert_eq!(v["docs"], 6, "{v}");
 
     // --- search sees the replacement, not the original ---
     let hits1 = search(n0, "fox");
@@ -138,7 +141,8 @@ fn cluster_of_three() {
     assert_eq!(get(n0, "/doc/c3").0, 404);
     assert_eq!(get(ports[1], "/doc/c3").0, 404);
     let v: serde_json::Value = serde_json::from_str(&get(n0, "/stats").1).unwrap();
-    assert_eq!(v["docs"], 2, "{v}");
+    // delete kills both copies of c3: stored-row sum = 2 docs x R=2
+    assert_eq!(v["docs"], 4, "{v}");
 }
 
 fn search(port: u16, q: &str) -> Vec<serde_json::Value> {

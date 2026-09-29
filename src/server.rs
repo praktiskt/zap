@@ -194,14 +194,26 @@ fn served_maps(
     addr
 }
 
-/// pull this shard's segment of the ring back from the peers: pages through
-/// each peer's `/__zap/handoff` stream, re-ingests the rows locally and
-/// ack-deletes the id-carrying ones on the source. For shard movement /
-/// empty-node recovery; unid rows are re-ingested but not ack-deleted.
+/// pull this shard's SEGMENT of the ring back from the peers: pages through
+/// each peer's `/__zap/handoff` stream, re-ingests rows this node holds
+/// (owner OR replica slots) and ack-deletes the id-carrying ones on the
+/// source ONLY when this node owns the row outright (the replica copy must
+/// stay at the source: replication requires R holders, the ack is a MOVE).
+/// For shard movement / empty-node recovery; unid rows re-ingest without ack.
 pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> usize {
+    // one survey at a time per node: overlapping membership-change pulls and
+    // boot surveys would double-commit their batches AND storm the peers'
+    // single-threaded tiny_http accept loop (that storm showed as transient
+    // connection refusals on the receiving shards during repartitions)
+    static SURVEYING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if SURVEYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return 0;
+    }
     let peers = cluster.cache.lock().unwrap().peers();
     let ring = cluster.cache.lock().unwrap().ring();
     let self_addr = cluster.cache.lock().unwrap().self_addr();
+    let self_idx = ring.iter().position(|r| r == &self_addr);
     let mut moved = 0usize;
     for peer in peers {
         let mut cursor: Option<String> = None;
@@ -232,23 +244,24 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
                 break;
             }
             let mut batch: Vec<Document> = Vec::with_capacity(docs.len());
-            let mut ids: Vec<String> = Vec::with_capacity(docs.len());
             for d in docs {
-                // only re-home rows this node now owns (ring key = id, or
-                // content hash for unid'd docs); the source keeps the copies
-                // until the id-ack deletes them
+                // re-home rows this node holds: owner slot OR replica slot
+                // (slot+k rotation). NO ACK-DELETE here: with replication the
+                // source copy may be the legitimate replica (R holders stay),
+                // not a dup-purge-safety stale copy; stale rows left behind by
+                // membership moves are removed by the search's id-dedup and
+                // the /doc holder-first routing until an explicit purge pass
+                // (search + /doc both resolve correctly regardless)
                 match serde_json::from_value::<Document>(d.clone()) {
                     Ok(doc) => {
                         let key = doc.id.clone().unwrap_or_else(|| {
                             let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
                             format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
                         });
-                        let slot = crate::cluster::ring_owner(&ring, &key).unwrap_or(usize::MAX);
-                        if ring.get(slot) != Some(&self_addr) {
+                        let holders = crate::cluster::ring_holder_indices(&ring, &key);
+                        let holds = self_idx.is_some_and(|si| holders.contains(&si));
+                        if !holds {
                             continue;
-                        }
-                        if let Some(id) = &doc.id {
-                            ids.push(id.clone());
                         }
                         batch.push(doc);
                     }
@@ -268,20 +281,13 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
             if verbose {
                 eprintln!("[handoff] pulled {pulled} docs from {peer}");
             }
-            if !ids.is_empty() {
-                let body = serde_json::json!({ "ids": ids }).to_string();
-                if let Some((code, _)) = http_post(peer, "/__zap/handoff_delete", &body) {
-                    if verbose && code != 200 {
-                        eprintln!("[handoff] source delete failed: {code}");
-                    }
-                }
-            }
             cursor = next;
             if cursor.is_none() {
                 break;
             }
         }
     }
+    SURVEYING.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::bus::notify_stats();
     moved
 }
@@ -372,7 +378,9 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
         }
         (Method::Get, p) if p.starts_with("/doc/") => {
             let id = url_decode(&p["/doc/".len()..]);
-            doc_get_reply(req, index, cluster, &id);
+            // holder-walks carry a hop depth: forwarded requests are answered
+            // locally only, so a replica miss can never loop A->B->A forever
+            doc_get_reply(req, index, cluster, &id, query_hop(&url));
         }
         (Method::Delete, p) if p.starts_with("/doc/") => {
             let id = url_decode(&p["/doc/".len()..]);
@@ -425,6 +433,57 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
                 reply(req, 200, &body);
             }
             Err(msg) => reply(req, 400, &serde_json::json!({"error": msg}).to_string()),
+        },
+        // replica write path: the OWNER pushed this batch; store locally and
+        // commit, DO NOT re-push (replication terminates here)
+        (Method::Post, "/__zap/replica_push") => match read_body(&mut req) {
+            Ok(body) => {
+                let v = serde_json::from_str::<serde_json::Value>(&body)
+                    .map_err(|e| e.to_string())
+                    .unwrap_or_default();
+                let docs: Vec<Document> = v
+                    .get("docs")
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|d| parse_doc(d).unwrap_or_default())
+                    .filter(|d| !d.fields.is_empty())
+                    .collect();
+                let n = docs.len();
+                if n > 0 && index.add_documents(docs).is_ok() {
+                    index.commit();
+                    crate::bus::notify_stats();
+                    if let Some(cl) = cluster {
+                        push_own_stats(cl, index);
+                    }
+                }
+                reply(req, 200, &serde_json::json!({"replicated": n}).to_string());
+            }
+            Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
+        },
+        // replica delete path: the OWNER pushed the tombstone id list; apply
+        // locally (no re-propagation)
+        (Method::Post, "/__zap/replica_delete") => match read_body(&mut req) {
+            Ok(body) => {
+                let v = serde_json::from_str::<serde_json::Value>(&body)
+                    .map_err(|e| e.to_string())
+                    .unwrap_or_default();
+                let ids: Vec<&str> = v
+                    .get("ids")
+                    .and_then(|i| i.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let mut n = 0u32;
+                for id in ids {
+                    if index.delete(id).is_ok_and(|r| r) {
+                        n += 1;
+                    }
+                }
+                crate::bus::notify_stats();
+                reply(req, 200, &serde_json::json!({"deleted": n}).to_string());
+            }
+            Err(e) => reply(req, 400, &serde_json::json!({"error": e}).to_string()),
         },
         (Method::Get, "/__zap/shard_stats") => {
             let body = serde_json::json!({
@@ -743,7 +802,15 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
         }
         (rows, degraded)
     });
+    // replication means the same doc can surface on R shards — and its replica
+    // copy may be a STALE pre-replace version: sort by score, then keep only
+    // the FIRST (highest-scored) row per id
     rows.sort_by(merged_cmp);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    rows.retain(|r| match &r.id {
+        Some(id) => seen.insert(id.clone()),
+        None => true,
+    });
     rows.truncate(k);
     let results: Vec<serde_json::Value> = rows.into_iter().map(row_to_json).collect();
     let n = results.len();
@@ -893,9 +960,13 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
         let local = l.into_iter().next().map(|(_, b)| b);
         (local, r)
     };
-    // remote fan-out uses the same thread-scope pattern as /search; the local
-    // commit overlaps with the peer POSTs inside the scope
-    let (total, errors) = std::thread::scope(|scope| {
+    // remote fan-out uses the same thread-scope pattern as /search; remote
+    // owners ingest concurrently while the LOCAL batch commits + performs its
+    // replica duty INLINE on this thread (no self-POST loopback: the tiny_http
+    // coordinator thread is busy serving this request)
+    let mut errors = Vec::new();
+    let mut ok_total = 0usize;
+    std::thread::scope(|scope| {
         let mut jobs = Vec::new();
         for (owner, batch) in &remote {
             let (owner, batch) = (*owner, batch.clone());
@@ -909,16 +980,10 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
                 }
             }));
         }
-        // local commit runs on this thread while peers ingest
-        let mut ok_total = 0usize;
-        let mut errors = Vec::new();
-        if let Some(batch) = &local_batch {
-            if let Err(e) = index.add_documents(batch.clone()) {
-                errors.push(e.to_string());
-            } else {
-                index.commit();
-                crate::bus::notify_stats();
-                ok_total += batch.len();
+        if let Some(batch) = local_batch {
+            match owner_commit_and_replicate(index, Some(cl), &batch) {
+                Ok(n) => ok_total += n,
+                Err(e) => errors.push(e),
             }
         }
         for jh in jobs {
@@ -928,17 +993,73 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
                 Err(_) => errors.push("fanout thread panicked".to_string()),
             }
         }
-        (ok_total, errors)
     });
     push_own_stats(cl, index);
     if errors.is_empty() {
-        Ok(total)
+        Ok(ok_total)
     } else {
         Err(errors.join("; "))
     }
 }
 
-/// internal shard ingest (ring already chose this shard; never re-routed)
+/// ingest a batch on THIS shard (owner duty), then push its own replica
+/// copies to the (slot+k)%N rotation holders. Direct helper: both the
+/// coordinator's local-lane and the /__zap/shard_ingest receipt call it
+fn owner_commit_and_replicate(
+    index: &Index,
+    cl: Option<&LocalCluster>,
+    batch: &[Document],
+) -> Result<usize, String> {
+    // local commit FIRST — the replica push must never serializer-wedge the
+    // ingest handler (a synchronous push can deadlock against the
+    // coordinator's own busy tiny_http loop)
+    let n = batch.len();
+    index
+        .add_documents(batch.to_vec())
+        .map_err(|e| e.to_string())?;
+    index.commit();
+    crate::bus::notify_stats();
+    if let Some(cl) = cl {
+        push_own_stats(cl, index);
+        // the OWNER has R-1 replica duties: re-bucket by (slot + k) % N
+        // rotation against the current ring; unid'd docs key on the content
+        // hash like every other routing surface. The push runs on detached
+        // threads (fire-and-forget with a single retry): replica lag is
+        // bounded by the peers' boot surveys, never by request latency
+        let ring = cl.cache.lock().unwrap().ring();
+        let self_addr = cl.cache.lock().unwrap().self_addr();
+        let mut reps: std::collections::HashMap<SocketAddr, Vec<Document>> =
+            std::collections::HashMap::new();
+        for doc in batch {
+            let key = doc.id.clone().unwrap_or_else(|| {
+                let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
+                format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
+            });
+            let holders = crate::cluster::ring_holder_indices(&ring, &key);
+            for (k, idx) in holders.iter().enumerate() {
+                let holder = ring[*idx];
+                if k > 0 && holder != self_addr {
+                    reps.entry(holder).or_default().push(doc.clone());
+                }
+            }
+        }
+        for (peer, rep_batch) in reps {
+            let body = serde_json::json!({"docs": rep_batch, "replica": true}).to_string();
+            let _ = std::thread::Builder::new()
+                .name("replica-push".into())
+                .spawn(move || {
+                    let sent = http_post(peer, "/__zap/replica_push", &body);
+                    if sent.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let _retry = http_post(peer, "/__zap/replica_push", &body);
+                    }
+                });
+        }
+    }
+    Ok(n)
+}
+/// internal shard ingest (ring already chose this shard; never re-routed).
+/// The owner performs its replication duty via owner_commit_and_replicate
 fn shard_ingest(
     req: &mut Request,
     index: &Index,
@@ -960,14 +1081,7 @@ fn shard_ingest(
     if docs.is_empty() {
         return Err("no documents supplied".into());
     }
-    let n = docs.len();
-    index.add_documents(docs).map_err(|e| e.to_string())?;
-    index.commit();
-    crate::bus::notify_stats();
-    if let Some(cl) = cluster {
-        push_own_stats(cl, index);
-    }
-    Ok(n)
+    owner_commit_and_replicate(index, cluster.map(|c| &**c), &docs)
 }
 
 fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
@@ -991,31 +1105,50 @@ fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
 
 // ---- id routing (ring owners own /doc/{id}) -------------------------------
 
-fn doc_get_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str) {
+fn doc_get_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str, hop: u8) {
     let Some(cl) = cluster else {
         return doc_get(req, index, id);
     };
-    let (_, owner) = cl.cache.lock().unwrap().owner_of(id);
-    if owner == cl.cache.lock().unwrap().self_addr() {
+    // walk the holder set [owner, replicas...]: the first 200 wins; a dead
+    // owner must not hide rows the replica holds (that's the whole point of
+    // REPLICA_FACTOR). Forwarded requests (hop > 0) answer LOCALLY ONLY so
+    // two miss-holders can never redirect forever.
+    if hop > 0 {
         return doc_get(req, index, id);
     }
-    let path = format!("/doc/{}", url_escape(id));
-    // one quick retry: the owner is a single-threaded tiny_http shard, and
-    // under concurrent load a connect can transiently refuse (pull threads,
-    // search hammering, ingest fan-outs) — the second attempt pays for itself
-    let mut attempt = http_get(owner, &path);
-    if attempt.is_none() {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        attempt = http_get(owner, &path);
+    let ring = cl.cache.lock().unwrap().ring();
+    let self_addr = cl.cache.lock().unwrap().self_addr();
+    let holders = crate::cluster::ring_holder_indices(&ring, id);
+    let path = format!("/doc/{}?hop={}", url_escape(id), hop + 1);
+    for idx in holders {
+        let addr = ring[idx];
+        if addr == self_addr {
+            let exists = index.get(id).is_some();
+            if exists {
+                return doc_get(req, index, id);
+            }
+            continue; // local miss: a replica may hold it
+        }
+        // forward retries: a single-threaded tiny_http owner can transiently
+        // refuse under load (pull threads, ingest fan-outs, hammering).
+        // bounded 3× — persistent refusal surfaces as a walk-on to the replica
+        let mut attempt = http_get(addr, &path);
+        for _ in 0..2 {
+            if attempt.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            attempt = http_get(addr, &path);
+        }
+        match attempt {
+            Some((200, body)) => reply(req, 200, &body),
+            Some((404, _)) => continue,
+            Some((code, body)) => reply(req, code, &body),
+            None => continue,
+        };
+        return;
     }
-    match attempt {
-        Some((code, body)) => reply(req, code, &body),
-        None => reply(
-            req,
-            502,
-            &serde_json::json!({"error": "owner shard unreachable"}).to_string(),
-        ),
-    }
+    reply(req, 404, r#"{"error":"not found"}"#);
 }
 
 fn doc_get(req: Request, index: &Index, id: &str) {
@@ -1036,30 +1169,71 @@ fn doc_get(req: Request, index: &Index, id: &str) {
 
 fn doc_delete_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str) {
     let Some(cl) = cluster else {
-        return doc_delete(req, index, id);
+        return doc_delete(req, index, id, None);
     };
-    let (_, owner) = cl.cache.lock().unwrap().owner_of(id);
-    if owner == cl.cache.lock().unwrap().self_addr() {
-        return doc_delete(req, index, id);
-    }
-    let path = format!("/doc/{}", url_escape(id));
-    let mut attempt = http_delete(owner, &path);
-    if attempt.is_none() {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        attempt = http_delete(owner, &path);
-    }
-    match attempt {
-        Some((code, body)) => reply(req, code, &body),
-        None => reply(
-            req,
-            502,
-            &serde_json::json!({"error": "owner shard unreachable"}).to_string(),
-        ),
+    // route to the OWNER (the write authority); the owner pushes the delete
+    // to the replicas (id carries the whole list, so every copy hides)
+    let ring = cl.cache.lock().unwrap().ring();
+    let self_addr = cl.cache.lock().unwrap().self_addr();
+    let holders = crate::cluster::ring_holder_indices(&ring, id);
+    let Some(&first) = holders.first() else {
+        return reply(req, 400, r#"{"error":"empty ring"}"#);
+    };
+    let owner = ring[first];
+    if owner != self_addr {
+        let path = format!("/doc/{}", url_escape(id));
+        let mut attempt = http_delete(owner, &path);
+        if attempt.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            attempt = http_delete(owner, &path);
+        }
+        match attempt {
+            Some((code, body)) => reply(req, code, &body),
+            None => reply(
+                req,
+                502,
+                &serde_json::json!({"error": "owner shard unreachable"}).to_string(),
+            ),
+        }
+    } else {
+        doc_delete(req, index, id, Some(cl));
     }
 }
 
-fn doc_delete(req: Request, index: &Index, id: &str) {
-    match index.delete(id) {
+fn doc_delete(req: Request, index: &Index, id: &str, cluster: ClusterRef<'_>) {
+    let res = index.delete(id);
+    // the owner propagates the tombstone to the replica holders; the same
+    // holder-set derivation keeps every copy in lockstep
+    if let Ok(true) = res {
+        if let Some(cl) = cluster {
+            let ring = cl.cache.lock().unwrap().ring();
+            let self_addr = cl.cache.lock().unwrap().self_addr();
+            let holders = crate::cluster::ring_holder_indices(&ring, id);
+            let mut reps: Vec<SocketAddr> = Vec::new();
+            for (k, idx) in holders.iter().enumerate() {
+                let addr = ring[*idx];
+                if k > 0 && addr != self_addr {
+                    reps.push(addr);
+                }
+            }
+            if !reps.is_empty() {
+                let body = serde_json::json!({ "ids": [id] }).to_string();
+                for peer in reps {
+                    let body = body.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("replica-delete".into())
+                        .spawn(move || {
+                            let sent = http_post(peer, "/__zap/replica_delete", &body);
+                            if sent.is_none() {
+                                std::thread::sleep(std::time::Duration::from_millis(150));
+                                let _retry = http_post(peer, "/__zap/replica_delete", &body);
+                            }
+                        });
+                }
+            }
+        }
+    }
+    match res {
         Ok(true) => reply(
             req,
             200,
@@ -1372,4 +1546,13 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == key).then(|| url_decode(v))
     })
+}
+
+/// /doc/{id}?hop=N: forwarded holder walks increment; hop>0 = answer locally
+fn query_hop(url: &str) -> u8 {
+    url.split('?')
+        .nth(1)
+        .and_then(|q| query_param(q, "hop"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }

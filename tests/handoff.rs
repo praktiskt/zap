@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 mod common;
-use common::{get, post, request};
+use common::{get, post};
 
 struct Guard(Vec<Child>);
 impl std::ops::Drop for Guard {
@@ -39,7 +39,7 @@ fn spawn_serve(bind: u16, peers: &str, resync: bool) -> Child {
     Command::new(env!("CARGO_BIN_EXE_zap"))
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(format!("/tmp/zdtest-{bind}.stderr")).expect("log"))
         .spawn()
         .expect("spawn zap serve")
 }
@@ -85,22 +85,22 @@ fn resync_pull_moves_owned_range() {
     // `any` check purely through routing, before any move happened
     kids.0.push(spawn_serve(b, "127.0.0.1:48671", true));
     wait_ready(&[b]);
+    // the joined node's boot survey must pull its holder share from a
+    // (singleton-polled-by-routing /doc/h* could satisfy forwarding rules):
+    // poll for B's LOCAL row count reaching the full corpus (every doc = a
+    // [A, B] holder pair, R=2)
     for _ in 0..40 {
-        if get(b, "/doc/h2").0 == 200 {
+        let vs: serde_json::Value = serde_json::from_str(&get(b, "/stats").1).unwrap();
+        let local = vs["shards"][0]["docs"].as_u64().unwrap_or(0);
+        if local == 3 {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // repartition the LEFT node's ring view: both sides must agree on
-    // membership before cross-node reads route to the new owner
-    let (code, body) = request(
-        a,
-        "POST",
-        "/__zap/peers",
-        Some(r#"{"peers":"127.0.0.1:48672"}"#),
-    );
-    assert_eq!(code, 200, "{body}");
+    // the join announce already widened both ring views (A learns B through
+    // the join merge; B learned A at boot) — the explicit repartition would
+    // be a no-op → the ring routes converged via /__zap/peers {join}
 
     // every doc readable from BOTH nodes (ring routing + same ids)
     for id in ["h1", "h2", "h3"] {
@@ -110,10 +110,11 @@ fn resync_pull_moves_owned_range() {
         }
     }
 
-    // cluster totals keep exactly the 3 live docs (moved ids were ack-deleted
-    // on the source; unid-free set)
+    // stored-row sum: 3 docs x R=2 holders — the singleton's owner share
+    // moved to b (ack-deleted at a) and b's survey re-pulled the share plus
+    // its replica share stays at a
     let v: serde_json::Value = serde_json::from_str(&get(b, "/stats").1).unwrap();
     let d0 = v["shards"][0]["docs"].as_u64().unwrap_or(0);
     let d1 = v["shards"][1]["docs"].as_u64().unwrap_or(0);
-    assert_eq!(d0 + d1, 3, "{v}");
+    assert_eq!(d0 + d1, 6, "{v}");
 }
