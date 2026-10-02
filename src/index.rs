@@ -208,6 +208,11 @@ pub struct IndexSnapshot {
     /// live external id -> address (tombstoned docs excluded)
     pub ids: Arc<im::HashMap<String, DocAddr>>,
     pub generation: u64,
+    /// tombstone complement per segment (allowed probe), built ONCE per publish:
+    /// readers extend the lifetime via Arc instead of rebuilding the `1 - mask`
+    /// probe live (O(num_docs/8) bytes per segment per query whenever tombstones
+    /// exist). Empty masks stay absent.
+    pub allowed: Arc<HashMap<u32, RoaringBitmap>>,
 }
 
 pub struct Index {
@@ -294,6 +299,7 @@ impl Index {
                 segments: Vec::new(),
                 stats: Stats::empty(),
                 deleted: Arc::new(HashMap::new()),
+                allowed: Arc::new(HashMap::new()),
                 ids: Arc::new(im::HashMap::new()),
                 generation: 0,
             }),
@@ -682,6 +688,20 @@ impl Index {
             .filter(|(_, m)| !m.is_empty())
             .map(|(&si, m)| (si, m.clone()))
             .collect();
+        // complement bitmaps for the allowed probe: one build per publish
+        // (O(num_docs/8) per tombstoned segment) instead of one per query
+        let allowed: HashMap<u32, RoaringBitmap> = if deleted.is_empty() {
+            HashMap::new()
+        } else {
+            deleted
+                .iter()
+                .filter_map(|(&si, mask)| {
+                    let n = g.segments.get(si as usize)?.num_docs;
+                    let full: RoaringBitmap = (0..n).collect();
+                    Some((si, &full - mask))
+                })
+                .collect()
+        };
         let tombstoned: u64 = deleted.values().map(|m| m.len()).sum();
         let mut total_docs: u64 = 0;
         let mut sums: Vec<u64> = vec![0u64; nf];
@@ -777,6 +797,7 @@ impl Index {
                 df,
             },
             deleted: Arc::new(deleted),
+            allowed: Arc::new(allowed),
             ids,
             generation: g.generation,
         };
@@ -808,11 +829,10 @@ impl Index {
                 .par_iter()
                 .enumerate()
                 .map(|(si, seg)| {
-                    let mask = snap.deleted.get(&(si as u32)).filter(|m| !m.is_empty());
-                    let allowed: Option<RoaringBitmap> = mask.map(|m| {
-                        let full: RoaringBitmap = (0..seg.num_docs).collect();
-                        &full - m
-                    });
+                    // complement bitmap is precomputed on the snapshot: when
+                    // tombstones exist this used to rebuild `(0..num_docs)-mask`
+                    // per segment per query; now it is an Arc clone
+                    let allowed: Option<&RoaringBitmap> = snap.allowed.get(&(si as u32));
                     let mut collector = TopK::new(k);
                     // WAND-lite fast path needs a ctx closure bound to this collector;
                     // for non-Term nodes fall back to dense array evaluation
@@ -833,7 +853,7 @@ impl Index {
                                 None,
                                 seg,
                                 &ctx,
-                                allowed.as_ref(),
+                                allowed,
                                 &mut collector,
                             );
                         }
@@ -860,13 +880,8 @@ impl Index {
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
                             };
-                            let ds = crate::search::exec::eval_allowed(
-                                &node,
-                                None,
-                                seg,
-                                &ctx,
-                                allowed.as_ref(),
-                            );
+                            let ds =
+                                crate::search::exec::eval_allowed(&node, None, seg, &ctx, allowed);
                             for (i, doc) in ds.ids.iter().enumerate() {
                                 collector.push(
                                     DocAddr {
@@ -884,7 +899,10 @@ impl Index {
                         .filter(|h| {
                             // safety net for eval paths without an `allowed` probe
                             // (phrase, fuzzy, prefix): drop tombstoned docs
-                            !mask.is_some_and(|m| m.contains(h.addr.docid))
+                            !snap
+                                .deleted
+                                .get(&(si as u32))
+                                .is_some_and(|m| m.contains(h.addr.docid))
                         })
                         .map(|h| SearchHit {
                             addr: DocAddr {
