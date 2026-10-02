@@ -1,6 +1,7 @@
 //! term expansion + query tree evaluation against one segment
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fst::automaton::Levenshtein;
 use roaring::RoaringBitmap;
@@ -22,8 +23,9 @@ pub struct Stats {
     pub total_docs: u32,
     /// field id -> average doc length
     pub avg_len: Vec<f32>,
-    /// (field id, term) -> global doc frequency (Arc-shared across snapshots)
-    pub df: std::sync::Arc<HashMap<(u32, String), u32>>,
+    /// field id -> (term -> global doc frequency); two-level so lookups take a
+    /// borrowed `&str` (HashMap<(u32,String),_> forced a String alloc per probe)
+    pub df: std::sync::Arc<HashMap<u32, HashMap<String, u32>>>,
 }
 
 impl Stats {
@@ -37,7 +39,8 @@ impl Stats {
 
     pub fn df_of(&self, fid: u32, term: &str, fallback: u32) -> u32 {
         self.df
-            .get(&(fid, term.to_string()))
+            .get(&fid)
+            .and_then(|m| m.get(term))
             .copied()
             .unwrap_or(fallback)
     }
@@ -54,6 +57,11 @@ pub struct Ctx<'a> {
     pub analyzer: &'a Analyzer,
     /// provider of the current top-k heap threshold (block-max WAND pruning)
     pub threshold: &'a dyn Fn() -> f32,
+    /// query-term -> [stemmed, raw] resolved ONCE per query (stem_word is a
+    /// snowball pass + alloc; per-segment recomputation costs segments×fields
+    /// per term). Rc so per-call "clones" are refcount bumps. Terms missing
+    /// from the map fall back to live stemming.
+    pub stems: &'a HashMap<String, [Option<Arc<str>>; 2]>,
 }
 
 impl Ctx<'_> {
@@ -89,14 +97,60 @@ fn glob_match(term: &str, pat: &[char]) -> bool {
     pi == m
 }
 
-/// [stemmed, raw] variants of one term; raw is None when the stem is identical
+/// collect the distinct term strings a query will stem (Term leaves, phrase terms)
+fn collect_terms<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
+    match node {
+        Node::Term(t) => out.push(t),
+        Node::Phrase { terms, .. } => {
+            for t in terms {
+                out.push(t.as_str());
+            }
+        }
+        Node::Field { node, .. } | Node::Not(node) => collect_terms(node, out),
+        Node::Or(items) | Node::And(items) => {
+            for it in items {
+                collect_terms(it, out);
+            }
+        }
+        Node::Fuzzy { .. } | Node::Prefix(_) | Node::Wildcard(_) => {}
+    }
+}
+
+/// build the per-query stem cache: distinct query terms -> [stemmed, raw]
+pub fn stem_cache(analyzer: &Analyzer, node: &Node) -> HashMap<String, [Option<Arc<str>>; 2]> {
+    let mut terms = Vec::new();
+    collect_terms(node, &mut terms);
+    terms.sort_unstable();
+    terms.dedup();
+    let mut out = HashMap::with_capacity(terms.len() * 2);
+    for t in terms {
+        let (raw, pair) = stem_pair_raw(analyzer, t);
+        let pair = pair.map(|o| o.map(Arc::from));
+        out.entry(raw).or_insert(pair);
+    }
+    out
+}
+
+/// raw term -> [stemmed, raw] variants; raw is None when the stem is identical
 /// (at most 1 alloc per call)
-fn stem_pair(ctx: &Ctx, t: &str) -> [Option<String>; 2] {
-    let stem = ctx.analyzer.stem_word(t);
-    if stem == t {
+fn stem_pair_raw(analyzer: &Analyzer, t: &str) -> (String, [Option<String>; 2]) {
+    let stem = analyzer.stem_word(t);
+    let pair = if stem == t {
         [Some(stem), None]
     } else {
         [Some(stem), Some(t.to_string())]
+    };
+    (t.to_string(), pair)
+}
+
+/// per-segment stem lookup: cache hit = Rc refcount bump, miss = live stemming
+fn stem_pair(ctx: &Ctx, t: &str) -> [Option<Arc<str>>; 2] {
+    match ctx.stems.get(t) {
+        Some(pair) => pair.clone(),
+        None => {
+            let (_, p) = stem_pair_raw(ctx.analyzer, t);
+            p.map(|o| o.map(Arc::from))
+        }
     }
 }
 
@@ -124,15 +178,12 @@ pub fn eval_term_stream(
     let Node::Term(t) = node else {
         return false;
     };
-    for fid in scope_ids(scope, ctx) {
+    for fid in scope_iter(scope, ctx) {
         for st in stem_pair(ctx, t).into_iter().flatten() {
             let Some(info) = seg.term(fid, &st) else {
                 continue;
             };
-            let idf = bm25_idf(
-                ctx.stats.df_of(fid, st.as_str(), info.df),
-                ctx.stats.total_docs,
-            );
+            let idf = bm25_idf(ctx.stats.df_of(fid, &st, info.df), ctx.stats.total_docs);
             let mut r = seg.reader(&info);
             let mut seen_block = usize::MAX;
             let norms = seg.norms(fid);
@@ -199,13 +250,11 @@ pub fn eval_allowed(
     match node {
         Node::Term(t) => {
             let mut acc = DocScores::default();
-            for fid in scope_ids(scope, ctx) {
+            for fid in scope_iter(scope, ctx) {
                 for st in stem_pair(ctx, t).into_iter().flatten() {
                     if let Some(info) = seg.term(fid, &st) {
-                        let idf = bm25_idf(
-                            ctx.stats.df_of(fid, st.as_str(), info.df),
-                            ctx.stats.total_docs,
-                        );
+                        let idf =
+                            bm25_idf(ctx.stats.df_of(fid, &st, info.df), ctx.stats.total_docs);
                         let ts = term_scores_allowed(
                             &info,
                             seg.blob(),
@@ -225,7 +274,7 @@ pub fn eval_allowed(
         Node::Fuzzy { term, distance } => {
             let dist = (*distance as u32).min(2);
             let mut acc = DocScores::default();
-            for fid in scope_ids(scope, ctx) {
+            for fid in scope_iter(scope, ctx) {
                 // fresh automaton ownership per field (moved into the fst walk)
                 let lev = match Levenshtein::new(term, dist) {
                     Ok(l) => l,
@@ -240,7 +289,7 @@ pub fn eval_allowed(
         Node::Prefix(p) | Node::Wildcard(p) => {
             let prefix = matches!(node, Node::Prefix(_));
             let mut acc = DocScores::default();
-            for fid in scope_ids(scope, ctx) {
+            for fid in scope_iter(scope, ctx) {
                 // leading literal segment bounds the FST range; remaining glob chars filter
                 let head_end = if prefix {
                     p.len()
@@ -263,7 +312,7 @@ pub fn eval_allowed(
                 return eval_allowed(&Node::Term(terms[0].clone()), scope, seg, ctx, allowed);
             }
             let mut acc = DocScores::default();
-            for fid in scope_ids(scope, ctx) {
+            for fid in scope_iter(scope, ctx) {
                 let infos: Vec<Option<TermInfo>> = terms.iter().map(|t| seg.term(fid, t)).collect();
                 if infos.iter().any(|i| i.is_none()) {
                     continue;
@@ -327,7 +376,7 @@ pub fn eval_allowed(
             let all_terms =
                 positives.iter().all(|p| matches!(p, Node::Term(_))) && excluded.is_empty();
             if all_terms {
-                let term_infos: Vec<Vec<(u32, String, TermInfo)>> = positives
+                let term_infos: Vec<Vec<(u32, Arc<str>, TermInfo)>> = positives
                     .iter()
                     .map(|p| resolve_term_positives(p, scope, seg, ctx))
                     .collect();
@@ -379,12 +428,12 @@ fn resolve_term_positives(
     scope: Option<u32>,
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
-) -> Vec<(u32, String, TermInfo)> {
+) -> Vec<(u32, Arc<str>, TermInfo)> {
     let Node::Term(t) = p else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for fid in scope_ids(scope, ctx) {
+    for fid in scope_iter(scope, ctx) {
         for st in stem_pair(ctx, t).into_iter().flatten() {
             if let Some(info) = seg.term(fid, &st) {
                 out.push((fid, st, info));
@@ -396,7 +445,7 @@ fn resolve_term_positives(
 
 /// bm25 score series for a resolved term set (plain walk)
 fn term_infos_doc_scores(
-    infos: &[(u32, String, TermInfo)],
+    infos: &[(u32, Arc<str>, TermInfo)],
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
     allowed: Option<&roaring::RoaringBitmap>,
@@ -421,8 +470,8 @@ fn term_infos_doc_scores(
 
 /// galloping driver-walk over two resolved single-variant postings; smallest df drives
 fn and_two_infos(
-    a_infos: &[(u32, String, TermInfo)],
-    b_infos: &[(u32, String, TermInfo)],
+    a_infos: &[(u32, Arc<str>, TermInfo)],
+    b_infos: &[(u32, Arc<str>, TermInfo)],
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
     allowed: Option<&roaring::RoaringBitmap>,
@@ -501,9 +550,9 @@ fn and_two_infos(
 /// two-pass large-df AND: docid_vec decode, driver list split into P chunks,
 /// per-chunk independent gallop over [chunk_start, chunk_end)
 fn and_two_infos_par(
-    drv: &(u32, String, TermInfo),
+    drv: &(u32, Arc<str>, TermInfo),
     idf_drv: f32,
-    oth: &(u32, String, TermInfo),
+    oth: &(u32, Arc<str>, TermInfo),
     idf_oth: f32,
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
@@ -545,9 +594,9 @@ fn and_two_infos_par(
             let chunk_slice = &drv_vec[ci * per..((ci + 1) * per).min(drv_vec.len())];
             // the pool's live threshold closure is not Sync; each chunk builds
             // its own idle-threshold ctx (dense-AND scoring never consults it)
-            let shared = (ctx.schema, ctx.stats, ctx.params, ctx.analyzer);
+            let shared = (ctx.schema, ctx.stats, ctx.params, ctx.analyzer, ctx.stems);
             jobs.push(scope.spawn(move || {
-                let (schema, stats, params, analyzer) = shared;
+                let (schema, stats, params, analyzer, stems) = shared;
                 let zero_thr = || 0.0f32;
                 let cctx = Ctx {
                     schema,
@@ -555,6 +604,7 @@ fn and_two_infos_par(
                     params,
                     analyzer,
                     threshold: &zero_thr,
+                    stems,
                 };
                 and_chunk(
                     lo,
@@ -592,9 +642,9 @@ fn and_chunk(
     lo: u32,
     hi: u32,
     drv_slice: &[u32],
-    drv: &(u32, String, TermInfo),
+    drv: &(u32, Arc<str>, TermInfo),
     idf_drv: f32,
-    oth: &(u32, String, TermInfo),
+    oth: &(u32, Arc<str>, TermInfo),
     idf_oth: f32,
     seg: &crate::segment::SegmentReader,
     ctx: &Ctx,
@@ -661,10 +711,27 @@ fn filter_by(ds: &DocScores, probe: &RoaringBitmap) -> DocScores {
     out
 }
 
-fn scope_ids(scope: Option<u32>, ctx: &Ctx) -> Vec<u32> {
+/// zero-alloc field sweep: explicit scope field or every schema field. The old
+/// `scope_ids` allocated a Vec per node per segment (recursion depth × fields).
+fn scope_iter(scope: Option<u32>, ctx: &Ctx) -> ScopeIter {
     match scope {
-        Some(f) => vec![f],
-        None => (0..ctx.schema.num_fields() as u32).collect(),
+        Some(f) => ScopeIter::One(std::iter::once(f)),
+        None => ScopeIter::All(0..ctx.schema.num_fields() as u32),
+    }
+}
+
+enum ScopeIter {
+    One(std::iter::Once<u32>),
+    All(std::ops::Range<u32>),
+}
+
+impl Iterator for ScopeIter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            ScopeIter::One(it) => it.next(),
+            ScopeIter::All(it) => it.next(),
+        }
     }
 }
 

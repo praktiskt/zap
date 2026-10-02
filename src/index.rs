@@ -35,7 +35,7 @@ pub enum IndexError {
 const MAX_SEGMENTS: usize = 8;
 
 /// cached publish stats: (per-field length sums, global df, total docs)
-type StatsCache = (Vec<u64>, Arc<HashMap<(u32, String), u32>>, u64);
+type StatsCache = (Vec<u64>, Arc<HashMap<u32, HashMap<String, u32>>>, u64);
 
 /// per-segment merge scan: (per-field norm slices, store blocks, external ids)
 type SegScan = (Vec<Vec<u16>>, Vec<Box<[u8]>>, Vec<Option<String>>);
@@ -506,7 +506,7 @@ impl Index {
         let (sums, df, total_docs_check) = if merged_now {
             // merge purged docids: fold from the merged segment alone
             let mut sums = vec![0u64; nf];
-            let mut raw_df: HashMap<(u32, String), u32> = HashMap::new();
+            let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
             let mut total = 0u64;
             for s in &g.segments {
                 total += s.num_docs as u64;
@@ -515,7 +515,7 @@ impl Index {
                         sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
-                        *raw_df.entry((fid, term)).or_insert(0) += info.df;
+                        *raw_df.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                     }
                 }
             }
@@ -531,7 +531,11 @@ impl Index {
                     };
                     (s, d, t)
                 }
-                None => (vec![0u64; nf], HashMap::<(u32, String), u32>::new(), 0u64),
+                None => (
+                    vec![0u64; nf],
+                    HashMap::<u32, HashMap<String, u32>>::new(),
+                    0u64,
+                ),
             };
             for s in &g.segments[base_len..] {
                 total += s.num_docs as u64;
@@ -540,7 +544,7 @@ impl Index {
                         sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
-                        *df_mut.entry((fid, term)).or_insert(0) += info.df;
+                        *df_mut.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                     }
                 }
             }
@@ -705,7 +709,7 @@ impl Index {
         let tombstoned: u64 = deleted.values().map(|m| m.len()).sum();
         let mut total_docs: u64 = 0;
         let mut sums: Vec<u64> = vec![0u64; nf];
-        let mut df: Arc<HashMap<(u32, String), u32>> = Arc::new(HashMap::new());
+        let mut df: Arc<HashMap<u32, HashMap<String, u32>>> = Arc::new(HashMap::new());
         if segment_change {
             // commit path: the caller refreshed the envelope in commit_locked
             // (cache stays in g — later commits fold into it); boot has none
@@ -714,7 +718,7 @@ impl Index {
                 df = d.clone();
                 total_docs = *t;
             } else {
-                let mut raw_df: HashMap<(u32, String), u32> = HashMap::new();
+                let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
                 for s in &g.segments {
                     total_docs += s.num_docs as u64;
                     for fid in 0..nf as u32 {
@@ -722,7 +726,7 @@ impl Index {
                             sums[fid as usize] += norms.iter().map(|x| *x as u64).sum::<u64>();
                         }
                         for (term, info) in s.stream_terms(fid) {
-                            *raw_df.entry((fid, term)).or_insert(0) += info.df;
+                            *raw_df.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                         }
                     }
                 }
@@ -820,6 +824,9 @@ impl Index {
         let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
         let snap = self.snap.load();
         let params = self.params();
+        // resolve query-term stems once (snowball + alloc per DISTINCT term),
+        // shared read-only across the per-segment rayon tasks
+        let stems = crate::search::exec::stem_cache(&self.analyzer, &node);
         // single Term: streaming walk with a live topk threshold (block-max WAND);
         // generic nodes: dense arrays + collector push. Tombstoned docs are masked
         // through the `allowed` probe (zero cost when no tombstones exist).
@@ -847,6 +854,7 @@ impl Index {
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
+                                stems: &stems,
                             };
                             crate::search::exec::eval_term_stream(
                                 &node,
@@ -879,6 +887,7 @@ impl Index {
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
+                                stems: &stems,
                             };
                             let ds =
                                 crate::search::exec::eval_allowed(&node, None, seg, &ctx, allowed);

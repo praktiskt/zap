@@ -118,14 +118,15 @@ fn build_index(docs: &[String]) -> (Arc<Index>, Stats, Arc<zap::segment::Segment
     let seg = index.segments_snapshot()[0].clone();
     // stats rebuilt the same way index.publish_snapshot does
     let mut stats = Stats::empty();
-    let mut df = std::collections::HashMap::new();
+    let mut df: std::collections::HashMap<u32, std::collections::HashMap<String, u32>> =
+        std::collections::HashMap::new();
     let mut total: u64 = 0;
     let mut sums: Vec<u64> = vec![0; 1];
     for s in &index.segments_snapshot() {
         total += s.num_docs as u64;
         sums[0] += s.sum_field_len(0);
         for (term, info) in s.stream_terms(0) {
-            *df.entry((0u32, term)).or_insert(0) += info.df;
+            *df.entry(0u32).or_default().entry(term).or_insert(0) += info.df;
         }
     }
     stats.total_docs = total as u32;
@@ -141,8 +142,23 @@ fn ctx_of<'a>(index: &'a Arc<Index>, stats: &'a Stats) -> Ctx<'a> {
         params: &Bm25Params { k1: 1.2, b: 0.75 },
         analyzer: index.analyzer(),
         threshold: &(|| 0.0),
+        stems: &EMPTY_STEMS,
     }
 }
+
+fn ctx_prune_of<'a>(index: &'a Arc<Index>, stats: &'a Stats, thr: &'a dyn Fn() -> f32) -> Ctx<'a> {
+    Ctx {
+        schema: index.schema(),
+        stats,
+        params: &Bm25Params { k1: 1.2, b: 0.75 },
+        analyzer: index.analyzer(),
+        threshold: thr,
+        stems: &EMPTY_STEMS,
+    }
+}
+
+static EMPTY_STEMS: std::sync::LazyLock<std::collections::HashMap<String, [Option<Arc<str>>; 2]>> =
+    std::sync::LazyLock::new(std::collections::HashMap::new);
 
 /// (doc text, score bits, docid)
 fn dense_topk(
@@ -229,13 +245,8 @@ proptest! {
             let dense = dense_topk(&node, &seg, &ctx, kk);
             let Some(kth) = dense.get(kk - 1) else { continue; };
             let thr_val = kth.score;
-            let ctx_prune = Ctx {
-                schema: index.schema(),
-                stats: &stats,
-                params: &Bm25Params { k1: 1.2, b: 0.75 },
-                analyzer: index.analyzer(),
-                threshold: &(move || thr_val),
-            };
+            let thr = move || thr_val;
+            let ctx_prune = ctx_prune_of(&index, &stats, &thr);
             let mut wcol = TopK::new(kk);
             eval_term_stream(&node, None, &seg, &ctx_prune, None, &mut wcol);
             let wand = wcol.into_sorted();

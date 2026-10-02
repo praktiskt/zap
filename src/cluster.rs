@@ -250,7 +250,8 @@ pub struct ClusterView {
 pub struct GlobalStats {
     pub total_docs: u32,
     pub sums: Vec<u64>,
-    pub df: HashMap<(u32, String), u32>,
+    /// field id -> (term -> df); two-level for borrowed &str lookups
+    pub df: HashMap<u32, HashMap<String, u32>>,
 }
 
 impl ClusterView {
@@ -299,11 +300,11 @@ impl ClusterView {
                     sums[i] += s;
                 }
             }
-            let mut df: HashMap<(u32, String), u32> = HashMap::new();
+            let mut df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
             let mut add = |env: &StatsEnvelope| {
                 for (k, v) in &env.df {
                     if let Some((fid, term)) = parse_df_key(k) {
-                        *df.entry((fid, term)).or_insert(0) += v;
+                        *df.entry(fid).or_default().entry(term).or_insert(0) += v;
                     }
                 }
             };

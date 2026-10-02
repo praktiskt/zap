@@ -58,10 +58,11 @@ fn stats_from_envelope(env: StatsEnvelope) -> Stats {
             1.0
         });
     }
-    let mut df = std::collections::HashMap::new();
+    let mut df: std::collections::HashMap<u32, std::collections::HashMap<String, u32>> =
+        std::collections::HashMap::new();
     for (k, v) in env.df {
         if let Some((fid, term)) = parse_df_key(&k) {
-            df.insert((fid, term), v);
+            df.entry(fid).or_default().insert(term, v);
         }
     }
     Stats {
@@ -75,8 +76,10 @@ fn stats_from_envelope(env: StatsEnvelope) -> Stats {
 fn envelope_from_stats(index: &Index, stats: &Stats) -> StatsEnvelope {
     let sums = index.field_sums();
     let mut df = std::collections::HashMap::new();
-    for ((fid, term), v) in stats.df.iter() {
-        df.insert(encode_df_key(*fid, term), *v);
+    for (fid, m) in stats.df.iter() {
+        for (term, v) in m.iter() {
+            df.insert(encode_df_key(*fid, term), *v);
+        }
     }
     StatsEnvelope {
         docs: stats.total_docs,
@@ -850,8 +853,10 @@ fn row_of_hit(index: &Index, h: &crate::search::SearchHit) -> Option<MergedRow> 
 /// merged global view on the wire
 fn global_to_envelope(g: crate::cluster::GlobalStats) -> StatsEnvelope {
     let mut df = std::collections::HashMap::new();
-    for ((fid, term), v) in g.df {
-        df.insert(encode_df_key(fid, &term), v);
+    for (fid, m) in g.df {
+        for (term, v) in m {
+            df.insert(encode_df_key(fid, &term), v);
+        }
     }
     StatsEnvelope {
         docs: g.total_docs,
