@@ -25,8 +25,7 @@ use std::sync::{Arc, Mutex};
 use tiny_http::{Method, Request, Response, Server};
 
 use crate::cluster::{
-    encode_df_key, http_delete, http_get, http_post, parse_df_key, LocalCluster, PeerCache,
-    PeerConfig, StatsEnvelope,
+    http_delete, http_get, http_post, LocalCluster, PeerCache, PeerConfig, StatsEnvelope,
 };
 use crate::index::Index;
 use crate::schema::Document;
@@ -58,33 +57,21 @@ fn stats_from_envelope(env: StatsEnvelope) -> Stats {
             1.0
         });
     }
-    let mut df: std::collections::HashMap<u32, std::collections::HashMap<String, u32>> =
-        std::collections::HashMap::new();
-    for (k, v) in env.df {
-        if let Some((fid, term)) = parse_df_key(&k) {
-            df.entry(fid).or_default().insert(term, v);
-        }
-    }
     Stats {
         total_docs: env.docs,
         avg_len: avg,
-        df: Arc::new(df),
+        df: env.df,
     }
 }
 
-/// absolute envelope from engine stats; sums recomputed from live norms
+/// absolute envelope from engine stats; sums come from the snapshot's exact
+/// live sums (maintained incrementally), df is an Arc move — both O(fields)
 fn envelope_from_stats(index: &Index, stats: &Stats) -> StatsEnvelope {
     let sums = index.field_sums();
-    let mut df = std::collections::HashMap::new();
-    for (fid, m) in stats.df.iter() {
-        for (term, v) in m.iter() {
-            df.insert(encode_df_key(*fid, term), *v);
-        }
-    }
     StatsEnvelope {
         docs: stats.total_docs,
         sums,
-        df,
+        df: stats.df.clone(),
         full: false,
     }
 }
@@ -790,8 +777,22 @@ fn row_from_json(v: &serde_json::Value) -> MergedRow {
 fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, String) {
     let stats: Stats = {
         let mut view = cl.view.lock().unwrap();
-        let env = global_to_envelope(view.stats());
-        stats_from_envelope(env)
+        let g = view.stats();
+        Stats {
+            total_docs: g.total_docs,
+            avg_len: g
+                .sums
+                .iter()
+                .map(|s| {
+                    if g.total_docs > 0 {
+                        *s as f32 / g.total_docs as f32
+                    } else {
+                        1.0
+                    }
+                })
+                .collect(),
+            df: g.df,
+        }
     };
     let peers = cl.cache.lock().unwrap().peers();
     let q_owned = q.to_owned();
@@ -852,16 +853,10 @@ fn row_of_hit(index: &Index, h: &crate::search::SearchHit) -> Option<MergedRow> 
 
 /// merged global view on the wire
 fn global_to_envelope(g: crate::cluster::GlobalStats) -> StatsEnvelope {
-    let mut df = std::collections::HashMap::new();
-    for (fid, m) in g.df {
-        for (term, v) in m {
-            df.insert(encode_df_key(fid, &term), v);
-        }
-    }
     StatsEnvelope {
         docs: g.total_docs,
         sums: g.sums,
-        df,
+        df: g.df,
         full: false,
     }
 }
@@ -1310,13 +1305,28 @@ fn push_own_stats(cl: &LocalCluster, index: &Index) {
         } else {
             let last = cl.last_pushed.lock().unwrap();
             let base = last.as_ref().expect("just checked");
-            let mut diff = std::collections::HashMap::new();
-            for (k, v) in &env.df {
-                if base.df.get(k) != Some(v) {
-                    diff.insert(k.clone(), *v);
+            // fast path: same df map (no vocabulary change since last push)
+            // -> pointer-identical Arc, empty diff without an O(vocab) scan
+            if Arc::ptr_eq(&env.df, &base.df) {
+                Arc::new(std::collections::HashMap::new())
+            } else {
+                let mut diff: std::collections::HashMap<
+                    u32,
+                    std::collections::HashMap<String, u32>,
+                > = std::collections::HashMap::new();
+                for (fid, m) in env.df.iter() {
+                    let Some(base_m) = base.df.get(fid) else {
+                        diff.insert(*fid, m.clone());
+                        continue;
+                    };
+                    for (term, v) in m.iter() {
+                        if base_m.get(term) != Some(v) {
+                            diff.entry(*fid).or_default().insert(term.clone(), *v);
+                        }
+                    }
                 }
+                Arc::new(diff)
             }
-            diff
         },
         full: first,
     };

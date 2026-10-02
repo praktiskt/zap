@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// fnv-1a 64 (no external deps); ring hash + delta keys
@@ -220,26 +220,38 @@ pub struct LocalCluster {
     pub last_pushed: Mutex<Option<StatsEnvelope>>,
 }
 
-/// serialized stats envelope (wire + stored per peer); df entries are
-/// ABSOLUTE doc frequencies keyed `"<field id>:<term>"`
+/// serialized stats envelope (wire + stored per peer); df is ABSOLUTE doc
+/// frequencies per (field id, term), Arc-shared so envelope BUILDS are O(1)
+/// (was: one "fid:term" String per vocabulary term per push — O(vocab) allocs
+/// on the ingest critical path in cluster mode)
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsEnvelope {
     /// live doc count of the reporting shard
     pub docs: u32,
     /// per-field token sums for avg_len computation
     pub sums: Vec<u64>,
-    /// df change set: "" empty = use as full replacement for this peer's map
-    pub df: HashMap<String, u32>,
+    /// df change set: empty = use as full replacement for this peer's map
+    pub df: Arc<HashMap<u32, HashMap<String, u32>>>,
     /// true when `df` is the peer's whole map (full resync)
     pub full: bool,
+}
+
+/// per-peer absolute stats; df kept OWNED so gossip delta folds are O(changed)
+/// (an Arc'd df would force an O(vocab) rematerialization per delta apply)
+#[derive(Default, Clone)]
+pub struct PeerStats {
+    pub docs: u32,
+    pub sums: Vec<u64>,
+    pub df: HashMap<u32, HashMap<String, u32>>,
 }
 
 /// per-peer absolute stats + the merged global snapshot a query scores with
 #[derive(Default)]
 pub struct ClusterView {
-    /// peer address -> last known absolute envelope of that shard
-    peers: HashMap<SocketAddr, StatsEnvelope>,
-    /// this node's own contribution, rewritten at every local commit
+    /// peer address -> last known absolute stats of that shard
+    peers: HashMap<SocketAddr, PeerStats>,
+    /// this node's own contribution, rewritten at every local commit (Arc df:
+    /// O(1) set — the envelope build is an Arc clone)
     own: StatsEnvelope,
     /// cached merged view (invalidated by any update)
     global: Option<GlobalStats>,
@@ -250,8 +262,8 @@ pub struct ClusterView {
 pub struct GlobalStats {
     pub total_docs: u32,
     pub sums: Vec<u64>,
-    /// field id -> (term -> df); two-level for borrowed &str lookups
-    pub df: HashMap<u32, HashMap<String, u32>>,
+    /// field id -> (term -> df); Arc so the per-query clone is O(1)
+    pub df: Arc<HashMap<u32, HashMap<String, u32>>>,
 }
 
 impl ClusterView {
@@ -265,15 +277,25 @@ impl ClusterView {
     pub fn merge_peer(&mut self, peer: SocketAddr, env: StatsEnvelope) {
         // drop keys not present in a full update
         if env.full {
-            self.peers.insert(peer, env);
+            self.peers.insert(
+                peer,
+                PeerStats {
+                    docs: env.docs,
+                    sums: env.sums,
+                    df: (*env.df).clone(),
+                },
+            );
             self.global = None;
             return;
         }
         let cur = self.peers.entry(peer).or_default();
         cur.docs = env.docs;
         cur.sums = env.sums.clone();
-        for (k, v) in &env.df {
-            cur.df.insert(k.clone(), *v);
+        for (fid, m) in env.df.iter() {
+            let per = cur.df.entry(*fid).or_default();
+            for (term, v) in m.iter() {
+                per.insert(term.clone(), *v);
+            }
         }
         self.global = None;
     }
@@ -301,21 +323,26 @@ impl ClusterView {
                 }
             }
             let mut df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
-            let mut add = |env: &StatsEnvelope| {
-                for (k, v) in &env.df {
-                    if let Some((fid, term)) = parse_df_key(k) {
-                        *df.entry(fid).or_default().entry(term).or_insert(0) += v;
+            // own: Arc'd map, read-only fold
+            for (fid, m) in self.own.df.iter() {
+                let per = df.entry(*fid).or_default();
+                for (term, v) in m.iter() {
+                    *per.entry(term.clone()).or_insert(0) += v;
+                }
+            }
+            // peers: owned maps, read-only fold
+            for p in self.peers.values() {
+                for (fid, m) in p.df.iter() {
+                    let per = df.entry(*fid).or_default();
+                    for (term, v) in m.iter() {
+                        *per.entry(term.clone()).or_insert(0) += v;
                     }
                 }
-            };
-            add(&self.own);
-            for p in self.peers.values() {
-                add(p);
             }
             self.global = Some(GlobalStats {
                 total_docs: docs,
                 sums,
-                df,
+                df: Arc::new(df),
             });
         }
         self.global.as_ref().expect("just built").clone()

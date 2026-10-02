@@ -35,7 +35,10 @@ pub enum IndexError {
 const MAX_SEGMENTS: usize = 8;
 
 /// cached publish stats: (per-field length sums, global df, total docs)
-type StatsCache = (Vec<u64>, Arc<HashMap<u32, HashMap<String, u32>>>, u64);
+/// cached publish stats: (global df, total docs). Per-field LIVE sums live in
+/// `IndexInner.live_sums` (exact, tombstone-masked) instead — the gossip path
+/// needs them tombstone-exact and the cache's all-doc sums never were.
+type StatsCache = (Arc<HashMap<u32, HashMap<String, u32>>>, u64);
 
 /// per-segment merge scan: (per-field norm slices, store blocks, external ids)
 type SegScan = (Vec<Vec<u16>>, Vec<Box<[u8]>>, Vec<Option<String>>);
@@ -203,6 +206,10 @@ pub struct DocPayload {
 pub struct IndexSnapshot {
     pub segments: Vec<Arc<SegmentReader>>,
     pub stats: Stats,
+    /// exact per-field token sums over LIVE docs (tombstoned excluded) —
+    /// maintained incrementally so gossip envelopes cost O(fields), not a
+    /// full norms rescan per push
+    pub sums: Vec<u64>,
     /// per-segment tombstone masks (segment index -> deleted docids)
     pub deleted: Arc<HashMap<u32, RoaringBitmap>>,
     /// live external id -> address (tombstoned docs excluded)
@@ -237,6 +244,10 @@ struct IndexInner {
     /// extend via O(1) clone + O(log n) update per appended doc — no copy of the
     /// map per commit. Hot ids live in `hot_ids` until commit.
     ids_arc: Arc<im::HashMap<String, DocAddr>>,
+    /// exact per-field token sums over LIVE docs (tombstoned excluded).
+    /// boot: full rescan; commit fold: += new segments; delete: -= deleted doc;
+    /// merge: recomputed from the merged (purged) segment.
+    live_sums: Vec<u64>,
     /// (sums, df, total_docs) cached between segment changes (tombstone-only publishes)
     stats_cache: Option<StatsCache>,
     /// ids of docs pending in hot lanes (uncommitted, invisible to readers)
@@ -285,9 +296,27 @@ impl Index {
             }
             None => None,
         };
+        let nf = schema.num_fields();
         let (handle, segs, tomb) = match disk {
             Some((h, segs, t)) => (Some(h), segs, t),
             None => (None, Vec::new(), HashMap::new()),
+        };
+        // boot live-sum rescan: tombstone-masked (the cache-less path in
+        // publish_snapshot counts tombstoned docs — these sums must not)
+        let live_sums: Vec<u64> = {
+            let mut sums = vec![0u64; nf];
+            for (si, s) in segs.iter().enumerate() {
+                let mask = tomb.get(&(si as u32));
+                for (fid, norms) in s.field_norms.iter().enumerate() {
+                    sums[fid] += norms
+                        .iter()
+                        .enumerate()
+                        .filter(|(d, _)| !mask.is_some_and(|m| m.contains(*d as u32)))
+                        .map(|(_, v)| *v as u64)
+                        .sum::<u64>();
+                }
+            }
+            sums
         };
         let index = Arc::new(Self {
             disk: handle,
@@ -298,6 +327,7 @@ impl Index {
             snap: ArcSwap::from_pointee(IndexSnapshot {
                 segments: Vec::new(),
                 stats: Stats::empty(),
+                sums: Vec::new(),
                 deleted: Arc::new(HashMap::new()),
                 allowed: Arc::new(HashMap::new()),
                 ids: Arc::new(im::HashMap::new()),
@@ -309,6 +339,7 @@ impl Index {
                 segments: segs,
                 deleted: tomb,
                 ids_arc: Arc::new(im::HashMap::new()),
+                live_sums,
                 stats_cache: None,
                 hot_ids: HashSet::new(),
                 generation: 0,
@@ -503,55 +534,50 @@ impl Index {
         // appends stream only the frozen lanes and fold their df/sums/docs into
         // the cached envelope; merges/boot fall back to one full rescan
         let nf = self.schema.num_fields();
-        let (sums, df, total_docs_check) = if merged_now {
+        let (df, total_docs_check) = if merged_now {
             // merge purged docids: fold from the merged segment alone
-            let mut sums = vec![0u64; nf];
             let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
             let mut total = 0u64;
             for s in &g.segments {
                 total += s.num_docs as u64;
                 for fid in 0..nf as u32 {
                     if let Some(nm) = s.norms(fid) {
-                        sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                        g.live_sums[fid as usize] = nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
                         *raw_df.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                     }
                 }
             }
-            (sums, Arc::new(raw_df), total)
+            (Arc::new(raw_df), total)
         } else {
             // take the mutable map back when no live snapshot still holds it;
             // else deep-clone (a query was executing mid-commit)
-            let (mut sums, mut df_mut, mut total) = match g.stats_cache.take() {
-                Some((s, d, t)) => {
+            let (mut df_mut, mut total) = match g.stats_cache.take() {
+                Some((d, t)) => {
                     let d = match Arc::try_unwrap(d) {
                         Ok(m) => m,
                         Err(arc) => (*arc).clone(),
                     };
-                    (s, d, t)
+                    (d, t)
                 }
-                None => (
-                    vec![0u64; nf],
-                    HashMap::<u32, HashMap<String, u32>>::new(),
-                    0u64,
-                ),
+                None => (HashMap::<u32, HashMap<String, u32>>::new(), 0u64),
             };
             for s in &g.segments[base_len..] {
                 total += s.num_docs as u64;
                 for fid in 0..nf as u32 {
                     if let Some(nm) = s.norms(fid) {
-                        sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                        g.live_sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
                         *df_mut.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                     }
                 }
             }
-            (sums, Arc::new(df_mut), total)
+            (Arc::new(df_mut), total)
         };
         let total_docs = total_docs_check;
-        g.stats_cache = Some((sums.clone(), df, total_docs));
+        g.stats_cache = Some((df, total_docs));
         let new_from = if merged_now { None } else { Some(base_len) };
         self.publish_snapshot(g, true, new_from);
         if let Some(d) = &self.disk {
@@ -579,6 +605,18 @@ impl Index {
             eprintln!("[delete] id={id} old={:?}", old);
         }
         g.deleted.entry(old.segment).or_default().insert(old.docid);
+        // exact live-sum maintenance: subtract the tombstoned doc's norms
+        // (copy the small norm slice out first: seg is an Arc from the shared list)
+        if let Some(seg) = g.segments.get(old.segment as usize).cloned() {
+            let norms: Vec<Option<u16>> = (0..g.live_sums.len())
+                .map(|fid| seg.norms(fid as u32).map(|nm| nm[old.docid as usize]))
+                .collect();
+            for (fid, sums) in g.live_sums.iter_mut().enumerate() {
+                if let Some(n) = norms[fid] {
+                    *sums -= n as u64;
+                }
+            }
+        }
         g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
         self.publish_snapshot(&mut g, false, None);
         if let Some(d) = &self.disk {
@@ -708,13 +746,11 @@ impl Index {
         };
         let tombstoned: u64 = deleted.values().map(|m| m.len()).sum();
         let mut total_docs: u64 = 0;
-        let mut sums: Vec<u64> = vec![0u64; nf];
         let mut df: Arc<HashMap<u32, HashMap<String, u32>>> = Arc::new(HashMap::new());
         if segment_change {
             // commit path: the caller refreshed the envelope in commit_locked
             // (cache stays in g — later commits fold into it); boot has none
-            if let Some((s, d, t)) = g.stats_cache.as_ref() {
-                sums = s.clone();
+            if let Some((d, t)) = g.stats_cache.as_ref() {
                 df = d.clone();
                 total_docs = *t;
             } else {
@@ -722,21 +758,17 @@ impl Index {
                 for s in &g.segments {
                     total_docs += s.num_docs as u64;
                     for fid in 0..nf as u32 {
-                        if let Some(norms) = s.norms(fid) {
-                            sums[fid as usize] += norms.iter().map(|x| *x as u64).sum::<u64>();
-                        }
                         for (term, info) in s.stream_terms(fid) {
                             *raw_df.entry(fid).or_default().entry(term).or_insert(0) += info.df;
                         }
                     }
                 }
                 df = Arc::new(raw_df);
-                g.stats_cache = Some((sums.clone(), df.clone(), total_docs));
+                g.stats_cache = Some((df.clone(), total_docs));
             }
         } else {
             // segments unchanged: reuse cached totals/sums/df (Arc clone, no deep copy)
-            if let Some((s, d, t)) = &g.stats_cache {
-                sums = s.clone();
+            if let Some((d, t)) = &g.stats_cache {
                 df = d.clone();
                 total_docs = *t;
             }
@@ -788,7 +820,8 @@ impl Index {
             segments: g.segments.clone(),
             stats: Stats {
                 total_docs: live as u32,
-                avg_len: sums
+                avg_len: g
+                    .live_sums
                     .iter()
                     .map(|s| {
                         if live > 0 {
@@ -800,6 +833,7 @@ impl Index {
                     .collect(),
                 df,
             },
+            sums: g.live_sums.clone(),
             deleted: Arc::new(deleted),
             allowed: Arc::new(allowed),
             ids,
@@ -942,23 +976,11 @@ impl Index {
         self.snap.load().stats.clone()
     }
 
-    /// live per-field token sums (tombstoned docs excluded)
+    /// live per-field token sums (tombstoned docs excluded) — O(fields): the
+    /// exact sums are maintained incrementally on the snapshot (this used to
+    /// re-scan every norm of every segment per call, i.e. O(corpus) per gossip push)
     pub fn field_sums(&self) -> Vec<u64> {
-        let nf = self.schema.num_fields();
-        let mut sums = vec![0u64; nf];
-        let snap = self.snap.load();
-        for (si, s) in snap.segments.iter().enumerate() {
-            let mask = snap.deleted.get(&(si as u32));
-            for (fid, norms) in s.field_norms.iter().enumerate() {
-                sums[fid] += norms
-                    .iter()
-                    .enumerate()
-                    .filter(|(d, _)| !mask.is_some_and(|m| m.contains(*d as u32)))
-                    .map(|(_, v)| *v as u64)
-                    .sum::<u64>();
-            }
-        }
-        sums
+        self.snap.load().sums.clone()
     }
 
     pub fn num_segments(&self) -> usize {
