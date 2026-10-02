@@ -663,7 +663,15 @@ impl Index {
         let mut cursor = after;
         for (si, seg) in snap.segments.iter().enumerate() {
             let mask = snap.deleted.get(&(si as u32));
-            for docid in 0..seg.num_docs {
+            // advance the inner loop to the cursor instead of filtering from
+            // docid 0 (the old `addr <= cur continue` walk made a full handoff
+            // O(pages × corpus): page i re-scanned all i×limit prior docids)
+            let start_docid = match cursor {
+                Some((cur_si, cur_d)) if (cur_si as usize) == si => cur_d + 1,
+                Some((cur_si, _)) if (cur_si as usize) > si => continue,
+                _ => 0,
+            };
+            for docid in start_docid..seg.num_docs {
                 let addr = (si as u32, docid);
                 if let Some(cur) = cursor {
                     if addr <= cur {
