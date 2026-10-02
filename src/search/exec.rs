@@ -561,69 +561,53 @@ fn and_two_infos_par(
     // pass 1: docid_vecs are cheap decodes (postprobe 1.4ns/doc) and give exact
     // chunk boundaries for both cursors
     let drv_vec = seg.reader(&drv.2).docid_vec();
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    // pass 2: split the driver list over the SHARED rayon pool (the old code
+    // spawned raw std::thread::scope workers sized by available_parallelism:
+    // double-booked against rayon's per-segment tasks on multi-segment queries,
+    // and the equal-chunk split had no work-stealing under skew)
+    use rayon::prelude::*;
+    let p = rayon::current_num_threads()
+        .max(1)
+        .min(drv_vec.len() / 4096)
         .max(1);
-    let p = threads.min(drv_vec.len() / 4096).max(1);
-    let per = drv_vec.len().div_ceil(p);
-    // chunk boundaries include the start doc of each chunk (inclusive-lo) and
-    // the next chunk's start doc (exclusive-hi); tail chunk closes past max
-    let bounds: Vec<u32> = (0..=p)
-        .map(|i| {
-            let idx = i * per;
-            if idx >= drv_vec.len() {
-                // tail bound: past the last known driver doc + 1
-                drv_vec
-                    .last()
-                    .copied()
-                    .map_or(u32::MAX, |d| d.saturating_add(1))
-            } else {
-                drv_vec[idx]
-            }
-        })
-        .collect();
-    let chunk_results: Vec<DocScores> = std::thread::scope(|scope| {
-        let mut jobs = Vec::new();
-        for ci in 0..p {
-            let lo = bounds[ci];
-            let hi = bounds[ci + 1]; // exclusive docid bound
-            if lo >= hi {
-                continue;
-            }
-            let chunk_slice = &drv_vec[ci * per..((ci + 1) * per).min(drv_vec.len())];
+    let per = drv_vec.len().div_ceil(p).max(1);
+    let last_doc = drv_vec.last().copied().unwrap_or(u32::MAX);
+    let chunk_results: Vec<DocScores> = drv_vec
+        .par_chunks(per)
+        .enumerate()
+        .map(|(ci, chunk_slice)| {
+            // chunk bounds: inclusive-lo = own start doc, exclusive-hi = next
+            // chunk's start doc; tail chunk closes past the last known driver doc
+            let lo = chunk_slice[0];
+            let hi = drv_vec
+                .get((ci + 1) * per)
+                .copied()
+                .unwrap_or(last_doc.saturating_add(1));
             // the pool's live threshold closure is not Sync; each chunk builds
             // its own idle-threshold ctx (dense-AND scoring never consults it)
-            let shared = (ctx.schema, ctx.stats, ctx.params, ctx.analyzer, ctx.stems);
-            jobs.push(scope.spawn(move || {
-                let (schema, stats, params, analyzer, stems) = shared;
-                let zero_thr = || 0.0f32;
-                let cctx = Ctx {
-                    schema,
-                    stats,
-                    params,
-                    analyzer,
-                    threshold: &zero_thr,
-                    stems,
-                };
-                and_chunk(
-                    lo,
-                    hi,
-                    chunk_slice,
-                    drv,
-                    idf_drv,
-                    oth,
-                    idf_oth,
-                    seg,
-                    &cctx,
-                    allowed,
-                )
-            }));
-        }
-        jobs.into_iter()
-            .map(|j| j.join().unwrap_or_default())
-            .collect()
-    });
+            let zero_thr = || 0.0f32;
+            let cctx = Ctx {
+                schema: ctx.schema,
+                stats: ctx.stats,
+                params: ctx.params,
+                analyzer: ctx.analyzer,
+                threshold: &zero_thr,
+                stems: ctx.stems,
+            };
+            and_chunk(
+                lo,
+                hi,
+                chunk_slice,
+                drv,
+                idf_drv,
+                oth,
+                idf_oth,
+                seg,
+                &cctx,
+                allowed,
+            )
+        })
+        .collect();
     DocScores {
         ids: chunk_results
             .iter()
