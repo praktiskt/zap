@@ -462,14 +462,16 @@ impl Index {
         let mut g = self.inner.lock().unwrap();
         let lanes = g.hot.len().max(1);
         let chunk = deduped.len().div_ceil(lanes).max(1);
-        let mut chunks: Vec<Vec<Document>> = Vec::with_capacity(g.hot.len());
-        for chunk in deduped.chunks(chunk) {
-            chunks.push(chunk.to_vec());
+        // split into per-lane vecs WITHOUT cloning the documents (the old
+        // `chunk.to_vec()` deep-copied every field String per ingest)
+        let mut chunks: Vec<Vec<Document>> = (0..g.hot.len()).map(|_| Vec::new()).collect();
+        for (i, d) in deduped.into_iter().enumerate() {
+            chunks[i / chunk].push(d);
         }
-        while chunks.len() < g.hot.len() {
-            chunks.push(Vec::new());
-        }
-        let hot_ids_new: Vec<String> = deduped.iter().filter_map(|d| d.id.clone()).collect();
+        let hot_ids_new: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.iter().filter_map(|d| d.id.clone()))
+            .collect();
         let errors: Vec<Option<String>> = {
             let builders: &mut Vec<SegmentBuilder> = &mut g.hot;
             builders

@@ -442,16 +442,14 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
         // commit, DO NOT re-push (replication terminates here)
         (Method::Post, "/__zap/replica_push") => match read_body(&mut req) {
             Ok(body) => {
-                let v = serde_json::from_str::<serde_json::Value>(&body)
-                    .map_err(|e| e.to_string())
-                    .unwrap_or_default();
-                let docs: Vec<Document> = v
-                    .get("docs")
-                    .and_then(|d| d.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|d| parse_doc(d).unwrap_or_default())
+                // typed parse: one pass, no Value tree + per-row clones
+                let wire: DocsWire = serde_json::from_str(&body).unwrap_or(DocsWire {
+                    docs: Vec::new(),
+                    replica: true,
+                });
+                let docs: Vec<Document> = wire
+                    .docs
+                    .into_iter()
                     .filter(|d| !d.fields.is_empty())
                     .collect();
                 let n = docs.len();
@@ -986,7 +984,11 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
             let (owner, batch) = (*owner, batch.clone());
             jobs.push(scope.spawn(move || {
                 let n = batch.len();
-                let body = serde_json::json!({"docs": batch}).to_string();
+                let body = serde_json::to_string(&DocsWire {
+                    docs: batch,
+                    replica: false,
+                })
+                .unwrap_or_default();
                 match http_post(owner, "/__zap/shard_ingest", &body) {
                     Some((200, _)) => Ok(n),
                     Some((code, b)) => Err(format!("shard {owner}: {code} {b}")),
@@ -995,7 +997,7 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
             }));
         }
         if let Some(batch) = local_batch {
-            match owner_commit_and_replicate(index, Some(cl), &batch) {
+            match owner_commit_and_replicate(index, Some(cl), batch) {
                 Ok(n) => ok_total += n,
                 Err(e) => errors.push(e),
             }
@@ -1022,29 +1024,18 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
 fn owner_commit_and_replicate(
     index: &Index,
     cl: Option<&LocalCluster>,
-    batch: &[Document],
+    batch: Vec<Document>,
 ) -> Result<usize, String> {
-    // local commit FIRST — the replica push must never serializer-wedge the
-    // ingest handler (a synchronous push can deadlock against the
-    // coordinator's own busy tiny_http loop)
     let n = batch.len();
-    index
-        .add_documents(batch.to_vec())
-        .map_err(|e| e.to_string())?;
-    index.commit();
-    crate::bus::notify_stats();
     if let Some(cl) = cl {
-        push_own_stats(cl, index);
-        // the OWNER has R-1 replica duties: re-bucket by (slot + k) % N
-        // rotation against the current ring; unid'd docs key on the content
-        // hash like every other routing surface. The push runs on detached
-        // threads (fire-and-forget with a single retry): replica lag is
-        // bounded by the peers' boot surveys, never by request latency
+        // replica re-bucketing happens BEFORE the consume: the docs move into
+        // the engine without any defensive deep clone (old code ran
+        // batch.to_vec()/clone() chains for a double copy of every field)
         let ring = cl.cache.lock().unwrap().ring();
         let self_addr = cl.cache.lock().unwrap().self_addr();
         let mut reps: std::collections::HashMap<SocketAddr, Vec<Document>> =
             std::collections::HashMap::new();
-        for doc in batch {
+        for doc in &batch {
             let key = doc.id.clone().unwrap_or_else(|| {
                 let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
                 format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
@@ -1058,7 +1049,13 @@ fn owner_commit_and_replicate(
             }
         }
         for (peer, rep_batch) in reps {
-            let body = serde_json::json!({"docs": rep_batch, "replica": true}).to_string();
+            // replica copies MUST be cloned (they ship to another shard);
+            // build the wire body from a typed struct, not a Value tree
+            let body = serde_json::to_string(&DocsWire {
+                docs: rep_batch,
+                replica: true,
+            })
+            .unwrap_or_default();
             let _ = std::thread::Builder::new()
                 .name("replica-push".into())
                 .spawn(move || {
@@ -1070,7 +1067,24 @@ fn owner_commit_and_replicate(
                 });
         }
     }
+    // local commit — the replica push must never serializer-wedge the
+    // ingest handler (a synchronous push can deadlock against the
+    // coordinator's own busy tiny_http loop)
+    index.add_documents(batch).map_err(|e| e.to_string())?;
+    index.commit();
+    crate::bus::notify_stats();
+    if let Some(cl) = cl {
+        push_own_stats(cl, index);
+    }
     Ok(n)
+}
+
+/// typed ingest wire shape: avoids the serde_json::Value tree roundtrip
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DocsWire {
+    docs: Vec<Document>,
+    #[serde(default)]
+    replica: bool,
 }
 /// internal shard ingest (ring already chose this shard; never re-routed).
 /// The owner performs its replication duty via owner_commit_and_replicate
@@ -1083,19 +1097,16 @@ fn shard_ingest(
     if body.is_empty() {
         return Err("empty ingest body".into());
     }
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let arr = v
-        .get("docs")
-        .and_then(|d| d.as_array())
-        .ok_or("missing docs array")?;
-    let mut docs = Vec::with_capacity(arr.len());
-    for it in arr {
-        docs.push(parse_doc(it)?);
-    }
+    let wire: DocsWire = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let docs: Vec<Document> = wire
+        .docs
+        .into_iter()
+        .filter(|d| !d.fields.is_empty())
+        .collect();
     if docs.is_empty() {
         return Err("no documents supplied".into());
     }
-    owner_commit_and_replicate(index, cluster.map(|c| &**c), &docs)
+    owner_commit_and_replicate(index, cluster.map(|c| &**c), docs)
 }
 
 fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
