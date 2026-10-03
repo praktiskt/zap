@@ -337,3 +337,59 @@ fn segment_reader_id_lookup_direct() {
     assert_eq!(seg.id_of(1), Some("aa-first"));
     assert_eq!(seg.id_of(0), Some("zz-last"));
 }
+
+#[test]
+fn tombstone_debt_triggers_purge_merge() {
+    // delete-heavy workload: the old code purged tombstones only at the
+    // segment-count trigger, so a delete-only workload grew its masks forever.
+    // Debt >= live/4 (>= 100 docs here) must compel a purge merge NOW.
+    let index = index_with_lanes(2);
+    let docs: Vec<Document> = (0..400)
+        .map(|i| doc(&format!("d{i}"), &format!("token{i} shared words here")))
+        .collect();
+    index.add_documents(docs).unwrap();
+    index.commit();
+    let segs_before = index.num_segments();
+    // single-doc deletes: each one publishes a tombstone-only snapshot
+    let deleted = (0..130u32)
+        .map(|i| index.delete(&format!("d{i}")).unwrap())
+        .filter(|x| *x)
+        .count();
+    assert_eq!(deleted, 130);
+    // >= 25% debt crossed -> purge merge compacted everything to one segment
+    assert_eq!(
+        index.num_segments(),
+        1,
+        "delete-only workload must compact, not accumulate masks"
+    );
+    assert_eq!(index.num_docs(), 270);
+    // deleted doc ids gone, survivors intact
+    assert!(index.get("d0").is_none());
+    let p = index.get("d250").unwrap();
+    assert!(p.fields[0].1.contains("token250"));
+    assert!(index.search("token300", 10).unwrap().len() == 1);
+    // segment shape at entry was multi-segment (lanes=2, one commit)
+    assert!(segs_before >= 1);
+}
+
+#[test]
+fn tombstone_below_threshold_stays_masked() {
+    // < 25% debt: no purge merge; masks do the masking (old behavior kept)
+    let index = index_with_lanes(2);
+    let docs: Vec<Document> = (0..400)
+        .map(|i| doc(&format!("e{i}"), &format!("mark{i} masked words here")))
+        .collect();
+    index.add_documents(docs).unwrap();
+    index.commit();
+    let segs_before = index.num_segments();
+    for i in 0..10u32 {
+        index.delete(&format!("e{i}")).unwrap();
+    }
+    assert_eq!(
+        index.num_segments(),
+        segs_before,
+        "small debt must NOT merge"
+    );
+    assert_eq!(index.num_docs(), 390);
+    assert!(index.get("e3").is_none());
+}

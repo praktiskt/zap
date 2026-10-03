@@ -35,6 +35,15 @@ pub enum IndexError {
 /// segments at 8 lanes, exactly like the previous 4-segment budget produced.
 const MAX_SEGMENTS: usize = 8;
 
+/// tombstone-debt compaction: purge-debt (deleted, not yet merged docs) costs
+/// per-query mask work on every affected segment and keeps dead postings/df
+/// alive. Merge REBUILDS to purge once the debt is large enough relative to
+/// the live set AND big enough that the merge's O(live) save-what-lives
+/// rewrite amortizes (below MERGE_TOMB_MIN a purge is cheaper left pending).
+const MERGE_TOMB_MIN: u64 = 128;
+/// merge when debt >= live/MERGE_TOMB_RATIO (4 => at >= 25% of live docs)
+const MERGE_TOMB_RATIO: u64 = 4;
+
 /// cached publish stats: (per-field length sums, global df, total docs)
 /// cached publish stats: (global df, total docs). Per-field LIVE sums live in
 /// `IndexInner.live_sums` (exact, tombstone-masked) instead — the gossip path
@@ -644,10 +653,14 @@ impl Index {
         };
 
         // PERFORM (no locks): seal + freeze lanes in parallel; every lane comes
-        // back with 0 or 1 sealed segments in lane order (same as the old rayon
-        // collect, plus pipeline overlap of enqueue vs seal)
+        // back with 0 or 1 sealed segments in lane order (same order as the old
+        // rayon collect). The WAIT runs on the calling thread — rayon must not
+        // block on foreign replies: the lane workers' freeze itself consumes
+        // rayon slots (R22 parallel encode), and recv() inside the pool would
+        // starve it dead under concurrent commits (caught live by parallel
+        // test binaries). Workers seal independently; the loop waits only as
+        // long as the slowest lane.
         let new_segs: Vec<Arc<SegmentReader>> = {
-            use rayon::prelude::*;
             let mut rxs = Vec::with_capacity(lanes);
             for lane in 0..lanes {
                 let (msg, rx) = LaneMsg::seal_pair();
@@ -655,17 +668,27 @@ impl Index {
                     rxs.push(rx);
                 }
             }
-            rxs.into_par_iter()
-                .map(|rx| rx.recv().unwrap_or_default())
-                .flatten()
-                .collect()
+            let mut out = Vec::new();
+            for rx in rxs {
+                out.extend(rx.recv().unwrap_or_default());
+            }
+            out
         };
         let mut segs = job_segments;
         let base_len = segs.len();
         segs.extend(new_segs);
         let mut merged_now = false;
         let mut deleted_out = job_deleted;
-        if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
+        // compaction triggers: the segment-count trigger (bounded fan-out between
+        // merges) OR tombstone debt — a delete-heavy / replace-heavy workload
+        // used to never merge, so its tombstone masks (paid per query per
+        // segment) and purged-at-merge df/sum rows only ever disappeared when
+        // ingest happened to push the count over the trigger
+        let tombstone_debt: u64 = deleted_out.values().map(|m| m.len()).sum();
+        let live_total: u64 = segs.iter().map(|s| s.num_docs as u64).sum::<u64>() - tombstone_debt;
+        let tomb_trigger =
+            tombstone_debt >= MERGE_TOMB_MIN && tombstone_debt * MERGE_TOMB_RATIO >= live_total;
+        if segs.len() >= MAX_SEGMENTS * lanes.max(1) || tomb_trigger {
             let masks_all: Vec<RoaringBitmap> = (0..segs.len())
                 .map(|i| deleted_out.get(&(i as u32)).cloned().unwrap_or_default())
                 .collect();
@@ -719,7 +742,6 @@ impl Index {
             (Arc::new(df_mut), total)
         };
 
-        eprintln!("[t] commit install");
         // INSTALL: under the inner lock; the disk persist (serialize + fsync)
         // runs OUTSIDE it — the installed Arc list + tombstones are what gets written
         {
@@ -739,9 +761,7 @@ impl Index {
     }
 
     pub fn commit(&self) {
-        eprintln!("[t] commit() writer wait");
         let _w = self.writer.lock().unwrap();
-        eprintln!("[t] commit() writer got");
         self.commit_locked();
     }
 
@@ -750,7 +770,6 @@ impl Index {
     /// Holds `writer` for the whole tombstone: a delete must never race a merge's
     /// mask fold or a publish (the merged segment re-indexes docids).
     pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
-        eprintln!("[t] delete enter");
         let flush = {
             let g = self.inner.lock().unwrap();
             g.hot_ids.contains(id)
@@ -781,10 +800,24 @@ impl Index {
             }
         }
         g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
-        self.publish_snapshot(&mut g, false, None);
-        if let Some(d) = &self.disk {
-            d.persist(&g.segments, &g.deleted)
-                .expect("disk persist tombstone");
+        // tombstone-debt compaction: when this delete pushes purge debt over
+        // the ratio threshold, run the merge NOW (seals nothing, purges the
+        // tombstones, publishes + persists) instead of a tombstone-only
+        // publish — otherwise a delete-only workload would grow its masks
+        // forever (the old code only purged on the segment-count trigger)
+        let debt: u64 = g.deleted.values().map(|m| m.len()).sum();
+        let live: u64 = g.segments.iter().map(|s| s.num_docs as u64).sum::<u64>()
+            - g.deleted.values().map(|m| m.len()).sum::<u64>();
+        let compact = debt >= MERGE_TOMB_MIN && debt * MERGE_TOMB_RATIO >= live;
+        if compact {
+            drop(g);
+            self.commit_locked();
+        } else {
+            self.publish_snapshot(&mut g, false, None);
+            if let Some(d) = &self.disk {
+                d.persist(&g.segments, &g.deleted)
+                    .expect("disk persist tombstone");
+            }
         }
         Ok(true)
     }
