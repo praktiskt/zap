@@ -7,6 +7,8 @@ Single binary, everything lives in the process; no mmap, no persistence, no serv
 ## What zap is
 - Rust FTS: BM25 (+ phrase window bonus, field boosts), boolean/phrase/slop/prefix/wildcard/fuzzy queries
 - Segment architecture: immutable sealed segments (FST term dict, delta-varint postings, skip anchors) + a parallel hot-ingest lane builder; log-tier merge
+- ingest v2 (R27+): per-lane WORKER threads own the SegmentBuilders — /ingest enqueues (LaneMsg::Add) and pays only enqueue + upfront field validation; commit = LaneMsg::Seal fan-out + rayon collect of frozen segs (FIFO per lane seals after queued adds); writer mutex (single writer) serializes take->work->install cycles, inner lock held only at install, no empty-commit gate (unkeyed docs live in lane queues)
+- serve v2 (R27+): worker-POOLED tiny_http accept loop (4..=32 workers drain server.recv() — tiny_http Server is Sync); owner replica pushes + replica_delete WAIT before replying (read-your-writes; safe since every node has free workers — the old detached pushes were only correct by single-threaded accept ordering)
 - block-max WAND top-k with live thresholds; galloping seeks power both phase cursors and block pruning
 - arccos-swap snapshots: single writer, lock-free readers
 - HTTP serve subcommand (tiny_http): /ingest /search /stats /commit /health
