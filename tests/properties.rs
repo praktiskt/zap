@@ -250,14 +250,6 @@ proptest! {
             let mut wcol = TopK::new(kk);
             eval_term_stream(&node, None, &seg, &ctx_prune, None, &mut wcol);
             let wand = wcol.into_sorted();
-            let d_res = dense.iter().map(|h| h.addr).collect::<Vec<_>>();
-            let w_res = wand.iter().map(|h| h.addr).collect::<Vec<_>>();
-            if d_res != w_res {
-                eprintln!("DIVG kk={kk} dense={d_res:?} wand={w_res:?}");
-                eprintln!("docs={docs:?} query={query:?}");
-                eprintln!("scores={:?}", dense.iter().map(|h| (h.addr.docid, h.score)).collect::<Vec<_>>());
-                panic!("kk={kk} wand-pruned topk diverged");
-            }
             assert_eq!(
                 dense.iter().map(|h| h.addr).collect::<Vec<_>>(),
                 wand.iter().map(|h| h.addr).collect::<Vec<_>>(),
@@ -393,16 +385,22 @@ proptest! {
                     .expect("nonempty");
                 let ref_min = refs.iter().map(|(_, s)| s.clone()).min().expect("nonempty");
                 assert_eq!(ref_min, min_score, "query {q}: min score differs");
-                let got_above: Vec<(String, String)> = got
+                let mut got_above: Vec<(String, String)> = got
                     .iter()
                     .filter(|(_, s)| *s != min_score)
                     .cloned()
                     .collect();
-                let ref_above: Vec<(String, String)> = refs
+                let mut ref_above: Vec<(String, String)> = refs
                     .iter()
                     .filter(|(_, s)| *s != min_score)
                     .cloned()
                     .collect();
+                // unordered: R28's stable-segid addresses make equal-scored
+                // docs from DIFFERENT segments order by build-varying segid
+                // (the repo convention holds: cross-build top-k compares as
+                // multisets, never as ordered results)
+                got_above.sort();
+                ref_above.sort();
                 assert_eq!(ref_above, got_above, "query {q}: above-tie docs differ");
             }
         }
