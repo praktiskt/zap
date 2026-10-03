@@ -167,20 +167,31 @@ fn served_maps(
             }
         });
     }
-    std::thread::spawn(move || {
-        while !shutdown.load(Ordering::SeqCst) {
-            match server.recv() {
-                Ok(req) => {
-                    let index = index.clone();
-                    handle(req, &index, served.as_ref());
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 32);
+    let server = Arc::new(server);
+    for wi in 0..workers {
+        let server = server.clone();
+        let index = index.clone();
+        let served = served.clone();
+        // detached: serve() returns the bound addr immediately (tests + the
+        // CLI shell expect it); workers exit when shutdown flips or recv errors
+        let _ = std::thread::Builder::new()
+            .name(format!("zap-worker{wi}"))
+            .spawn(move || {
+                while !shutdown.load(Ordering::SeqCst) {
+                    match server.recv() {
+                        Ok(req) => handle(req, &index, served.as_ref()),
+                        Err(e) => {
+                            eprintln!("[zap serve] recv error: {e}");
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[zap serve] recv error: {e}");
-                    break;
-                }
-            }
-        }
-    });
+            });
+    }
     addr
 }
 
@@ -1048,33 +1059,35 @@ fn owner_commit_and_replicate(
                 }
             }
         }
-        for (peer, rep_batch) in reps {
-            // replica copies MUST be cloned (they ship to another shard);
-            // build the wire body from a typed struct, not a Value tree
-            let body = serde_json::to_string(&DocsWire {
-                docs: rep_batch,
-                replica: true,
-            })
-            .unwrap_or_default();
-            let _ = std::thread::Builder::new()
-                .name("replica-push".into())
-                .spawn(move || {
+        // local commit first (authoritative row), then WAIT for the replica
+        // pushes: read-your-writes across the ring — the /ingest response now
+        // guarantees R-holder coverage. This used to be fire-and-forget
+        // DETACHED pushes because synchronous pushes dead-locked the
+        // single-threaded tiny_http receiver chain (A's handler waits on B's
+        // handler which waits on A's busy loop); with the worker pool the
+        // receiving node has free workers, so push-waiting cannot wedge the
+        // chain anymore. Replica copies MUST be cloned (they ship to another
+        // shard); the wire body comes from a typed struct, not a Value tree.
+        index.add_documents(batch).map_err(|e| e.to_string())?;
+        index.commit();
+        crate::bus::notify_stats();
+        push_own_stats(cl, index);
+        std::thread::scope(|scope| {
+            for (peer, rep_batch) in reps {
+                let body = serde_json::to_string(&DocsWire {
+                    docs: rep_batch,
+                    replica: true,
+                })
+                .unwrap_or_default();
+                scope.spawn(move || {
                     let sent = http_post(peer, "/__zap/replica_push", &body);
                     if sent.is_none() {
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         let _retry = http_post(peer, "/__zap/replica_push", &body);
                     }
                 });
-        }
-    }
-    // local commit — the replica push must never serializer-wedge the
-    // ingest handler (a synchronous push can deadlock against the
-    // coordinator's own busy tiny_http loop)
-    index.add_documents(batch).map_err(|e| e.to_string())?;
-    index.commit();
-    crate::bus::notify_stats();
-    if let Some(cl) = cl {
-        push_own_stats(cl, index);
+            }
+        });
     }
     Ok(n)
 }
@@ -1243,18 +1256,22 @@ fn doc_delete(req: Request, index: &Index, id: &str, cluster: ClusterRef<'_>) {
             }
             if !reps.is_empty() {
                 let body = serde_json::json!({ "ids": [id] }).to_string();
-                for peer in reps {
-                    let body = body.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("replica-delete".into())
-                        .spawn(move || {
+                // wait for the tombstone pushes: read-your-deletes across the
+                // ring — a /doc right after DELETE must not resurrect the row
+                // from a not-yet-pushed replica (the old detached pushes
+                // relied on the single-threaded accept queue ordering)
+                std::thread::scope(|scope| {
+                    for peer in reps {
+                        let body = body.clone();
+                        scope.spawn(move || {
                             let sent = http_post(peer, "/__zap/replica_delete", &body);
                             if sent.is_none() {
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 let _retry = http_post(peer, "/__zap/replica_delete", &body);
                             }
                         });
-                }
+                    }
+                });
             }
         }
     }
