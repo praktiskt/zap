@@ -138,10 +138,3 @@ fn probe(seg: &zap::segment::SegmentReader, info: &zap::posting::TermInfo) {
     );
     black_box(sink);
 }
-
-/// A/B edge appended (probe-bp): same postings, two decode formats.
-/// (a) engine varint walk (the 7.6ns/doc floor); (b) bitpacking 4x SIMD
-/// blocks: pack the SAME [delta][tf] arrays per 128-doc block at fixed
-/// widths chosen per block (SIMD BitPacker4x), unpack forward + seek.
-#[cfg(feature = "zzz")]
-fn unused() {}
