@@ -250,6 +250,14 @@ proptest! {
             let mut wcol = TopK::new(kk);
             eval_term_stream(&node, None, &seg, &ctx_prune, None, &mut wcol);
             let wand = wcol.into_sorted();
+            let d_res = dense.iter().map(|h| h.addr).collect::<Vec<_>>();
+            let w_res = wand.iter().map(|h| h.addr).collect::<Vec<_>>();
+            if d_res != w_res {
+                eprintln!("DIVG kk={kk} dense={d_res:?} wand={w_res:?}");
+                eprintln!("docs={docs:?} query={query:?}");
+                eprintln!("scores={:?}", dense.iter().map(|h| (h.addr.docid, h.score)).collect::<Vec<_>>());
+                panic!("kk={kk} wand-pruned topk diverged");
+            }
             assert_eq!(
                 dense.iter().map(|h| h.addr).collect::<Vec<_>>(),
                 wand.iter().map(|h| h.addr).collect::<Vec<_>>(),

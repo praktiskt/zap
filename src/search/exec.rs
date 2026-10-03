@@ -184,28 +184,36 @@ pub fn eval_term_stream(
                 continue;
             };
             let idf = bm25_idf(ctx.stats.df_of(fid, &st, info.df), ctx.stats.total_docs);
+            // hoisted per-(term,field) constants: the per-doc loop used to pay
+            // two divisions (len/avg + the score denominator) and three loop-
+            // invariant multiplies every posting
+            let fold = crate::search::term::Bm25Fold::new(idf, ctx.params, ctx.stats.avg_of(fid));
+            let norms = seg.norms(fid);
             let mut r = seg.reader(&info);
             let mut seen_block = usize::MAX;
-            let norms = seg.norms(fid);
             while let Some((doc, tf)) = r.advance() {
                 if let Some(al) = allowed {
                     if !al.contains(doc) {
                         continue;
                     }
                 }
+                let tf = tf as f32;
                 let blk = r.cur_block();
                 if blk != seen_block {
                     seen_block = blk;
                     if let Some((tf_max, len_min)) = r.block_bounds() {
-                        let tfm = tf_max.max(tf) as f32;
-                        let norm_min = if len_min > 0 {
-                            (1.0 - ctx.params.b)
-                                + ctx.params.b * (len_min as f32 / ctx.stats.avg_of(fid).max(1.0))
+                        let tfm = tf_max.max(tf as u32);
+                        // bound = fold.shape(tfm, len_min); len_min == 0 in a
+                        // norms-covered corpus scores itself with p1 (norm=1-b)
+                        // — only a fully norm-less FIELD falls back to the k1
+                        // form (score_fallback shape), matching its doc math
+                        let tfm = tfm as f32;
+                        let bound = if norms.is_some() {
+                            // anchor len_min is u32 in 8-bit lens always fits
+                            fold.bound(tfm, len_min as u16)
                         } else {
-                            1.0
+                            fold.pa * tfm / (tfm + fold.k1)
                         };
-                        let bound =
-                            idf * (tfm * (ctx.params.k1 + 1.0)) / (tfm + ctx.params.k1 * norm_min);
                         if bound < ctx.thr() {
                             match r.next_block_start() {
                                 Some(ns) => {
@@ -217,14 +225,10 @@ pub fn eval_term_stream(
                         }
                     }
                 }
-                let tf = tf as f32;
-                let norm = crate::search::term::norm_ratio(
-                    norms,
-                    doc,
-                    ctx.stats.avg_of(fid),
-                    ctx.params.b,
-                );
-                let w = idf * (tf * (ctx.params.k1 + 1.0)) / (tf + ctx.params.k1 * norm);
+                let w = match norms.and_then(|n| n.get(doc as usize)) {
+                    Some(&len) => fold.score(tf, len),
+                    None => idf * (tf * (ctx.params.k1 + 1.0)) / (tf + ctx.params.k1),
+                };
                 col.push(
                     DocAddr {
                         segment: 0,
@@ -504,6 +508,8 @@ fn and_two_infos(
     let mut r_oth = seg.reader(&oth.2);
     let norms_drv = seg.norms(drv.0);
     let norms_oth = seg.norms(oth.0);
+    let fold_drv = crate::search::term::Bm25Fold::new(idf_drv, ctx.params, ctx.stats.avg_of(drv.0));
+    let fold_oth = crate::search::term::Bm25Fold::new(idf_oth, ctx.params, ctx.stats.avg_of(oth.0));
     // intersect size <= min(df): pre-reserve so dense-AND pushes never regrow
     let mut out = DocScores::default();
     out.ids
@@ -523,24 +529,14 @@ fn and_two_infos(
         if d2 != doc {
             continue;
         }
-        let w_d = idf_drv * (tf_d as f32 * (ctx.params.k1 + 1.0))
-            / (tf_d as f32
-                + ctx.params.k1
-                    * crate::search::term::norm_ratio(
-                        norms_drv,
-                        doc,
-                        ctx.stats.avg_of(drv.0),
-                        ctx.params.b,
-                    ));
-        let w_o = idf_oth * (tf_o as f32 * (ctx.params.k1 + 1.0))
-            / (tf_o as f32
-                + ctx.params.k1
-                    * crate::search::term::norm_ratio(
-                        norms_oth,
-                        doc,
-                        ctx.stats.avg_of(oth.0),
-                        ctx.params.b,
-                    ));
+        let w_d = match norms_drv.and_then(|n| n.get(doc as usize)) {
+            Some(&len) => fold_drv.score(tf_d as f32, len),
+            None => fold_drv.score_fallback(idf_drv * (ctx.params.k1 + 1.0), tf_d as f32),
+        };
+        let w_o = match norms_oth.and_then(|n| n.get(doc as usize)) {
+            Some(&len) => fold_oth.score(tf_o as f32, len),
+            None => fold_oth.score_fallback(idf_oth * (ctx.params.k1 + 1.0), tf_o as f32),
+        };
         out.ids.push(doc);
         out.scores.push(w_d + w_o);
     }
@@ -643,6 +639,8 @@ fn and_chunk(
     r_oth.seek_to(lo);
     let norms_drv = seg.norms(drv.0);
     let norms_oth = seg.norms(oth.0);
+    let fold_drv = crate::search::term::Bm25Fold::new(idf_drv, ctx.params, ctx.stats.avg_of(drv.0));
+    let fold_oth = crate::search::term::Bm25Fold::new(idf_oth, ctx.params, ctx.stats.avg_of(oth.0));
     while let Some((doc, tf_d)) = r_drv.advance() {
         if doc >= hi {
             break;
@@ -659,24 +657,14 @@ fn and_chunk(
         if d2 != doc {
             continue;
         }
-        let w_d = idf_drv * (tf_d as f32 * (ctx.params.k1 + 1.0))
-            / (tf_d as f32
-                + ctx.params.k1
-                    * crate::search::term::norm_ratio(
-                        norms_drv,
-                        doc,
-                        ctx.stats.avg_of(drv.0),
-                        ctx.params.b,
-                    ));
-        let w_o = idf_oth * (tf_o as f32 * (ctx.params.k1 + 1.0))
-            / (tf_o as f32
-                + ctx.params.k1
-                    * crate::search::term::norm_ratio(
-                        norms_oth,
-                        doc,
-                        ctx.stats.avg_of(oth.0),
-                        ctx.params.b,
-                    ));
+        let w_d = match norms_drv.and_then(|n| n.get(doc as usize)) {
+            Some(&len) => fold_drv.score(tf_d as f32, len),
+            None => fold_drv.score_fallback(idf_drv * (ctx.params.k1 + 1.0), tf_d as f32),
+        };
+        let w_o = match norms_oth.and_then(|n| n.get(doc as usize)) {
+            Some(&len) => fold_oth.score(tf_o as f32, len),
+            None => fold_oth.score_fallback(idf_oth * (ctx.params.k1 + 1.0), tf_o as f32),
+        };
         out.ids.push(doc);
         out.scores.push(w_d + w_o);
     }
