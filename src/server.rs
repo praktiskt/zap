@@ -933,22 +933,21 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
     if body.is_empty() {
         return Err("empty ingest body".into());
     }
+    // typed single-pass parse (the old Value -> parse_doc path decoded every
+    // line into a full JSON tree first, then rebuilt the Document out of it)
     let mut docs = Vec::new();
     if body.trim_start().starts_with('[') {
-        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-        let items = v.as_array().ok_or("expected document array")?;
-        for it in items {
-            docs.push(parse_doc(it)?);
-        }
+        let items: Vec<IngestDoc> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        docs = items.into_iter().map(IngestDoc::into_document).collect();
     } else {
         for line in body.lines() {
             let trim = line.trim();
             if trim.is_empty() {
                 continue;
             }
-            let v: serde_json::Value =
+            let d: IngestDoc =
                 serde_json::from_str(trim).map_err(|e| format!("bad ndjson line: {e}"))?;
-            docs.push(parse_doc(&v)?);
+            docs.push(d.into_document());
         }
     }
     if docs.is_empty() {
@@ -1122,23 +1121,28 @@ fn shard_ingest(
     owner_commit_and_replicate(index, cluster.map(|c| &**c), docs)
 }
 
-fn parse_doc(v: &serde_json::Value) -> Result<Document, String> {
-    let obj = v.as_object().ok_or("each doc must be a JSON object")?;
-    let text = obj
-        .get("text")
-        .and_then(|x| x.as_str())
-        .ok_or("each doc requires a string `text` field")?;
-    let mut doc = Document::new().text("text", text);
-    if let Some(id) = obj.get("id") {
-        let id = id.as_str().ok_or("`id` must be a string")?;
-        doc = doc.id(id);
-    }
-    if let Some(meta) = obj.get("metadata") {
-        if !meta.is_null() {
-            doc = doc.metadata(meta.clone());
+/// wire shape accepted by /ingest (flat): `"text"` required string, optional
+/// string `"id"`, optional ignored-if-null `"metadata"`, other keys ignored
+#[derive(serde::Deserialize)]
+struct IngestDoc {
+    #[serde(default)]
+    id: Option<String>,
+    text: String,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+impl IngestDoc {
+    fn into_document(self) -> Document {
+        let mut doc = Document::new().text("text", self.text);
+        if let Some(id) = self.id {
+            doc = doc.id(id);
         }
+        if let Some(meta) = self.metadata.filter(|m| !m.is_null()) {
+            doc = doc.metadata(meta);
+        }
+        doc
     }
-    Ok(doc)
 }
 
 // ---- id routing (ring owners own /doc/{id}) -------------------------------
