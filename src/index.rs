@@ -193,6 +193,18 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp:?}: {e}"))
 }
 
+/// one commit cycle: (hot lanes, committed segments, tombstones, live sums, stats
+/// cache) taken under the writer lock, processed LOCK-FREE, installed back under
+/// the inner lock. The freeze + merge + stats fold (the expensive O(work) part)
+/// no longer blocks publishes, deletes or other readers.
+struct CommitJob {
+    frozen: Vec<SegmentBuilder>,
+    segments: Vec<Arc<SegmentReader>>,
+    deleted: HashMap<u32, RoaringBitmap>,
+    live_sums: Vec<u64>,
+    cache: Option<StatsCache>,
+}
+
 /// resolved store payload for one document
 #[derive(Debug, Clone)]
 pub struct DocPayload {
@@ -230,6 +242,12 @@ pub struct Index {
     b: f32,
     snap: ArcSwap<IndexSnapshot>,
     inner: Mutex<IndexInner>,
+    /// writer serialization: held across a writer's TAKE->work->INSTALL cycle
+    /// so the single-writer invariant survives the inner lock being RELEASED
+    /// during the expensive freeze/merge/fold (the old code blocked deletes,
+    /// publishes and other ingests for the WHOLE parallel freeze + merge).
+    /// Deletes take it too: a tombstone must never race a merge's mask fold.
+    writer: Mutex<()>,
 }
 
 struct IndexInner {
@@ -324,6 +342,7 @@ impl Index {
             analyzer,
             k1,
             b,
+            writer: Mutex::new(()),
             snap: ArcSwap::from_pointee(IndexSnapshot {
                 segments: Vec::new(),
                 stats: Stats::empty(),
@@ -395,30 +414,44 @@ impl Index {
     /// tombstoned, the new one wins. Uncommitted duplicates trigger a commit first
     /// (single-writer semantics; hot docs are invisible until committed).
     pub fn add_document(&self, doc: &Document) -> Result<(), IndexError> {
+        let mut w = Some(self.writer.lock().unwrap());
+        let flush = {
+            let g = self.inner.lock().unwrap();
+            doc.id.as_ref().is_some_and(|id| g.hot_ids.contains(id))
+        };
+        if flush {
+            // uncommitted duplicate: flush it (commit re-takes writer itself),
+            // then re-hold the writer for the replace; the guard must survive
+            // until end of function, hence the re-assign into a _ silently
+            let w = w.take().unwrap();
+            drop(w);
+            self.commit();
+            let _w = self.writer.lock().unwrap();
+        }
         let mut g = self.inner.lock().unwrap();
         self.add_locked(&mut g, doc)
     }
 
-    /// locked single-doc ingest (replace-aware)
+    /// locked single-doc ingest (replace-aware). Caller must hold `writer`.
+    /// A hot duplicate must be flushed BEFORE this runs (see flush_hot_ids).
     fn add_locked(&self, g: &mut IndexInner, doc: &Document) -> Result<(), IndexError> {
         if let Some(id) = &doc.id {
             if id.is_empty() {
                 return Err(IndexError::BadId(id.clone()));
-            }
-            if g.hot_ids.contains(id) {
-                // old version still hot: flush it so it can be tombstoned
-                self.commit_locked(g);
             }
             if let Some(old) = g.ids_arc.get(id).copied() {
                 g.deleted.entry(old.segment).or_default().insert(old.docid);
                 g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
             }
         }
+        eprintln!("[t] add_locked lane assign");
         let lane = g.next_lane % g.hot.len();
         g.next_lane += 1;
+        eprintln!("[t] add_locked lane={} nhot={}", lane, g.hot.len());
         g.hot[lane]
             .add_document(doc)
             .map_err(IndexError::UnknownField)?;
+        eprintln!("[t] add_locked builder ok");
         if let Some(id) = &doc.id {
             g.hot_ids.insert(id.clone());
         }
@@ -451,7 +484,27 @@ impl Index {
                     .is_some_and(|id| g.hot_ids.contains(id) || g.ids_arc.contains_key(id))
             })
         };
+        let mut w = Some(self.writer.lock().unwrap());
         if collides {
+            // sequential replace-aware path; hot dups of PRIOR ingests flush
+            // once (within-batch dups were already deduped)
+            let any_hot = {
+                let g = self.inner.lock().unwrap();
+                deduped
+                    .iter()
+                    .any(|d| d.id.as_ref().is_some_and(|id| g.hot_ids.contains(id)))
+            };
+            if any_hot {
+                drop(w.take().unwrap());
+                self.commit();
+                // re-hold the writer for the sequential add loop
+                let _w = self.writer.lock().unwrap();
+                let mut g = self.inner.lock().unwrap();
+                for doc in &deduped {
+                    self.add_locked(&mut g, doc)?;
+                }
+                return Ok(());
+            }
             let mut g = self.inner.lock().unwrap();
             for doc in &deduped {
                 self.add_locked(&mut g, doc)?;
@@ -459,38 +512,52 @@ impl Index {
             return Ok(());
         }
         use rayon::prelude::*;
-        let mut g = self.inner.lock().unwrap();
-        let lanes = g.hot.len().max(1);
-        let chunk = deduped.len().div_ceil(lanes).max(1);
-        // split into per-lane vecs WITHOUT cloning the documents (the old
-        // `chunk.to_vec()` deep-copied every field String per ingest)
-        let mut chunks: Vec<Vec<Document>> = (0..g.hot.len()).map(|_| Vec::new()).collect();
-        for (i, d) in deduped.into_iter().enumerate() {
-            chunks[i / chunk].push(d);
+        // TAKE the lane builders out; the parallel tokenize+insert runs with
+        // the inner lock RELEASED (deletes/publishes interleave freely); the
+        // writer lock protects the single-writer invariant across the gap
+        let hot_split: (Vec<Vec<Document>>, Vec<SegmentBuilder>, Vec<String>);
+        {
+            let mut g = self.inner.lock().unwrap();
+            let taken: Vec<SegmentBuilder> = std::mem::take(&mut g.hot);
+            let lanes = taken.len().max(1);
+            g.hot = (0..taken.len())
+                .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
+                .collect();
+            let chunk = deduped.len().div_ceil(lanes).max(1);
+            // split into per-lane vecs WITHOUT cloning the documents (the old
+            // `chunk.to_vec()` deep-copied every field String per ingest)
+            let mut split: Vec<Vec<Document>> = (0..taken.len()).map(|_| Vec::new()).collect();
+            for (i, d) in deduped.into_iter().enumerate() {
+                split[i / chunk].push(d);
+            }
+            let hot_ids_new = split
+                .iter()
+                .flat_map(|c| c.iter().filter_map(|d| d.id.clone()))
+                .collect();
+            hot_split = (split, taken, hot_ids_new);
         }
-        let hot_ids_new: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| c.iter().filter_map(|d| d.id.clone()))
-            .collect();
-        let errors: Vec<Option<String>> = {
-            let builders: &mut Vec<SegmentBuilder> = &mut g.hot;
-            builders
-                .par_iter_mut()
-                .zip(chunks.into_par_iter())
-                .map(|(b, docs)| {
-                    let mut first_err = None;
-                    for d in docs {
-                        if let Err(e) = b.add_document(&d) {
-                            first_err = Some(e);
-                            break;
-                        }
+        let (split, mut taken, hot_ids_new) = hot_split;
+        let errors: Vec<Option<String>> = taken
+            .par_iter_mut()
+            .zip(split.into_par_iter())
+            .map(|(b, docs)| {
+                let mut first_err = None;
+                for d in docs {
+                    if let Err(e) = b.add_document(&d) {
+                        first_err = Some(e);
+                        break;
                     }
-                    first_err
-                })
-                .collect()
-        };
-        for id in hot_ids_new {
-            g.hot_ids.insert(id);
+                }
+                first_err
+            })
+            .collect();
+        // install: lanes go back as g.hot, ids become hot
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.hot = taken;
+            for id in hot_ids_new {
+                g.hot_ids.insert(id);
+            }
         }
         if let Some(e) = errors.into_iter().flatten().next() {
             return Err(IndexError::UnknownField(e));
@@ -498,53 +565,70 @@ impl Index {
         Ok(())
     }
 
-    /// flush hot lanes into sealed segments (+ merge when over budget)
-    fn commit_locked(&self, g: &mut IndexInner) {
-        if g.hot.iter().all(|h| h.num_docs == 0) {
-            return;
-        }
-        // swap in fresh builders; freeze the hot ones in parallel
-        let frozen = std::mem::take(&mut g.hot);
-        g.hot = (0..frozen.len())
-            .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
-            .collect();
+    /// flush hot lanes into sealed segments (+ merge when over budget).
+    /// Caller must hold `writer`; the inner lock may be RELEASED during the
+    /// parallel work (the writer lock preserves single-writer ordering).
+    fn commit_locked(&self) {
+        eprintln!("[t] commit take");
+        // TAKE: swap out the hot lanes, snapshot the committed state
+        let (job, lanes) = {
+            let mut g = self.inner.lock().unwrap();
+            if g.hot.iter().all(|h| h.num_docs == 0) {
+                return;
+            }
+            let frozen = std::mem::take(&mut g.hot);
+            let lanes = frozen.len();
+            g.hot = (0..frozen.len())
+                .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
+                .collect();
+            (
+                CommitJob {
+                    frozen,
+                    segments: g.segments.clone(),
+                    deleted: g.deleted.clone(),
+                    live_sums: g.live_sums.clone(),
+                    cache: g.stats_cache.take(),
+                },
+                lanes,
+            )
+        };
+
+        eprintln!("[t] commit perform");
+        // PERFORM (no locks): freeze lanes in parallel
         let new_segs: Vec<Arc<SegmentReader>> = {
             use rayon::prelude::*;
-            frozen
+            job.frozen
                 .into_par_iter()
                 .filter_map(|b| (b.num_docs > 0).then(|| Arc::new(b.freeze())))
                 .collect()
         };
-        let mut segs = std::mem::take(&mut g.segments);
+        let mut segs = job.segments;
         let base_len = segs.len();
         segs.extend(new_segs);
-        let lanes = g.hot.len().max(1);
         let mut merged_now = false;
+        let mut deleted_out = job.deleted;
         if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
             let masks_all: Vec<RoaringBitmap> = (0..segs.len())
-                .map(|i| g.deleted.get(&(i as u32)).cloned().unwrap_or_default())
+                .map(|i| deleted_out.get(&(i as u32)).cloned().unwrap_or_default())
                 .collect();
             let merged = merge_segments(&segs, &masks_all, self.schema.num_fields());
             segs = vec![Arc::new(merged)];
-            g.deleted.clear();
+            deleted_out.clear();
             merged_now = true;
         }
-        g.segments = segs;
-        g.hot_ids.clear();
-        g.generation += 1;
-        // stats maintenance happens HERE so publishes stay O(new segments):
-        // appends stream only the frozen lanes and fold their df/sums/docs into
-        // the cached envelope; merges/boot fall back to one full rescan
+        // stats fold: appends stream only the frozen lanes and fold their
+        // df/sums/docs into the taken cache; merges/boot do one full rescan
         let nf = self.schema.num_fields();
-        let (df, total_docs_check) = if merged_now {
+        let mut live_sums = job.live_sums;
+        let (df, total_docs) = if merged_now {
             // merge purged docids: fold from the merged segment alone
             let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
             let mut total = 0u64;
-            for s in &g.segments {
+            for s in &segs {
                 total += s.num_docs as u64;
                 for fid in 0..nf as u32 {
                     if let Some(nm) = s.norms(fid) {
-                        g.live_sums[fid as usize] = nm.iter().map(|x| *x as u64).sum::<u64>();
+                        live_sums[fid as usize] = nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
                         *raw_df.entry(fid).or_default().entry(term).or_insert(0) += info.df;
@@ -553,9 +637,7 @@ impl Index {
             }
             (Arc::new(raw_df), total)
         } else {
-            // take the mutable map back when no live snapshot still holds it;
-            // else deep-clone (a query was executing mid-commit)
-            let (mut df_mut, mut total) = match g.stats_cache.take() {
+            let (mut df_mut, mut total) = match job.cache {
                 Some((d, t)) => {
                     let d = match Arc::try_unwrap(d) {
                         Ok(m) => m,
@@ -565,11 +647,11 @@ impl Index {
                 }
                 None => (HashMap::<u32, HashMap<String, u32>>::new(), 0u64),
             };
-            for s in &g.segments[base_len..] {
+            for s in &segs[base_len..] {
                 total += s.num_docs as u64;
                 for fid in 0..nf as u32 {
                     if let Some(nm) = s.norms(fid) {
-                        g.live_sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                        live_sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
                     }
                     for (term, info) in s.stream_terms(fid) {
                         *df_mut.entry(fid).or_default().entry(term).or_insert(0) += info.df;
@@ -578,28 +660,49 @@ impl Index {
             }
             (Arc::new(df_mut), total)
         };
-        let total_docs = total_docs_check;
-        g.stats_cache = Some((df, total_docs));
-        let new_from = if merged_now { None } else { Some(base_len) };
-        self.publish_snapshot(g, true, new_from);
+
+        eprintln!("[t] commit install");
+        // INSTALL: under the inner lock; the disk persist (serialize + fsync)
+        // runs OUTSIDE it — the installed Arc list + tombstones are what gets written
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.segments = segs.clone();
+            g.deleted = deleted_out.clone();
+            g.live_sums = live_sums;
+            g.hot_ids.clear();
+            g.generation += 1;
+            g.stats_cache = Some((df, total_docs));
+            let new_from = if merged_now { None } else { Some(base_len) };
+            self.publish_snapshot(&mut g, true, new_from);
+        }
         if let Some(d) = &self.disk {
-            d.persist(&g.segments, &g.deleted).expect("disk persist");
+            d.persist(&segs, &deleted_out).expect("disk persist");
         }
     }
 
     pub fn commit(&self) {
-        let mut g = self.inner.lock().unwrap();
-        self.commit_locked(&mut g);
+        eprintln!("[t] commit() writer wait");
+        let _w = self.writer.lock().unwrap();
+        eprintln!("[t] commit() writer got");
+        self.commit_locked();
     }
 
     /// tombstone one live doc by external id; the tombstone is published immediately
-    /// (lock-free readers see it without a segment commit) and physically purged at merge
+    /// (lock-free readers see it without a segment commit) and physically purged at merge.
+    /// Holds `writer` for the whole tombstone: a delete must never race a merge's
+    /// mask fold or a publish (the merged segment re-indexes docids).
     pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
-        let mut g = self.inner.lock().unwrap();
-        if g.hot_ids.contains(id) {
+        eprintln!("[t] delete enter");
+        let flush = {
+            let g = self.inner.lock().unwrap();
+            g.hot_ids.contains(id)
+        };
+        if flush {
             // uncommitted: flush so the doc becomes tombstoneable
-            self.commit_locked(&mut g);
+            self.commit();
         }
+        let _w = self.writer.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         let Some(old) = g.ids_arc.get(id).copied() else {
             return Ok(false);
         };
