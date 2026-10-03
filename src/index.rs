@@ -6,6 +6,7 @@
 
 use crate::query::Node;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -193,18 +194,6 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp:?}: {e}"))
 }
 
-/// one commit cycle: (hot lanes, committed segments, tombstones, live sums, stats
-/// cache) taken under the writer lock, processed LOCK-FREE, installed back under
-/// the inner lock. The freeze + merge + stats fold (the expensive O(work) part)
-/// no longer blocks publishes, deletes or other readers.
-struct CommitJob {
-    frozen: Vec<SegmentBuilder>,
-    segments: Vec<Arc<SegmentReader>>,
-    deleted: HashMap<u32, RoaringBitmap>,
-    live_sums: Vec<u64>,
-    cache: Option<StatsCache>,
-}
-
 /// resolved store payload for one document
 #[derive(Debug, Clone)]
 pub struct DocPayload {
@@ -248,12 +237,59 @@ pub struct Index {
     /// publishes and other ingests for the WHOLE parallel freeze + merge).
     /// Deletes take it too: a tombstone must never race a merge's mask fold.
     writer: Mutex<()>,
+    /// per-lane ingest workers: each owns a SegmentBuilder and drains its own
+    /// queue; submit-side work is just an enqueue+bounded validation, so the
+    /// /ingest path no longer tokenizes synchronously (add-cost overlaps the
+    /// previous request's seal instead of serializing under the writer)
+    lanes: Vec<std::sync::mpsc::Sender<LaneMsg>>,
+    /// round-robin lane picker for single-doc adds (lock-free)
+    next_lane: std::sync::atomic::AtomicUsize,
+    lane_count: usize,
+}
+
+/// one message to a lane worker: a batch to append (validated upstream) or a
+/// seal request (freeze the builder, return sealed segments, build a fresh one)
+pub enum LaneMsg {
+    Add(Vec<Document>),
+    Seal(std::sync::mpsc::SyncSender<Vec<Arc<SegmentReader>>>),
+}
+
+impl LaneMsg {
+    /// a one-capacity reply channel for a seal; None is impossible (buffered)
+    fn seal_pair() -> (LaneMsg, std::sync::mpsc::Receiver<Vec<Arc<SegmentReader>>>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (LaneMsg::Seal(tx), rx)
+    }
+}
+
+/// lane worker lifetime: owns one builder; freezes on Seal with a fresh
+/// builder for the next cycle; exits when its sender side is dropped (Drop)
+fn lane_worker(
+    builder: SegmentBuilder,
+    schema: Arc<Schema>,
+    analyzer: Arc<Analyzer>,
+    rx: std::sync::mpsc::Receiver<LaneMsg>,
+) {
+    let mut builder = builder;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            LaneMsg::Add(docs) => {
+                for d in &docs {
+                    // validation happened submit-side; inside lanes an unknown
+                    // field can only mean a schema race (single static schema)
+                    let _ = builder.add_document(d);
+                }
+            }
+            LaneMsg::Seal(back) => {
+                let frozen = (builder.num_docs > 0).then(|| Arc::new(builder.freeze()));
+                builder = SegmentBuilder::new(schema.clone(), analyzer.clone());
+                let _ = back.send(frozen.into_iter().collect());
+            }
+        }
+    }
 }
 
 struct IndexInner {
-    /// per-lane builders (round-robin docid partitioning for parallel ingest)
-    hot: Vec<SegmentBuilder>,
-    next_lane: usize,
     segments: Vec<Arc<SegmentReader>>,
     /// tombstones over `segments` (segment index -> deleted docids); purged at merge
     deleted: HashMap<u32, RoaringBitmap>,
@@ -301,9 +337,19 @@ impl Index {
     ) -> Arc<Self> {
         let schema = Arc::new(schema);
         let lanes = lanes.max(1);
-        let hot = (0..lanes)
-            .map(|_| SegmentBuilder::new(schema.clone(), analyzer.clone()))
-            .collect();
+        // lane workers own the builders from boot: submit-side is enqueue only
+        let mut lane_tx = Vec::with_capacity(lanes);
+        for wi in 0..lanes {
+            let builder = SegmentBuilder::new(schema.clone(), analyzer.clone());
+            let (tx, rx) = std::sync::mpsc::channel::<LaneMsg>();
+            let schema_w = schema.clone();
+            let analyzer_w = analyzer.clone();
+            std::thread::Builder::new()
+                .name(format!("zap-lane{wi}"))
+                .spawn(move || lane_worker(builder, schema_w, analyzer_w, rx))
+                .expect("spawn lane worker");
+            lane_tx.push(tx);
+        }
         // opt-in persistence: load existing state synchronously at boot
         let disk = match disk_dir {
             Some(dir) => {
@@ -353,8 +399,6 @@ impl Index {
                 generation: 0,
             }),
             inner: Mutex::new(IndexInner {
-                hot,
-                next_lane: 0,
                 segments: segs,
                 deleted: tomb,
                 ids_arc: Arc::new(im::HashMap::new()),
@@ -363,6 +407,9 @@ impl Index {
                 hot_ids: HashSet::new(),
                 generation: 0,
             }),
+            lanes: lane_tx,
+            next_lane: std::sync::atomic::AtomicUsize::new(0),
+            lane_count: lanes,
         });
         // publish the loaded snapshot + rebuild the id index on top of it
         {
@@ -387,7 +434,7 @@ impl Index {
     }
 
     pub fn lane_count(&self) -> usize {
-        self.inner.lock().unwrap().hot.len()
+        self.lane_count
     }
 
     pub fn schema(&self) -> &Schema {
@@ -433,8 +480,17 @@ impl Index {
     }
 
     /// locked single-doc ingest (replace-aware). Caller must hold `writer`.
-    /// A hot duplicate must be flushed BEFORE this runs (see flush_hot_ids).
+    /// A hot duplicate must be flushed BEFORE this runs.
+    /// Submit-side is enqueue only: field validation here (so unknown-field
+    /// errors keep the old sync contract), then one Add onto a lane worker.
     fn add_locked(&self, g: &mut IndexInner, doc: &Document) -> Result<(), IndexError> {
+        if let Some(name) = doc
+            .fields
+            .keys()
+            .find(|f| self.schema.field_id(f).is_none())
+        {
+            return Err(IndexError::UnknownField(name.clone()));
+        }
         if let Some(id) = &doc.id {
             if id.is_empty() {
                 return Err(IndexError::BadId(id.clone()));
@@ -444,14 +500,10 @@ impl Index {
                 g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
             }
         }
-        eprintln!("[t] add_locked lane assign");
-        let lane = g.next_lane % g.hot.len();
-        g.next_lane += 1;
-        eprintln!("[t] add_locked lane={} nhot={}", lane, g.hot.len());
-        g.hot[lane]
-            .add_document(doc)
-            .map_err(IndexError::UnknownField)?;
-        eprintln!("[t] add_locked builder ok");
+        let lane = self.next_lane.fetch_add(1, Ordering::Relaxed) % self.lane_count;
+        self.lanes[lane]
+            .send(LaneMsg::Add(vec![doc.clone()]))
+            .map_err(|_| IndexError::Query("lane worker died".into()))?;
         if let Some(id) = &doc.id {
             g.hot_ids.insert(id.clone());
         }
@@ -511,56 +563,42 @@ impl Index {
             }
             return Ok(());
         }
-        use rayon::prelude::*;
-        // TAKE the lane builders out; the parallel tokenize+insert runs with
-        // the inner lock RELEASED (deletes/publishes interleave freely); the
-        // writer lock protects the single-writer invariant across the gap
-        let hot_split: (Vec<Vec<Document>>, Vec<SegmentBuilder>, Vec<String>);
+        // ENQUEUE: validate every field upfront (keeps the sync unknown-field
+        // contract; old fast path left partial docs in lanes on error), split
+        // CONTIGUOUSLY by lane (same docid->lane mapping as the old builder
+        // split: bench corpora keep their segment shapes), then hand each
+        // chunk to its lane worker. Tokenization overlaps concurrent traffic
+        // instead of blocking the writer.
         {
             let mut g = self.inner.lock().unwrap();
-            let taken: Vec<SegmentBuilder> = std::mem::take(&mut g.hot);
-            let lanes = taken.len().max(1);
-            g.hot = (0..taken.len())
-                .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
-                .collect();
+            if let Some(name) = deduped
+                .iter()
+                .flat_map(|d| d.fields.keys())
+                .find(|f| self.schema.field_id(f).is_none())
+            {
+                return Err(IndexError::UnknownField(name.clone()));
+            }
+            let lanes = self.lane_count.max(1);
             let chunk = deduped.len().div_ceil(lanes).max(1);
-            // split into per-lane vecs WITHOUT cloning the documents (the old
-            // `chunk.to_vec()` deep-copied every field String per ingest)
-            let mut split: Vec<Vec<Document>> = (0..taken.len()).map(|_| Vec::new()).collect();
+            let mut split: Vec<Vec<Document>> = (0..lanes).map(|_| Vec::new()).collect();
             for (i, d) in deduped.into_iter().enumerate() {
                 split[i / chunk].push(d);
             }
-            let hot_ids_new = split
+            for chunk in split
                 .iter()
                 .flat_map(|c| c.iter().filter_map(|d| d.id.clone()))
-                .collect();
-            hot_split = (split, taken, hot_ids_new);
-        }
-        let (split, mut taken, hot_ids_new) = hot_split;
-        let errors: Vec<Option<String>> = taken
-            .par_iter_mut()
-            .zip(split.into_par_iter())
-            .map(|(b, docs)| {
-                let mut first_err = None;
-                for d in docs {
-                    if let Err(e) = b.add_document(&d) {
-                        first_err = Some(e);
-                        break;
-                    }
-                }
-                first_err
-            })
-            .collect();
-        // install: lanes go back as g.hot, ids become hot
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.hot = taken;
-            for id in hot_ids_new {
-                g.hot_ids.insert(id);
+                .collect::<Vec<String>>()
+            {
+                g.hot_ids.insert(chunk);
             }
-        }
-        if let Some(e) = errors.into_iter().flatten().next() {
-            return Err(IndexError::UnknownField(e));
+            for (lane, docs) in split.into_iter().enumerate() {
+                if docs.is_empty() {
+                    continue;
+                }
+                self.lanes[lane]
+                    .send(LaneMsg::Add(docs))
+                    .map_err(|_| IndexError::Query("lane worker died".into()))?;
+            }
         }
         Ok(())
     }
@@ -569,44 +607,46 @@ impl Index {
     /// Caller must hold `writer`; the inner lock may be RELEASED during the
     /// parallel work (the writer lock preserves single-writer ordering).
     fn commit_locked(&self) {
-        eprintln!("[t] commit take");
-        // TAKE: swap out the hot lanes, snapshot the committed state
-        let (job, lanes) = {
+        // NOTE: no "anything pending?" gate here — queued unkeyed docs (id=None)
+        // live in lane queues which are not observable from outside, so the seal
+        // always runs. A seal over an empty lane is a µs round-trip; the old
+        // builder-num_docs gate could not see queued work (readers don't take
+        // the inner lock), and hot_ids only covers keyed docs.
+        // FIFO per lane guarantees every Seal is processed AFTER its lane's
+        // queued adds: sealed segments are complete.
+        let (job_segments, job_deleted, job_sums, job_cache, lanes) = {
             let mut g = self.inner.lock().unwrap();
-            if g.hot.iter().all(|h| h.num_docs == 0) {
-                return;
-            }
-            let frozen = std::mem::take(&mut g.hot);
-            let lanes = frozen.len();
-            g.hot = (0..frozen.len())
-                .map(|_| SegmentBuilder::new(self.schema.clone(), self.analyzer.clone()))
-                .collect();
             (
-                CommitJob {
-                    frozen,
-                    segments: g.segments.clone(),
-                    deleted: g.deleted.clone(),
-                    live_sums: g.live_sums.clone(),
-                    cache: g.stats_cache.take(),
-                },
-                lanes,
+                g.segments.clone(),
+                g.deleted.clone(),
+                g.live_sums.clone(),
+                g.stats_cache.take(),
+                self.lane_count,
             )
         };
 
-        eprintln!("[t] commit perform");
-        // PERFORM (no locks): freeze lanes in parallel
+        // PERFORM (no locks): seal + freeze lanes in parallel; every lane comes
+        // back with 0 or 1 sealed segments in lane order (same as the old rayon
+        // collect, plus pipeline overlap of enqueue vs seal)
         let new_segs: Vec<Arc<SegmentReader>> = {
             use rayon::prelude::*;
-            job.frozen
-                .into_par_iter()
-                .filter_map(|b| (b.num_docs > 0).then(|| Arc::new(b.freeze())))
+            let mut rxs = Vec::with_capacity(lanes);
+            for lane in 0..lanes {
+                let (msg, rx) = LaneMsg::seal_pair();
+                if self.lanes[lane].send(msg).is_ok() {
+                    rxs.push(rx);
+                }
+            }
+            rxs.into_par_iter()
+                .map(|rx| rx.recv().unwrap_or_default())
+                .flatten()
                 .collect()
         };
-        let mut segs = job.segments;
+        let mut segs = job_segments;
         let base_len = segs.len();
         segs.extend(new_segs);
         let mut merged_now = false;
-        let mut deleted_out = job.deleted;
+        let mut deleted_out = job_deleted;
         if segs.len() >= MAX_SEGMENTS * lanes.max(1) {
             let masks_all: Vec<RoaringBitmap> = (0..segs.len())
                 .map(|i| deleted_out.get(&(i as u32)).cloned().unwrap_or_default())
@@ -619,7 +659,7 @@ impl Index {
         // stats fold: appends stream only the frozen lanes and fold their
         // df/sums/docs into the taken cache; merges/boot do one full rescan
         let nf = self.schema.num_fields();
-        let mut live_sums = job.live_sums;
+        let mut live_sums = job_sums;
         let (df, total_docs) = if merged_now {
             // merge purged docids: fold from the merged segment alone
             let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
@@ -637,7 +677,7 @@ impl Index {
             }
             (Arc::new(raw_df), total)
         } else {
-            let (mut df_mut, mut total) = match job.cache {
+            let (mut df_mut, mut total) = match job_cache {
                 Some((d, t)) => {
                     let d = match Arc::try_unwrap(d) {
                         Ok(m) => m,
