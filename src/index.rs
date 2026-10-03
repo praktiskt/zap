@@ -44,6 +44,49 @@ const MERGE_TOMB_MIN: u64 = 128;
 /// merge when debt >= live/MERGE_TOMB_RATIO (4 => at >= 25% of live docs)
 const MERGE_TOMB_RATIO: u64 = 4;
 
+/// tier merge fan-in: a size bucket (ilog2 of doc count) with more than
+/// TIER_FAN segments merges its WHOLE bucket into one segment (bounded fan-in:
+/// the write cost is O(bucket size), never O(corpus); the output lands in a
+/// higher bucket ~TIER_FAN× bigger, so bucket pressure jumps tiers and the
+/// segment population bounds near TIER_FAN × #buckets)
+const TIER_FAN: usize = 8;
+
+/// tier merging only applies to SMALL segments: serving-side bursts seal many
+/// tiny lane segments (per-request commits), and their unbounded fan-out is
+/// what tiers bound. Bulk seals (multi-thousand-doc lane segments) already
+/// carry large batches per merge trigger — forcing fan-in there fragments the
+/// natural single-merge shape (measured: 1M-doc bulk ingest +26% wall with
+/// unconditional tiering, segs 33 -> 2). Buckets above this stops tiering and
+/// hand the segments to the global backstop like before.
+const TIER_MAX_BUCKET_DOCS_LOG: u32 = 12; // segments up to 4096 docs tier-merge
+
+/// find the first size bucket over the fan; returns its segments in ascending
+/// segid order. Size buckets = ilog2(num_docs): segments in a bucket differ by
+/// less than 2x in doc count, so fan-in fan stays balanced.
+fn tier_overflow_bucket(segs: &[Arc<SegmentReader>]) -> Option<Vec<Arc<SegmentReader>>> {
+    // bucket = ilog2(num_docs); num_docs >= 1 for sealed segments; buckets of
+    // big seals stay with the global backstop (see TIER_MAX_BUCKET_DOCS_LOG)
+    let mut counts: HashMap<u32, Vec<Arc<SegmentReader>>> = HashMap::new();
+    for s in segs {
+        let bucket = s.num_docs.ilog2();
+        if bucket > TIER_MAX_BUCKET_DOCS_LOG {
+            continue; // big seals: global backstop only
+        }
+        counts.entry(bucket).or_default().push(s.clone());
+    }
+    // deterministic pick: lowest overflowing bucket
+    let mut buckets: Vec<(u32, Vec<Arc<SegmentReader>>)> = counts.into_iter().collect();
+    buckets.sort_by_key(|(t, _)| *t);
+    buckets.into_iter().find_map(|(_, segs)| {
+        (segs.len() > TIER_FAN).then(|| {
+            // ascending segid (input is pre-sorted)
+            let mut segs = segs;
+            segs.sort_by_key(|s| s.segid);
+            segs
+        })
+    })
+}
+
 /// cached publish stats: (per-field length sums, global df, total docs)
 /// cached publish stats: (global df, total docs). Per-field LIVE sums live in
 /// `IndexInner.live_sums` (exact, tombstone-masked) instead — the gossip path
@@ -213,8 +256,21 @@ pub struct DocPayload {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// how a publish refreshes the external-id map
+enum IdMode {
+    /// tombstone-only publish (delete): map already rewritten by delete()
+    None,
+    /// boot or global merge: rebuild from all live segments (O(live))
+    Full,
+    /// re-point the given segments' id columns (appended sealed segments or a
+    /// tier-merge output segment) — O(docs in the given set)
+    Update(Vec<Arc<SegmentReader>>),
+}
+
 pub struct IndexSnapshot {
     pub segments: Vec<Arc<SegmentReader>>,
+    /// segid -> segment (payload lookups by stable id; DocAddr.segment IS a segid)
+    pub by_id: HashMap<u32, Arc<SegmentReader>>,
     pub stats: Stats,
     /// exact per-field token sums over LIVE docs (tombstoned excluded) —
     /// maintained incrementally so gossip envelopes cost O(fields), not a
@@ -254,6 +310,8 @@ pub struct Index {
     /// round-robin lane picker for single-doc adds (lock-free)
     next_lane: std::sync::atomic::AtomicUsize,
     lane_count: usize,
+    /// stable segment identity counter (writer-allocated)
+    next_segid: std::sync::atomic::AtomicU32,
 }
 
 /// one message to a lane worker: a batch to append (validated upstream) or a
@@ -299,7 +357,11 @@ fn lane_worker(
 }
 
 struct IndexInner {
+    /// live segments, ascending segid (segid = stable identity; merges append
+    /// their output at the end, sources removed in place)
     segments: Vec<Arc<SegmentReader>>,
+    /// segid -> segment (same set as `segments`, for O(1) payload lookups)
+    by_segid: HashMap<u32, Arc<SegmentReader>>,
     /// tombstones over `segments` (segment index -> deleted docids); purged at merge
     deleted: HashMap<u32, RoaringBitmap>,
     /// live external id -> committed address, PERSISTENT im::HashMap Arc-shared
@@ -374,6 +436,9 @@ impl Index {
             Some((h, segs, t)) => (Some(h), segs, t),
             None => (None, Vec::new(), HashMap::new()),
         };
+        // loaded segments carry their persisted segid (zapseg3): the counter
+        // continues above the highest, so fresh seals never collide
+        let max_segid = segs.iter().map(|s| s.segid).max().unwrap_or(0);
         // boot live-sum rescan: tombstone-masked (the cache-less path in
         // publish_snapshot counts tombstoned docs — these sums must not)
         let live_sums: Vec<u64> = {
@@ -400,6 +465,7 @@ impl Index {
             writer: Mutex::new(()),
             snap: ArcSwap::from_pointee(IndexSnapshot {
                 segments: Vec::new(),
+                by_id: HashMap::new(),
                 stats: Stats::empty(),
                 sums: Vec::new(),
                 deleted: Arc::new(HashMap::new()),
@@ -408,7 +474,8 @@ impl Index {
                 generation: 0,
             }),
             inner: Mutex::new(IndexInner {
-                segments: segs,
+                segments: segs.clone(),
+                by_segid: segs.iter().map(|s| (s.segid, s.clone())).collect(),
                 deleted: tomb,
                 ids_arc: Arc::new(im::HashMap::new()),
                 live_sums,
@@ -419,7 +486,29 @@ impl Index {
             lanes: lane_tx,
             next_lane: std::sync::atomic::AtomicUsize::new(0),
             lane_count: lanes,
+            next_segid: std::sync::atomic::AtomicU32::new(max_segid + 1),
         });
+        // zapseg1/2 boots have segid 0 (pre-stable-identity): assign fresh ids
+        // so the segid key-space starts clean
+        {
+            let mut got = index.inner.lock().unwrap();
+            let mut next = index.next_segid.load(Ordering::Relaxed);
+            let fixed: Vec<Arc<SegmentReader>> = got
+                .segments
+                .iter()
+                .map(|s| {
+                    if s.segid != 0 {
+                        return s.clone();
+                    }
+                    let c = Arc::new(s.reidentify(next));
+                    next += 1;
+                    c
+                })
+                .collect();
+            got.segments = fixed.clone();
+            got.by_segid = fixed.iter().map(|s| (s.segid, s.clone())).collect();
+            index.next_segid.store(next, Ordering::Relaxed);
+        }
         // publish the loaded snapshot + rebuild the id index on top of it
         {
             let mut g = index.inner.lock().unwrap();
@@ -431,7 +520,7 @@ impl Index {
                     g.deleted.values().map(|m| m.len()).collect::<Vec<_>>()
                 );
             }
-            index.publish_snapshot(&mut g, true, None);
+            index.publish_snapshot(&mut g, true, IdMode::Full);
             if std::env::var("ZAP_DISK_TRACE").is_ok() {
                 eprintln!(
                     "[disk] post-publish snap total_docs={}",
@@ -676,33 +765,53 @@ impl Index {
         };
         let mut segs = job_segments;
         let base_len = segs.len();
-        segs.extend(new_segs);
-        let mut merged_now = false;
+        // fresh identity for every sealed segment (stable across publishes)
+        let appended: Vec<Arc<SegmentReader>> = new_segs
+            .into_iter()
+            .map(|s| {
+                let sid = self.next_segid.fetch_add(1, Ordering::Relaxed);
+                let mut s = s;
+                Arc::get_mut(&mut s).expect("fresh sealed segment").segid = sid;
+                s
+            })
+            .collect();
+        segs.extend(appended.clone());
         let mut deleted_out = job_deleted;
-        // compaction triggers: the segment-count trigger (bounded fan-out between
-        // merges) OR tombstone debt — a delete-heavy / replace-heavy workload
-        // used to never merge, so its tombstone masks (paid per query per
-        // segment) and purged-at-merge df/sum rows only ever disappeared when
-        // ingest happened to push the count over the trigger
+        // compaction triggers:
+        //  1. global: segment count over the backstop, or tombstone debt
+        //     >= 25% of live (delete-heavy workloads collect purge debt the
+        //     tier merges cannot amortize) -> full rewrite, O(live)
+        //  2. tier: a size bucket (ilog2 of doc count) over the fan -> merge
+        //     THAT bucket, bounded fan-in: write cost is O(bucket), not O(corpus)
         let tombstone_debt: u64 = deleted_out.values().map(|m| m.len()).sum();
         let live_total: u64 = segs.iter().map(|s| s.num_docs as u64).sum::<u64>() - tombstone_debt;
         let tomb_trigger =
             tombstone_debt >= MERGE_TOMB_MIN && tombstone_debt * MERGE_TOMB_RATIO >= live_total;
-        if segs.len() >= MAX_SEGMENTS * lanes.max(1) || tomb_trigger {
-            let masks_all: Vec<RoaringBitmap> = (0..segs.len())
-                .map(|i| deleted_out.get(&(i as u32)).cloned().unwrap_or_default())
-                .collect();
-            let merged = merge_segments(&segs, &masks_all, self.schema.num_fields());
-            segs = vec![Arc::new(merged)];
-            deleted_out.clear();
-            merged_now = true;
-        }
-        // stats fold: appends stream only the frozen lanes and fold their
-        // df/sums/docs into the taken cache; merges/boot do one full rescan
+        let global_merge = tomb_trigger || segs.len() >= MAX_SEGMENTS * lanes.max(1);
+        let tier_src = if global_merge {
+            None
+        } else {
+            tier_overflow_bucket(&segs)
+        };
+        // appended ids that got pulled INTO the tier bucket (their work folds
+        // into the merged output instead of the plain append fold)
+        let appended_ids: std::collections::HashSet<u32> =
+            appended.iter().map(|s| s.segid).collect();
+
+        // stats fold: only new+changed segments stream their terms; global
+        // merges do one full rescan
         let nf = self.schema.num_fields();
         let mut live_sums = job_sums;
-        let (df, total_docs) = if merged_now {
-            // merge purged docids: fold from the merged segment alone
+        let (df, total_docs);
+        let id_mode;
+        let mut tier_removed: Option<Vec<u32>> = None;
+        if global_merge {
+            let masks_all: Vec<RoaringBitmap> = (0..segs.len())
+                .map(|i| deleted_out.get(&segs[i].segid).cloned().unwrap_or_default())
+                .collect();
+            let merged = merge_segments(&segs, &masks_all, nf);
+            segs = vec![Arc::new(merged)];
+            deleted_out.clear();
             let mut raw_df: HashMap<u32, HashMap<String, u32>> = HashMap::new();
             let mut total = 0u64;
             for s in &segs {
@@ -716,7 +825,116 @@ impl Index {
                     }
                 }
             }
-            (Arc::new(raw_df), total)
+            id_mode = IdMode::Full;
+            df = Arc::new(raw_df);
+            total_docs = total;
+        } else if let Some(srcs) = tier_src {
+            // bounded tier fan-in: merge ONLY the overflowing bucket
+            let (mut df_mut, cache_total) = match job_cache {
+                Some((d, t)) => {
+                    let d = match Arc::try_unwrap(d) {
+                        Ok(m) => m,
+                        Err(arc) => (*arc).clone(),
+                    };
+                    (d, t)
+                }
+                None => (HashMap::<u32, HashMap<String, u32>>::new(), 0u64),
+            };
+            // pre-merge total INCLUDING the fresh appends (some sources may be
+            // this commit's seals)
+            let old_total = cache_total + appended.iter().map(|s| s.num_docs as u64).sum::<u64>();
+            let src_docs: u64 = srcs.iter().map(|s| s.num_docs as u64).sum();
+            let src_masks: Vec<RoaringBitmap> = srcs
+                .iter()
+                .map(|s| deleted_out.get(&s.segid).cloned().unwrap_or_default())
+                .collect();
+            let merged_raw = merge_segments(&srcs, &src_masks, nf);
+            let sid = self.next_segid.fetch_add(1, Ordering::Relaxed);
+            let mut merged = Arc::new(merged_raw);
+            Arc::get_mut(&mut merged)
+                .expect("fresh merged segment")
+                .segid = sid;
+            // live sums: sources that pre-date this commit subtract their LIVE
+            // sums (fresh appends never contributed — skip them)
+            for (sidx, s) in srcs.iter().enumerate() {
+                if appended_ids.contains(&s.segid) {
+                    continue;
+                }
+                let mask = &src_masks[sidx];
+                for fid in 0..nf as u32 {
+                    if let Some(nm) = s.norms(fid) {
+                        live_sums[fid as usize] -= nm
+                            .iter()
+                            .enumerate()
+                            .filter(|(d, _)| !mask.contains(*d as u32))
+                            .map(|(_, v)| *v as u64)
+                            .sum::<u64>();
+                    }
+                }
+            }
+            for fid in 0..nf as u32 {
+                if let Some(nm) = merged.norms(fid) {
+                    live_sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                }
+            }
+            // fresh appends that did NOT join the bucket contribute their own
+            // norms (the merged output only covers the bucket's docs)
+            for s in appended
+                .iter()
+                .filter(|s| !srcs.iter().any(|x| x.segid == s.segid))
+            {
+                for fid in 0..nf as u32 {
+                    if let Some(nm) = s.norms(fid) {
+                        live_sums[fid as usize] += nm.iter().map(|x| *x as u64).sum::<u64>();
+                    }
+                }
+            }
+            // df delta: remove PRE-EXISTING sources' term streams (fresh
+            // appends never contributed), add merged's, and fold the appended
+            // segments that did NOT join the bucket
+            for s in srcs.iter().filter(|s| !appended_ids.contains(&s.segid)) {
+                for fid in 0..nf as u32 {
+                    for (term, info) in s.stream_terms(fid) {
+                        if let Some(v) = df_mut.get_mut(&fid).and_then(|m| m.get_mut(&term)) {
+                            *v = v.saturating_sub(info.df);
+                        }
+                    }
+                }
+            }
+            for fid in 0..nf as u32 {
+                for (term, info) in merged.stream_terms(fid) {
+                    *df_mut.entry(fid).or_default().entry(term).or_insert(0) += info.df;
+                }
+            }
+            for s in appended
+                .iter()
+                .filter(|s| !srcs.iter().any(|x| x.segid == s.segid))
+            {
+                for fid in 0..nf as u32 {
+                    for (term, info) in s.stream_terms(fid) {
+                        *df_mut.entry(fid).or_default().entry(term).or_insert(0) += info.df;
+                    }
+                }
+            }
+            // remove sources, install the merged segment (fresh segid = end,
+            // ascending-segid order kept)
+            let src_ids: Vec<u32> = srcs.iter().map(|s| s.segid).collect();
+            tier_removed = Some(src_ids.clone());
+
+            segs.retain(|s| !src_ids.contains(&s.segid));
+            deleted_out.retain(|k, _| !src_ids.contains(k));
+            segs.push(merged.clone());
+            let mut upd = appended
+                .iter()
+                .filter(|s| !src_ids.contains(&s.segid))
+                .cloned()
+                .collect::<Vec<_>>();
+            let merged_docs = merged.num_docs as u64;
+            upd.push(merged.clone());
+            drop(merged);
+            id_mode = IdMode::Update(upd);
+            df = Arc::new(df_mut);
+            total_docs = old_total - src_docs + merged_docs;
         } else {
             let (mut df_mut, mut total) = match job_cache {
                 Some((d, t)) => {
@@ -739,21 +957,38 @@ impl Index {
                     }
                 }
             }
-            (Arc::new(df_mut), total)
-        };
+            id_mode = IdMode::Update(appended);
+            df = Arc::new(df_mut);
+            total_docs = total;
+        }
 
         // INSTALL: under the inner lock; the disk persist (serialize + fsync)
         // runs OUTSIDE it — the installed Arc list + tombstones are what gets written
         {
             let mut g = self.inner.lock().unwrap();
             g.segments = segs.clone();
+            // keep the segid view in lockstep: rebuilt for global merges, delta
+            // for tier merges (sources out, output in) and appends
+            if global_merge {
+                g.by_segid = g.segments.iter().map(|s| (s.segid, s.clone())).collect();
+            } else {
+                // re-index EVERY live segment (cheap, count stays bounded) and
+                // drop the tier-merge sources (their docs now live elsewhere)
+                for s in &segs {
+                    g.by_segid.entry(s.segid).or_insert_with(|| s.clone());
+                }
+                if let Some(src_ids) = tier_removed {
+                    for id in src_ids {
+                        g.by_segid.remove(&id);
+                    }
+                }
+            }
             g.deleted = deleted_out.clone();
             g.live_sums = live_sums;
             g.hot_ids.clear();
             g.generation += 1;
             g.stats_cache = Some((df, total_docs));
-            let new_from = if merged_now { None } else { Some(base_len) };
-            self.publish_snapshot(&mut g, true, new_from);
+            self.publish_snapshot(&mut g, true, id_mode);
         }
         if let Some(d) = &self.disk {
             d.persist(&segs, &deleted_out).expect("disk persist");
@@ -789,7 +1024,7 @@ impl Index {
         g.deleted.entry(old.segment).or_default().insert(old.docid);
         // exact live-sum maintenance: subtract the tombstoned doc's norms
         // (copy the small norm slice out first: seg is an Arc from the shared list)
-        if let Some(seg) = g.segments.get(old.segment as usize).cloned() {
+        if let Some(seg) = g.by_segid.get(&old.segment).cloned() {
             let norms: Vec<Option<u16>> = (0..g.live_sums.len())
                 .map(|fid| seg.norms(fid as u32).map(|nm| nm[old.docid as usize]))
                 .collect();
@@ -813,7 +1048,7 @@ impl Index {
             drop(g);
             self.commit_locked();
         } else {
-            self.publish_snapshot(&mut g, false, None);
+            self.publish_snapshot(&mut g, false, IdMode::None);
             if let Some(d) = &self.disk {
                 d.persist(&g.segments, &g.deleted)
                     .expect("disk persist tombstone");
@@ -855,18 +1090,18 @@ impl Index {
         let snap = self.snap.load();
         let mut out = Vec::with_capacity(limit.min(64));
         let mut cursor = after;
-        for (si, seg) in snap.segments.iter().enumerate() {
-            let mask = snap.deleted.get(&(si as u32));
+        for seg in snap.segments.iter() {
+            let mask = snap.deleted.get(&seg.segid);
             // advance the inner loop to the cursor instead of filtering from
             // docid 0 (the old `addr <= cur continue` walk made a full handoff
             // O(pages × corpus): page i re-scanned all i×limit prior docids)
             let start_docid = match cursor {
-                Some((cur_si, cur_d)) if (cur_si as usize) == si => cur_d + 1,
-                Some((cur_si, _)) if (cur_si as usize) > si => continue,
+                Some((cur_si, cur_d)) if cur_si == seg.segid => cur_d + 1,
+                Some((cur_si, _)) if cur_si > seg.segid => continue,
                 _ => 0,
             };
             for docid in start_docid..seg.num_docs {
-                let addr = (si as u32, docid);
+                let addr = (seg.segid, docid);
                 if let Some(cur) = cursor {
                     if addr <= cur {
                         continue;
@@ -901,7 +1136,7 @@ impl Index {
     }
 
     fn payload_of(&self, snap: &IndexSnapshot, addr: DocAddr) -> Option<DocPayload> {
-        let seg = snap.segments.get(addr.segment as usize)?;
+        let seg = snap.by_id.get(&addr.segment)?;
         let stored: StoredDoc = seg.stored_doc(addr.docid)?;
         let fields = stored
             .fields
@@ -923,10 +1158,9 @@ impl Index {
         })
     }
 
-    /// publish a snapshot. `segment_change`: segments were added/merged — recompute
-    /// df stats and rebuild the id map. Tombstone-only publishes (delete) reuse the
-    /// cached stats (Arc-shared df) + id map; readers mask via `deleted`.
-    fn publish_snapshot(&self, g: &mut IndexInner, segment_change: bool, new_from: Option<usize>) {
+    /// publish a snapshot. `segment_change` recomputes df stats; `id_mode`
+    /// decides the external-id map work (see the IdMode doc).
+    fn publish_snapshot(&self, g: &mut IndexInner, segment_change: bool, id_mode: IdMode) {
         let nf = self.schema.num_fields();
         let deleted: HashMap<u32, RoaringBitmap> = g
             .deleted
@@ -941,10 +1175,10 @@ impl Index {
         } else {
             deleted
                 .iter()
-                .filter_map(|(&si, mask)| {
-                    let n = g.segments.get(si as usize)?.num_docs;
-                    let full: RoaringBitmap = (0..n).collect();
-                    Some((si, &full - mask))
+                .filter_map(|(&segid, mask)| {
+                    let s = g.by_segid.get(&segid)?;
+                    let full: RoaringBitmap = (0..s.num_docs).collect();
+                    Some((segid, &full - mask))
                 })
                 .collect()
         };
@@ -977,51 +1211,68 @@ impl Index {
                 total_docs = *t;
             }
         }
-        // live external id -> address over a persistent im::HashMap: deletes
-        // remove in place (delete/replace); segment-change publishes extend via
-        // O(1) clone + O(log n) update per appended doc (`segs.extend` appends,
-        // so old addresses stay valid). Merges/boot reset segment indices ->
-        // full rescan (O(live), amortized over the rare merge).
-        let any_ids = !g.hot_ids.is_empty() || g.segments.iter().any(|s| s.has_ids());
-        let ids: Arc<im::HashMap<String, DocAddr>> = if segment_change && any_ids {
-            let from = new_from.unwrap_or(0);
-            let base: im::HashMap<String, DocAddr> = if from == 0 {
-                im::HashMap::new()
-            } else {
-                (*g.ids_arc).clone()
-            };
-            let mut ids = base;
-            for si in from..g.segments.len() {
-                let s = &g.segments[si];
-                let mask = deleted.get(&(si as u32));
-                for docid in 0..s.num_docs {
-                    if mask.is_some_and(|m| m.contains(docid)) {
-                        continue;
-                    }
-                    if let Some(id) = s.id_of(docid) {
-                        ids = ids.update(
-                            id.to_owned(),
-                            DocAddr {
-                                segment: si as u32,
-                                docid,
-                            },
-                        );
+        // live external id -> address over a persistent im::HashMap keyed by
+        // STABLE segid (segments are immutable; a tier merge keeps the ids of
+        // untouched segments valid — only its OUTPUT segment is re-pointed,
+        // and purged rows were already id-less at tombstone time)
+        let ids: Arc<im::HashMap<String, DocAddr>> = match id_mode {
+            IdMode::None => {
+                // tombstone-only publish: deletes rewrote the shared map
+                g.ids_arc.clone()
+            }
+            IdMode::Full => {
+                // boot / global merge: rebuild from every live segment
+                let mut ids = im::HashMap::new();
+                for s in &g.segments {
+                    let mask = deleted.get(&s.segid);
+                    for docid in 0..s.num_docs {
+                        if mask.is_some_and(|m| m.contains(docid)) {
+                            continue;
+                        }
+                        if let Some(id) = s.id_of(docid) {
+                            ids = ids.update(
+                                id.to_owned(),
+                                DocAddr {
+                                    segment: s.segid,
+                                    docid,
+                                },
+                            );
+                        }
                     }
                 }
+                let ids = Arc::new(ids);
+                g.ids_arc = ids.clone();
+                ids
             }
-            let ids = Arc::new(ids);
-            g.ids_arc = ids.clone();
-            ids
-        } else if segment_change {
-            g.ids_arc = Arc::new(im::HashMap::new());
-            g.ids_arc.clone()
-        } else {
-            // tombstone-only publish: deletes already rewrote the shared map
-            g.ids_arc.clone()
+            IdMode::Update(ws) => {
+                // O(docs in these segments): re-point the surviving/new id columns
+                let mut ids = (*g.ids_arc).clone();
+                for s in &ws {
+                    let mask = deleted.get(&s.segid);
+                    for docid in 0..s.num_docs {
+                        if mask.is_some_and(|m| m.contains(docid)) {
+                            continue;
+                        }
+                        if let Some(id) = s.id_of(docid) {
+                            ids = ids.update(
+                                id.to_owned(),
+                                DocAddr {
+                                    segment: s.segid,
+                                    docid,
+                                },
+                            );
+                        }
+                    }
+                }
+                let ids = Arc::new(ids);
+                g.ids_arc = ids.clone();
+                ids
+            }
         };
         let live = total_docs - tombstoned;
         let snapshot = IndexSnapshot {
             segments: g.segments.clone(),
+            by_id: g.by_segid.clone(),
             stats: Stats {
                 total_docs: live as u32,
                 avg_len: g
@@ -1072,12 +1323,12 @@ impl Index {
             use rayon::prelude::*;
             snap.segments
                 .par_iter()
-                .enumerate()
-                .map(|(si, seg)| {
+                .map(|seg| {
                     // complement bitmap is precomputed on the snapshot: when
                     // tombstones exist this used to rebuild `(0..num_docs)-mask`
-                    // per segment per query; now it is an Arc clone
-                    let allowed: Option<&RoaringBitmap> = snap.allowed.get(&(si as u32));
+                    // per segment per query; now it is an Arc clone (keyed by
+                    // the segment's stable id)
+                    let allowed: Option<&RoaringBitmap> = snap.allowed.get(&seg.segid);
                     let mut collector = TopK::new(k);
                     // WAND-lite fast path needs a ctx closure bound to this collector;
                     // for non-Term nodes fall back to dense array evaluation
@@ -1132,7 +1383,7 @@ impl Index {
                             for (i, doc) in ds.ids.iter().enumerate() {
                                 collector.push(
                                     DocAddr {
-                                        segment: si as u32,
+                                        segment: seg.segid,
                                         docid: *doc,
                                     },
                                     ds.scores[i],
@@ -1140,7 +1391,7 @@ impl Index {
                             }
                         }
                     }
-                    // term_stream pushes with segment=0; remap to this segment index
+                    // collectors push with the segment's own segid (payload lookups yes via snap.by_id)
                     let out = collector.into_sorted();
                     out.into_iter()
                         .filter(|h| {
@@ -1148,12 +1399,12 @@ impl Index {
                             // (phrase, fuzzy, prefix): drop tombstoned docs
                             !snap
                                 .deleted
-                                .get(&(si as u32))
+                                .get(&seg.segid)
                                 .is_some_and(|m| m.contains(h.addr.docid))
                         })
                         .map(|h| SearchHit {
                             addr: DocAddr {
-                                segment: si as u32,
+                                segment: seg.segid,
                                 ..h.addr
                             },
                             score: h.score,

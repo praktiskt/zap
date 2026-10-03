@@ -160,6 +160,11 @@ impl SegmentBuilder {
 }
 
 pub struct SegmentReader {
+    /// stable identity across publishes: tombstones, id-map addresses and
+    /// snapshot lookups key on this instead of the snapshot's positional
+    /// index (which renumbers at merges). 0 = unassigned (assigned by Index
+    /// when the segment is installed).
+    pub segid: u32,
     pub num_docs: u32,
     /// per-field term dictionaries; global infos offset base is tracked per field
     fsts: Vec<Map<Vec<u8>>>,
@@ -176,6 +181,27 @@ pub struct SegmentReader {
     ids: Vec<Option<String>>,
     /// docids sorted by their id (binary-search forward index); empty iff ids is empty
     id_fwd: Vec<u32>,
+}
+
+impl SegmentReader {
+    /// shallow re-identity: every field clones (all small metadata vecs/blobs
+    /// copied) so the old Arc can stay shared. Only used on zapseg1/2 boot
+    /// segments, whose bytes carried no segid (assigned fresh at boot).
+    pub(crate) fn reidentify(&self, segid: u32) -> Self {
+        Self {
+            segid,
+            num_docs: self.num_docs,
+            fsts: self.fsts.clone(),
+            fst_raw: self.fst_raw.clone(),
+            content_hash: std::sync::OnceLock::new(),
+            infos: self.infos.clone(),
+            blob: self.blob.clone(),
+            field_norms: self.field_norms.clone(),
+            store_blocks: self.store_blocks.clone(),
+            ids: self.ids.clone(),
+            id_fwd: self.id_fwd.clone(),
+        }
+    }
 }
 
 // -- disk serialization (opt-in --disk) --------------------------------------
@@ -206,6 +232,9 @@ impl SegmentReader {
         }
         let mut out = Vec::new();
         out.extend_from_slice(SEG_MAGIC);
+        // v3: stable segment identity survives disk round-trips (subset tier
+        // merges must not renumber live segments; tombstones/id addresses key on it)
+        push_u32(&mut out, self.segid);
         push_u32(&mut out, self.num_docs);
         push_u32(&mut out, self.fsts.len() as u32);
         for bytes in self.fst_raw.iter() {
@@ -260,6 +289,15 @@ impl SegmentReader {
             return Err("bad segment magic".into());
         }
         p += 8;
+        let is_v3 = &bytes[..8] == SEG_MAGIC;
+        let mut segid = 0u32;
+        if is_v3 {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (segid)".into());
+            }
+            segid = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            p += 4;
+        }
         if bytes.len() < p + 4 {
             return Err("segment truncated (num_docs)".into());
         }
@@ -403,6 +441,7 @@ impl SegmentReader {
             }
         }
         let mut reader = SegmentReader {
+            segid,
             num_docs,
             fsts,
             fst_raw: fst_raws.into_boxed_slice(),
@@ -509,6 +548,7 @@ pub fn freeze_parts(
     // forward id index: only materialized when at least one doc carries an id
     let (ids, id_fwd) = rebuild_id_fwd(&ids, num_docs);
     SegmentReader {
+        segid: 0,
         num_docs,
         fsts,
         fst_raw: fst_raws.into_boxed_slice(),
