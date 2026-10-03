@@ -267,6 +267,17 @@ enum IdMode {
     Update(Vec<Arc<SegmentReader>>),
 }
 
+/// one resolved query: parse tree + per-distinct-term stem pairs (Arc-shared
+/// across the per-segment tasks; parse/stem work happens once per query string)
+struct QueryPlan {
+    node: Node,
+    stems: HashMap<String, [Option<Arc<str>>; 2]>,
+}
+
+/// query-plan cache ceiling: on overflow the map clears once (coarsely
+/// bounds memory without a real LRU; hot serving sets re-populate fast)
+const QUERY_CACHE_MAX: usize = 512;
+
 pub struct IndexSnapshot {
     pub segments: Vec<Arc<SegmentReader>>,
     /// segid -> segment (payload lookups by stable id; DocAddr.segment IS a segid)
@@ -375,6 +386,9 @@ struct IndexInner {
     live_sums: Vec<u64>,
     /// (sums, df, total_docs) cached between segment changes (tombstone-only publishes)
     stats_cache: Option<StatsCache>,
+    /// parsed-query plans (parse + stems), LRU-ish: serving repeats query
+    /// strings constantly; parse + snowball are ~us per request otherwise
+    qcache: HashMap<String, Arc<QueryPlan>>,
     /// ids of docs pending in hot lanes (uncommitted, invisible to readers)
     hot_ids: HashSet<String>,
     generation: u64,
@@ -478,6 +492,7 @@ impl Index {
                 by_segid: segs.iter().map(|s| (s.segid, s.clone())).collect(),
                 deleted: tomb,
                 ids_arc: Arc::new(im::HashMap::new()),
+                qcache: HashMap::new(),
                 live_sums,
                 stats_cache: None,
                 hot_ids: HashSet::new(),
@@ -1310,12 +1325,32 @@ impl Index {
         k: usize,
         stats: crate::search::exec::Stats,
     ) -> Result<Vec<SearchHit>, IndexError> {
-        let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
+        // query plan resolved ONCE per distinct query string (parse + snowball
+        // stems): serving repeats hot query strings constantly, and the parse
+        // + stem work is ~us per otherwise-unique request. The plan is fully
+        // self-contained (owned node + Arc'd own stems), snapshot- and
+        // stats-independent — it never goes invalid as the engine mutates.
+        // Bounded by QUERY_CACHE_MAX with a coarse clear-on-overflow.
+        let plan: Arc<QueryPlan> = {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(hit) = g.qcache.get(q) {
+                hit.clone()
+            } else {
+                let node =
+                    crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
+                let stems = crate::search::exec::stem_cache(&self.analyzer, &node);
+                let plan = Arc::new(QueryPlan { node, stems });
+                if g.qcache.len() >= QUERY_CACHE_MAX {
+                    g.qcache.clear(); // coarse reset: hot queries re-bucket next round
+                }
+                g.qcache.insert(q.to_string(), plan.clone());
+                plan
+            }
+        };
+        let node = &plan.node;
+        let stems = &plan.stems;
         let snap = self.snap.load();
         let params = self.params();
-        // resolve query-term stems once (snowball + alloc per DISTINCT term),
-        // shared read-only across the per-segment rayon tasks
-        let stems = crate::search::exec::stem_cache(&self.analyzer, &node);
         // single Term: streaming walk with a live topk threshold (block-max WAND);
         // generic nodes: dense arrays + collector push. Tombstoned docs are masked
         // through the `allowed` probe (zero cost when no tombstones exist).
@@ -1343,10 +1378,10 @@ impl Index {
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
-                                stems: &stems,
+                                stems,
                             };
                             crate::search::exec::eval_term_stream(
-                                &node,
+                                node,
                                 None,
                                 seg,
                                 &ctx,
@@ -1376,10 +1411,10 @@ impl Index {
                                 params: &params,
                                 analyzer: &self.analyzer,
                                 threshold: &thr,
-                                stems: &stems,
+                                stems,
                             };
                             let ds =
-                                crate::search::exec::eval_allowed(&node, None, seg, &ctx, allowed);
+                                crate::search::exec::eval_allowed(node, None, seg, &ctx, allowed);
                             for (i, doc) in ds.ids.iter().enumerate() {
                                 collector.push(
                                     DocAddr {
