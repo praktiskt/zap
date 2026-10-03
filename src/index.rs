@@ -538,8 +538,10 @@ impl Index {
         };
         let mut w = Some(self.writer.lock().unwrap());
         if collides {
-            // sequential replace-aware path; hot dups of PRIOR ingests flush
-            // once (within-batch dups were already deduped)
+            // replace-aware path: hot dups of PRIOR ingests flush once
+            // (within-batch dups were already deduped), then every	ombstone
+            // comes off ids_arc UPFRONT and the whole batch parallel-enqueues
+            // (the old doc-by-doc sequential loop paid full per-doc sends)
             let any_hot = {
                 let g = self.inner.lock().unwrap();
                 deduped
@@ -549,17 +551,33 @@ impl Index {
             if any_hot {
                 drop(w.take().unwrap());
                 self.commit();
-                // re-hold the writer for the sequential add loop
                 let _w = self.writer.lock().unwrap();
-                let mut g = self.inner.lock().unwrap();
-                for doc in &deduped {
-                    self.add_locked(&mut g, doc)?;
-                }
-                return Ok(());
             }
             let mut g = self.inner.lock().unwrap();
+            if let Some(name) = deduped
+                .iter()
+                .flat_map(|d| d.fields.keys())
+                .find(|f| self.schema.field_id(f).is_none())
+            {
+                return Err(IndexError::UnknownField(name.clone()));
+            }
             for doc in &deduped {
-                self.add_locked(&mut g, doc)?;
+                if let Some(id) = &doc.id {
+                    if id.is_empty() {
+                        return Err(IndexError::BadId(id.clone()));
+                    }
+                    if let Some(old) = g.ids_arc.get(id).copied() {
+                        g.deleted.entry(old.segment).or_default().insert(old.docid);
+                        g.ids_arc = Arc::new(g.ids_arc.as_ref().without(id));
+                    }
+                    g.hot_ids.insert(id.clone());
+                }
+            }
+            for doc in deduped {
+                let lane = self.next_lane.fetch_add(1, Ordering::Relaxed) % self.lane_count;
+                self.lanes[lane]
+                    .send(LaneMsg::Add(vec![doc]))
+                    .map_err(|_| IndexError::Query("lane worker died".into()))?;
             }
             return Ok(());
         }
