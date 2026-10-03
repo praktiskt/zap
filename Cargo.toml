@@ -23,6 +23,7 @@ im = "15.1"
 
 [dev-dependencies]
 assert_cmd = "2"
+bitpacking = "0.9.3"
 criterion = "0.7"
 predicates = "3"
 proptest = "1"
