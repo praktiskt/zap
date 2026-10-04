@@ -55,6 +55,7 @@ spec:
           {{- end }}
           ports:
             - containerPort: {{ .Values.service.targetPort }}
+              name: http
           command: ["/zap", "serve", "--bind", "0.0.0.0:{{ .Values.service.targetPort }}"]
           args:
             {{- if .Values.serve.lanes }}
@@ -69,6 +70,9 @@ spec:
             {{- if and .Values.cluster.enabled .Values.cluster.peersService }}
             - --peers={{ .Values.cluster.peersService }}:{{ .Values.service.targetPort }}
             - --announce=$(POD_IP):{{ .Values.service.targetPort }}
+            {{- end }}
+            {{- if and .Values.cluster.enabled .Values.cluster.resync }}
+            - --resync
             {{- end }}
             {{- if .Values.cluster.disk.enabled }}
             - --disk=/zap-data

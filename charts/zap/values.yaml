@@ -11,7 +11,7 @@ service:
 
 # serve-mode flags (zap serve --bind <host>:<targetPort> ...)
 serve:
-  lanes: ""    # parallel ingest lanes; "" = default (cores)
+  lanes: ""    # parallel ingest lanes; "" = CLI default (16)
   topK: 10
   k1: "1.2"
   b: "0.75"
@@ -80,17 +80,19 @@ ingress:
   #   secretName: my-tls-secret
 
 health:
+  # probe ports reference the container's named `http` port, so they track
+  # service.targetPort automatically
   livenessProbe:
     httpGet:
       path: /health
-      port: 3279
+      port: http
     initialDelaySeconds: 3
     periodSeconds: 10
     failureThreshold: 3
   readinessProbe:
     httpGet:
       path: /health
-      port: 3279
+      port: http
     initialDelaySeconds: 5
     periodSeconds: 10
     # allow slow corpus loads from a ConfigMap before traffic is sent
