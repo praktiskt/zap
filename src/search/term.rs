@@ -101,7 +101,7 @@ pub fn term_scores_allowed(
     let mut r = PostingReader::new(info, blob);
     let mut out = DocScores::default();
     out.ids.reserve(info.df as usize);
-    while let Some((doc, tf)) = r.advance() {
+    while let Some((doc, tf)) = r.advance_lazy() {
         if let Some(a) = allowed {
             if !a.contains(doc) {
                 continue;

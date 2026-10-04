@@ -419,6 +419,19 @@ impl<'a> PostingReader<'a> {
         out
     }
 
+    /// advance without the peek prefetch: one row decode per call. For pure
+    /// docid/tf walks (term scoring, AND gallop drivers) that never touch
+    /// peek()/peek_positions_into; phrase cursors keep advance().
+    pub fn advance_lazy(&mut self) -> Option<(u32, u32)> {
+        if self.peeked.is_none() {
+            if self.docidx >= self.doc_count {
+                return None;
+            }
+            self.decode_next();
+        }
+        self.peeked.take()
+    }
+
     /// positions of the doc at 0-based order `docidx`
     pub fn positions(&self, docidx: usize) -> Option<Vec<u32>> {
         let offs = self.posoff_start + docidx * 4;

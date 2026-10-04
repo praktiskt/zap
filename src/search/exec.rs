@@ -191,7 +191,7 @@ pub fn eval_term_stream(
             let norms = seg.norms(fid);
             let mut r = seg.reader(&info);
             let mut seen_block = usize::MAX;
-            while let Some((doc, tf)) = r.advance() {
+            while let Some((doc, tf)) = r.advance_lazy() {
                 if let Some(al) = allowed {
                     if !al.contains(doc) {
                         continue;
@@ -516,7 +516,7 @@ fn and_two_infos(
         .reserve(usize::min(drv.2.df as usize, oth.2.df as usize));
     out.scores
         .reserve(usize::min(drv.2.df as usize, oth.2.df as usize));
-    while let Some((doc, tf_d)) = r_drv.advance() {
+    while let Some((doc, tf_d)) = r_drv.advance_lazy() {
         if let Some(al) = allowed {
             if !al.contains(doc) {
                 continue;
@@ -641,7 +641,7 @@ fn and_chunk(
     let norms_oth = seg.norms(oth.0);
     let fold_drv = crate::search::term::Bm25Fold::new(idf_drv, ctx.params, ctx.stats.avg_of(drv.0));
     let fold_oth = crate::search::term::Bm25Fold::new(idf_oth, ctx.params, ctx.stats.avg_of(oth.0));
-    while let Some((doc, tf_d)) = r_drv.advance() {
+    while let Some((doc, tf_d)) = r_drv.advance_lazy() {
         if doc >= hi {
             break;
         }
