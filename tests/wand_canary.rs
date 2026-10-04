@@ -43,13 +43,27 @@ fn outliers_rank_on_top() {
     }
     let hits = index.search("fox", 10).unwrap();
     assert_eq!(hits.len(), 10);
-    // every returned doc must be an outlier (docid % 1000 == 500)
+    // every returned doc must be an outlier: at least the 100 planted
+    // 'fox' occurrences ("fox" is also in the random word list, so true
+    // outliers usually carry a few extra). The docid % 1000 == 500 pattern
+    // is NOT a valid invariant: subset tier merges re-index docids
+    // mid-corpus (the merged segment's row 0 starts wherever its first
+    // source started), which shifts the modulo pattern without changing
+    // which docs are outliers. The tf itself is the truth.
     for h in &hits {
-        assert_eq!(
-            h.addr.docid % 1000,
-            500,
-            "non-outlier doc leaked into top-k: {:?}",
-            h.addr.docid
+        let text = index.doc_payload(h.addr).expect("hit payload");
+        let fcount = text
+            .fields
+            .iter()
+            .map(|f| f.1.as_str())
+            .collect::<String>()
+            .matches("fox ")
+            .count();
+        assert!(
+            fcount >= 100,
+            "non-outlier doc leaked into top-k: {:?} (fcount={})",
+            h.addr.docid,
+            fcount
         );
     }
     // scores ordered high -> low
