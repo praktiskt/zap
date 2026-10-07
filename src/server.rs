@@ -318,6 +318,9 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
         (Method::Get, "/health") => {
             reply(req, 200, r##"{"status":"ok"}"##);
         }
+        (Method::Get, "/docs") => {
+            respond_body(req, 200, DOCS_MD, "text/markdown; charset=utf-8");
+        }
         (Method::Get, "/dashboard") => match dashboard_dir().get_file("index.html") {
             Some(f) => reply_html(req, 200, f.contents_utf8().unwrap_or("")),
             None => reply(req, 500, r#"{"error":"dashboard assets missing"}"#),
@@ -1506,6 +1509,11 @@ fn respond_body(req: Request, code: u16, body: &str, content_type: &str) {
     );
     let _ = req.respond(r.with_status_code(code));
 }
+
+// ---- /docs (compile-time embedded usage page) -------------------------------
+
+/// usage docs served as plain markdown at GET /docs (source: src/server/docs.md)
+static DOCS_MD: &str = include_str!("server/docs.md");
 
 // ---- /dashboard (compile-time embedded assets) -----------------------------
 

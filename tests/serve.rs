@@ -164,6 +164,31 @@ fn dashboard_served_with_assets() {
 }
 
 #[test]
+fn docs_served_as_markdown() {
+    // /docs: usage page, plain markdown MIME, documents the live routes
+    let addr = start_serve();
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.write_all(b"GET /docs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).ok();
+    let t = String::from_utf8_lossy(&resp).into_owned();
+    let (head, body) = t.split_once("\r\n\r\n").unwrap_or((&t, ""));
+    assert!(head.contains("200"), "{head}");
+    assert!(head.contains("text/markdown"), "{head}");
+    for marker in [
+        "POST /ingest",
+        "GET /search",
+        "query syntax",
+        "/doc/{id}",
+        "cluster mode",
+    ] {
+        assert!(body.contains(marker), "docs missing {marker:?}");
+    }
+}
+
+#[test]
 fn dashboard_sse_pushes_stats_frames() {
     // reactive dashboard: /dashboard/events streams `event: stats` frames
     // (heartbeat when idle, immediate on ingest/commit notifications)
