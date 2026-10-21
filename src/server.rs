@@ -30,6 +30,8 @@ use crate::cluster::{
 use crate::index::Index;
 use crate::schema::Document;
 use crate::search::exec::Stats;
+use crate::search::fusion::Candidate;
+use crate::search::{DocAddr, Fusion, SearchMode, SearchRequest};
 
 const MAX_BODY: usize = 64 << 20; // 64 MB ingest ceiling per request
 
@@ -454,22 +456,15 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
             }
         }
         (Method::Get, "/stats") => stats_reply(req, index, cluster),
-        (Method::Get, "/search") => match query_param(&query, "q") {
-            Some(q) => {
-                let k = query_param(&query, "k")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(10);
-                SEARCHES.fetch_add(1, Ordering::Relaxed);
-                search_reply(req, index, cluster, q, k);
-            }
-            None => {
-                reply(req, 400, r#"{"error":"missing `q`"}"#);
-            }
-        },
+        (Method::Get, "/search") => {
+            let wire = wire_search_query(&query);
+            SEARCHES.fetch_add(1, Ordering::Relaxed);
+            search_reply(req, index, cluster, wire);
+        }
         (Method::Post, "/search") => match read_body(&mut req).and_then(|b| json_search(&b)) {
-            Ok((q, k)) => {
+            Ok(wire) => {
                 SEARCHES.fetch_add(1, Ordering::Relaxed);
-                search_reply(req, index, cluster, q, k);
+                search_reply(req, index, cluster, wire);
             }
             Err(msg) => reply(req, 400, &msg),
         },
@@ -538,7 +533,7 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
         }
         (Method::Post, "/__zap/shard_search") => {
             match read_body(&mut req).and_then(|b| json_search(&b)) {
-                Ok((q, k)) => shard_search_reply(req, index, cluster, q, k),
+                Ok(wire) => shard_search_reply(req, index, cluster, wire),
                 Err(msg) => reply(req, 400, &msg),
             }
         }
@@ -805,9 +800,165 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
     }
 }
 
-fn search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String, k: usize) {
+// ---- search wire -----------------------------------------------------------
+
+/// parsed search request: keyword text and/or an embedding
+#[derive(Debug, Clone, Default)]
+struct WireSearch {
+    q: Option<String>,
+    k: Option<usize>,
+    vector: Option<Vec<f32>>,
+    field: Option<String>,
+    mode: Option<String>,
+    alpha: Option<f32>,
+    fusion: Option<String>,
+    /// candidate pool per shard (cluster internals)
+    pool: Option<usize>,
+}
+
+/// comma-separated embedding ("0.1,0.2,3") -> values
+fn csv_vector(s: &str) -> Result<Vec<f32>, String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(
+            t.parse::<f32>()
+                .map_err(|_| format!("`vector` element `{t}` is not a number"))?,
+        );
+    }
+    if out.is_empty() {
+        return Err("`vector` is empty".into());
+    }
+    Ok(out)
+}
+
+/// parse the search request body (POST /search, POST /__zap/shard_search)
+fn json_search(body: &str) -> Result<WireSearch, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    let obj = v.as_object().ok_or("body must be a JSON object")?;
+    let w = WireSearch {
+        q: obj.get("q").and_then(|x| x.as_str()).map(|s| s.to_string()),
+        k: obj.get("k").and_then(|x| x.as_u64()).map(|n| n as usize),
+        field: obj
+            .get("field")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        mode: obj
+            .get("mode")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        alpha: obj.get("alpha").and_then(|x| x.as_f64()).map(|f| f as f32),
+        fusion: obj
+            .get("fusion")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        pool: obj.get("pool").and_then(|x| x.as_u64()).map(|n| n as usize),
+        vector: match obj.get("vector") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(it.as_f64().ok_or("`vector` must contain only numbers")? as f32);
+                }
+                Some(out)
+            }
+            Some(serde_json::Value::String(s)) => Some(csv_vector(s)?),
+            Some(_) => return Err("`vector` must be an array of numbers".into()),
+        },
+    };
+    Ok(w)
+}
+
+/// parse the search request from the query string (GET /search)
+fn wire_search_query(query: &str) -> WireSearch {
+    WireSearch {
+        q: query_param(query, "q"),
+        k: query_param(query, "k").and_then(|s| s.parse().ok()),
+        vector: query_param(query, "vector").and_then(|s| csv_vector(&s).ok()),
+        field: query_param(query, "field"),
+        mode: query_param(query, "mode"),
+        alpha: query_param(query, "alpha").and_then(|s| s.parse().ok()),
+        fusion: query_param(query, "fusion"),
+        pool: None,
+    }
+}
+
+/// resolve the wire request into an engine request (mode defaults to
+/// keyword+vector = hybrid when both are present)
+fn build_request(w: &WireSearch) -> Result<SearchRequest, String> {
+    let mode = match w.mode.as_deref() {
+        Some("keyword") => SearchMode::Keyword,
+        Some("vector") => SearchMode::Vector,
+        Some("hybrid") => SearchMode::Hybrid,
+        Some("filter") => SearchMode::Filter,
+        Some(other) => return Err(format!("unknown mode `{other}`")),
+        None => match (w.q.as_ref(), w.vector.as_ref()) {
+            (Some(_), Some(_)) => SearchMode::Hybrid,
+            (None, Some(_)) => SearchMode::Vector,
+            _ => SearchMode::Keyword,
+        },
+    };
+    let fusion = match w.fusion.as_deref() {
+        Some("rrf") => Fusion::Rrf,
+        Some("weighted") => Fusion::Weighted,
+        Some(other) => return Err(format!("unknown fusion `{other}`")),
+        None => Fusion::Weighted,
+    };
+    match mode {
+        SearchMode::Keyword if w.q.is_none() => return Err("missing `q`".into()),
+        SearchMode::Vector if w.vector.is_none() => return Err("missing `vector`".into()),
+        SearchMode::Hybrid | SearchMode::Filter if w.q.is_none() || w.vector.is_none() => {
+            return Err("hybrid search needs both `q` and `vector`".into())
+        }
+        _ => {}
+    }
+    Ok(SearchRequest {
+        text: w.q.clone(),
+        vector: w.vector.clone(),
+        field: w.field.clone(),
+        k: w.k.unwrap_or(10),
+        mode,
+        alpha: w.alpha.unwrap_or(0.5).clamp(0.0, 1.0),
+        fusion,
+    })
+}
+
+fn mode_name(m: SearchMode) -> &'static str {
+    match m {
+        SearchMode::Keyword => "keyword",
+        SearchMode::Vector => "vector",
+        SearchMode::Hybrid => "hybrid",
+        SearchMode::Filter => "filter",
+    }
+}
+
+fn fusion_name(f: Fusion) -> &'static str {
+    match f {
+        Fusion::Weighted => "weighted",
+        Fusion::Rrf => "rrf",
+    }
+}
+
+/// candidate pool per shard: the fusion needs more than k candidates per
+/// modality (a document that is mid-ranked in both lists must still be able
+/// to reach the fused top-k)
+fn pool_for(sr: &SearchRequest) -> usize {
+    match sr.mode {
+        SearchMode::Hybrid => sr.k.saturating_mul(4).max(64),
+        _ => sr.k.max(1),
+    }
+}
+
+fn search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, wire: WireSearch) {
+    let sr = match build_request(&wire) {
+        Ok(sr) => sr,
+        Err(msg) => return reply(req, 400, &serde_json::json!({"error": msg}).to_string()),
+    };
     let Some(cl) = cluster else {
-        return match index.search(&q, k) {
+        return match index.search_request(&sr, index.pub_stats()) {
             Ok(hits) => {
                 let results: Vec<serde_json::Value> =
                     hits.iter().filter_map(|h| hit_row(index, h)).collect();
@@ -817,10 +968,14 @@ fn search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String,
                     &serde_json::json!({"results": results, "count": results.len()}).to_string(),
                 );
             }
-            Err(e) => reply(req, 400, &e.to_string()),
+            Err(e) => reply(
+                req,
+                400,
+                &serde_json::json!({"error": e.to_string()}).to_string(),
+            ),
         };
     };
-    let (code, body) = cluster_search(index, cl, &q, k);
+    let (code, body) = cluster_search(index, cl, &sr);
     reply(req, code, &body);
 }
 
@@ -829,18 +984,17 @@ fn search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String,
 /// one merged result row on the wire
 #[derive(Debug, Clone)]
 struct MergedRow {
-    score: f32,
+    /// address of the row (local: the real segment address; remote: a
+    /// synthetic shard id, so two shards never collide on an unkeyed doc)
+    addr: DocAddr,
+    /// BM25 component (None = the document did not match the keyword query)
+    kw: Option<f32>,
+    /// similarity component (None = the document carries no embedding)
+    vec: Option<f32>,
     id: Option<String>,
     docid: u32,
     doc: String,
     metadata: Option<serde_json::Value>,
-}
-
-fn merged_cmp(a: &MergedRow, b: &MergedRow) -> std::cmp::Ordering {
-    b.score
-        .total_cmp(&a.score)
-        .then_with(|| a.docid.cmp(&b.docid))
-        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// wire row for one search hit (payload resolved through the doc store)
@@ -861,6 +1015,10 @@ fn hit_row(index: &Index, h: &crate::search::SearchHit) -> Option<serde_json::Va
         "id": p.id,
         "docid": h.addr.docid,
         "doc": doc,
+        // the per-modality components (null when the modality did not
+        // produce this document)
+        "keyword_score": h.kw,
+        "vector_score": h.vec,
     });
     if let Some(meta) = p.metadata {
         v["metadata"] = meta;
@@ -868,24 +1026,37 @@ fn hit_row(index: &Index, h: &crate::search::SearchHit) -> Option<serde_json::Va
     Some(v)
 }
 
-fn row_to_json(r: MergedRow) -> serde_json::Value {
+fn row_to_json(r: &MergedRow, h: &crate::search::SearchHit) -> serde_json::Value {
     let mut v = serde_json::json!({
-        "score": r.score,
+        "score": h.score,
         "id": r.id,
         "docid": r.docid,
         "doc": r.doc,
+        // the MERGED per-modality scores of the fused group (the row is one
+        // replica's copy; the fused group may have contributions from several)
+        "keyword_score": h.kw,
+        "vector_score": h.vec,
     });
-    if let Some(m) = r.metadata {
-        v["metadata"] = m;
+    if let Some(m) = &r.metadata {
+        v["metadata"] = m.clone();
     }
     v
 }
 
-fn row_from_json(v: &serde_json::Value) -> MergedRow {
+/// a peer's row: the address is synthetic (peers share no address space and
+/// their docids restart per segment, so the ROW INDEX is the identity), the
+/// docid is the shard-local one the peer reported
+fn row_from_json(v: &serde_json::Value, shard: u32, row: u32) -> MergedRow {
+    let docid = v["docid"].as_u64().unwrap_or(0) as u32;
     MergedRow {
-        score: v["score"].as_f64().unwrap_or(0.0) as f32,
+        addr: DocAddr {
+            segment: shard,
+            docid: row,
+        },
+        kw: v.get("kw").and_then(|x| x.as_f64()).map(|f| f as f32),
+        vec: v.get("vec").and_then(|x| x.as_f64()).map(|f| f as f32),
         id: v["id"].as_str().map(|s| s.to_owned()),
-        docid: v["docid"].as_u64().unwrap_or(0) as u32,
+        docid,
         doc: v["doc"].as_str().unwrap_or("").to_owned(),
         metadata: v.get("metadata").cloned().filter(|m| !m.is_null()),
     }
@@ -893,8 +1064,8 @@ fn row_from_json(v: &serde_json::Value) -> MergedRow {
 
 /// coordinator: score the local shard and fan out to every peer CONCURRENTLY
 /// (wall time = slowest peer + local eval, not the sum of all peers);
-/// merge rows, truncate to k
-fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, String) {
+/// merge rows, fuse the modalities globally, truncate to k
+fn cluster_search(index: &Index, cl: &LocalCluster, sr: &SearchRequest) -> (u16, String) {
     let stats: Stats = {
         let mut view = cl.view.lock().unwrap();
         let g = view.stats();
@@ -915,22 +1086,30 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
         }
     };
     let peers = cl.cache.lock().unwrap().peers();
-    let q_owned = q.to_owned();
-    let (mut rows, degraded) = std::thread::scope(|scope| {
+    let pool = pool_for(sr);
+    let body = serde_json::json!({
+        "q": sr.text,
+        "k": sr.k,
+        "vector": sr.vector,
+        "field": sr.field,
+        "mode": mode_name(sr.mode),
+        "alpha": sr.alpha,
+        "fusion": fusion_name(sr.fusion),
+        "pool": pool,
+    })
+    .to_string();
+    let (rows, degraded) = std::thread::scope(|scope| {
         let mut jobs: Vec<std::thread::ScopedJoinHandle<'_, Result<Vec<MergedRow>, String>>> =
             Vec::new();
-        for peer in &peers {
-            let q2 = q_owned.clone();
-            jobs.push(scope.spawn(move || fanout_rows(*peer, &q2, k)));
+        for (pi, peer) in peers.iter().enumerate() {
+            let body = body.clone();
+            // synthetic shard id: peers share no address space, and the local
+            // rows keep their real segment addresses
+            let shard = 0x8000_0000u32 + pi as u32;
+            jobs.push(scope.spawn(move || fanout_rows(*peer, &body, shard)));
         }
         // own shard runs on this thread while peers fan out
-        let mut rows = match index.search_with_stats(q, k, stats) {
-            Ok(hits) => hits
-                .into_iter()
-                .filter_map(|h| row_of_hit(index, &h))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut rows = local_rows(index, sr, pool, &stats);
         let mut degraded = false;
         for jh in jobs {
             match jh.join() {
@@ -940,17 +1119,28 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
         }
         (rows, degraded)
     });
-    // replication means the same doc can surface on R shards — and its replica
-    // copy may be a STALE pre-replace version: sort by score, then keep only
-    // the FIRST (highest-scored) row per id
-    rows.sort_by(merged_cmp);
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    rows.retain(|r| match &r.id {
-        Some(id) => seen.insert(id.clone()),
-        None => true,
-    });
-    rows.truncate(k);
-    let results: Vec<serde_json::Value> = rows.into_iter().map(row_to_json).collect();
+    // fuse globally: the SAME fusion the single-node path uses, so a hybrid
+    // search ranks identically on one node and on a ring
+    let mut cands: Vec<Candidate> = Vec::with_capacity(rows.len());
+    let mut row_of: std::collections::HashMap<DocAddr, usize> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        row_of.insert(r.addr, i);
+        cands.push(Candidate {
+            addr: r.addr,
+            id: r.id.clone(),
+            kw: r.kw,
+            vec: r.vec,
+        });
+    }
+    let hits = crate::search::fusion::fuse(cands, sr.mode, sr.alpha, sr.fusion, sr.k);
+    let results: Vec<serde_json::Value> = hits
+        .iter()
+        .filter_map(|h| {
+            let r = row_of.get(&h.addr)?;
+            Some(row_to_json(&rows[*r], h))
+        })
+        .collect();
     let n = results.len();
     (
         200,
@@ -958,17 +1148,28 @@ fn cluster_search(index: &Index, cl: &LocalCluster, q: &str, k: usize) -> (u16, 
     )
 }
 
-/// direct row from a hit (no JSON roundtrip for the local shard)
-fn row_of_hit(index: &Index, h: &crate::search::SearchHit) -> Option<MergedRow> {
-    let p = index.doc_payload(h.addr)?;
-    let doc = joined_fields(&p);
-    Some(MergedRow {
-        score: h.score,
-        id: p.id,
-        docid: h.addr.docid,
-        doc,
-        metadata: p.metadata,
-    })
+/// this shard's candidate rows (the payload is resolved here, so the
+/// coordinator does not need a second roundtrip)
+fn local_rows(index: &Index, sr: &SearchRequest, pool: usize, stats: &Stats) -> Vec<MergedRow> {
+    let Ok(cands) = index.candidates(sr, stats.clone(), pool) else {
+        return Vec::new();
+    };
+    cands
+        .into_iter()
+        .filter_map(|c| {
+            let p = index.doc_payload(c.addr)?;
+            let doc = joined_fields(&p);
+            Some(MergedRow {
+                addr: c.addr,
+                kw: c.kw,
+                vec: c.vec,
+                id: p.id,
+                docid: c.addr.docid,
+                doc,
+                metadata: p.metadata,
+            })
+        })
+        .collect()
 }
 
 /// merged global view on the wire
@@ -981,10 +1182,9 @@ fn global_to_envelope(g: crate::cluster::GlobalStats) -> StatsEnvelope {
     }
 }
 
-/// fan-out one query to a shard; returns its top-k rows
-fn fanout_rows(peer: SocketAddr, q: &str, k: usize) -> Result<Vec<MergedRow>, String> {
-    let body = serde_json::json!({"q": q, "k": k}).to_string();
-    let (_, resp) = http_post(peer, "/__zap/shard_search", &body)
+/// fan-out one query to a shard; returns its candidate rows
+fn fanout_rows(peer: SocketAddr, body: &str, shard: u32) -> Result<Vec<MergedRow>, String> {
+    let (_, resp) = http_post(peer, "/__zap/shard_search", body)
         .ok_or_else(|| "peer unreachable".to_string())?;
     let v: serde_json::Value =
         serde_json::from_str(&resp).map_err(|e| format!("peer bad json: {e}"))?;
@@ -993,11 +1193,21 @@ fn fanout_rows(peer: SocketAddr, q: &str, k: usize) -> Result<Vec<MergedRow>, St
         .and_then(|o| o.get("results"))
         .and_then(|r| r.as_array())
         .ok_or("peer response missing results")?;
-    Ok(items.iter().map(row_from_json).collect())
+    Ok(items
+        .iter()
+        .enumerate()
+        .map(|(i, r)| row_from_json(r, shard, i as u32))
+        .collect())
 }
 
-/// shard-side handler: score ONLY our shard with OUR global view
-fn shard_search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: String, k: usize) {
+/// shard-side handler: score ONLY our shard with OUR global view and return
+/// the candidate rows (the coordinator fuses the modalities globally)
+fn shard_search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, wire: WireSearch) {
+    let sr = match build_request(&wire) {
+        Ok(sr) => sr,
+        Err(msg) => return reply(req, 400, &serde_json::json!({"error": msg}).to_string()),
+    };
+    let pool = wire.pool.unwrap_or_else(|| pool_for(&sr));
     let env: StatsEnvelope = match cluster {
         Some(cl) => global_to_envelope(cl.view.lock().unwrap().stats()),
         None => {
@@ -1006,34 +1216,35 @@ fn shard_search_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, q: S
         }
     };
     let stats = stats_from_envelope(env);
-    match index.search_with_stats(&q, k, stats) {
-        Ok(hits) => {
-            let results: Vec<serde_json::Value> =
-                hits.iter().filter_map(|h| hit_row(index, h)).collect();
+    match index.candidates(&sr, stats, pool) {
+        Ok(cands) => {
+            let results: Vec<serde_json::Value> = cands
+                .iter()
+                .filter_map(|c| {
+                    let p = index.doc_payload(c.addr)?;
+                    Some(serde_json::json!({
+                        "score": c.kw.or(c.vec).unwrap_or(0.0),
+                        "kw": c.kw,
+                        "vec": c.vec,
+                        "id": p.id,
+                        "docid": c.addr.docid,
+                        "doc": joined_fields(&p),
+                        "metadata": p.metadata,
+                    }))
+                })
+                .collect();
             reply(
                 req,
                 200,
                 &serde_json::json!({"results": results, "count": results.len()}).to_string(),
             );
         }
-        Err(e) => reply(req, 200, &e.to_string()),
+        Err(e) => reply(
+            req,
+            400,
+            &serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
     }
-}
-
-fn json_search(body: &str) -> Result<(String, usize), String> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
-    let q = v
-        .as_object()
-        .and_then(|o| o.get("q"))
-        .and_then(|x| x.as_str())
-        .ok_or("missing `q`")?
-        .to_string();
-    let k = v
-        .as_object()
-        .and_then(|o| o.get("k"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(10) as usize;
-    Ok((q, k))
 }
 
 /// NDJSON (one `{"text": ...}` per line) or a JSON array. Optional per doc:
@@ -1049,7 +1260,9 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
     let mut docs = Vec::new();
     if body.trim_start().starts_with('[') {
         let items: Vec<IngestDoc> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-        docs = items.into_iter().map(IngestDoc::into_document).collect();
+        for d in items {
+            docs.push(d.into_document()?);
+        }
     } else {
         for line in body.lines() {
             let trim = line.trim();
@@ -1058,7 +1271,7 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
             }
             let d: IngestDoc =
                 serde_json::from_str(trim).map_err(|e| format!("bad ndjson line: {e}"))?;
-            docs.push(d.into_document());
+            docs.push(d.into_document()?);
         }
     }
     if docs.is_empty() {
@@ -1233,7 +1446,8 @@ fn shard_ingest(
 }
 
 /// wire shape accepted by /ingest (flat): `"text"` required string, optional
-/// string `"id"`, optional ignored-if-null `"metadata"`, other keys ignored
+/// string `"id"`, optional ignored-if-null `"metadata"`, plus extra keys:
+/// a string is a text field, an array of numbers is an embedding
 #[derive(serde::Deserialize)]
 struct IngestDoc {
     #[serde(default)]
@@ -1241,10 +1455,13 @@ struct IngestDoc {
     text: String,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    /// extra keys: strings -> text fields, number arrays -> embeddings
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl IngestDoc {
-    fn into_document(self) -> Document {
+    fn into_document(self) -> Result<Document, String> {
         let mut doc = Document::new().text("text", self.text);
         if let Some(id) = self.id {
             doc = doc.id(id);
@@ -1252,7 +1469,25 @@ impl IngestDoc {
         if let Some(meta) = self.metadata.filter(|m| !m.is_null()) {
             doc = doc.metadata(meta);
         }
-        doc
+        for (k, v) in self.extra {
+            match v {
+                serde_json::Value::String(text) => {
+                    doc = doc.text(&k, text);
+                }
+                serde_json::Value::Array(items) => {
+                    let mut vec = Vec::with_capacity(items.len());
+                    for it in items {
+                        let f = it
+                            .as_f64()
+                            .ok_or_else(|| format!("`{k}` must contain only numbers"))?;
+                        vec.push(f as f32);
+                    }
+                    doc = doc.vector(&k, vec);
+                }
+                _ => return Err(format!("`{k}` must be a string or an array of numbers")),
+            }
+        }
+        Ok(doc)
     }
 }
 
@@ -1398,7 +1633,11 @@ fn doc_delete(req: Request, index: &Index, id: &str, cluster: ClusterRef<'_>) {
             &serde_json::json!({"deleted": true, "docs": index.num_docs()}).to_string(),
         ),
         Ok(false) => reply(req, 404, r#"{"error":"not found"}"#),
-        Err(e) => reply(req, 400, &e.to_string()),
+        Err(e) => reply(
+            req,
+            400,
+            &serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
     }
 }
 
@@ -1573,9 +1812,26 @@ fn stats_reply(req: Request, index: &Index, cluster: ClusterRef<'_>) {
         "generation": generation_tot,
         "shards": shards,
         "degraded": degraded,
+        "vectors": vector_stats(index),
     })
     .to_string();
     reply(req, 200, &body);
+}
+
+/// the embedding fields of THIS shard (dim, metric, live docs with a vector)
+fn vector_stats(index: &Index) -> Vec<serde_json::Value> {
+    index
+        .vector_field_stats()
+        .into_iter()
+        .map(|(name, dim, metric, docs)| {
+            serde_json::json!({
+                "field": name,
+                "dim": dim,
+                "metric": metric.name(),
+                "docs": docs,
+            })
+        })
+        .collect()
 }
 
 fn uptime_secs() -> u64 {

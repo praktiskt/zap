@@ -8,7 +8,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
-use zap::schema::{Document, Schema};
+use zap::schema::{Document, Metric, Schema};
+use zap::search::{Fusion, SearchMode, SearchRequest};
 
 #[derive(Parser, Debug)]
 #[command(name = "zap", about = "in-memory full-text search engine")]
@@ -46,6 +47,10 @@ struct Args {
     /// parallel ingest lanes (default: cores on this machine)
     #[arg(long, global = true, default_value = "16")]
     lanes: usize,
+    /// declare a vector (embedding) field: name:dim[:metric] (repeatable).
+    /// The metric defaults to cosine; the caller supplies the embeddings.
+    #[arg(long = "vector", global = true, value_name = "NAME:DIM[:METRIC]")]
+    vectors: Vec<String>,
     /// auto-commit every N documents (bounds segment memory)
     #[arg(long, global = true, default_value = "50000")]
     commit_every: usize,
@@ -159,6 +164,27 @@ fn main() -> Result<()> {
     let docs = collect_docs(&args, extra)?;
     let mut schema = Schema::default();
     schema.add_text("text", 1.0);
+    for spec in &args.vectors {
+        let mut parts = spec.split(':');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let dim: u32 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("bad --vector `{spec}` (want name:dim[:metric])"))?;
+        if dim == 0 {
+            bail!("--vector `{spec}`: dim must be > 0");
+        }
+        let metric = match parts.next().map(|s| s.trim()) {
+            None | Some("") => Metric::Cosine,
+            Some(m) => Metric::parse(m)
+                .ok_or_else(|| anyhow::anyhow!("unknown metric `{m}` in --vector `{spec}`"))?,
+        };
+        schema.add_vector(&name, dim, metric);
+        eprintln!(
+            "[zap] vector field `{name}` dim={dim} metric={}",
+            metric.name()
+        );
+    }
     let analyzer = Analyzer::new(AnalyzerConf {
         stem: !args.no_stem,
         max_token_len: 64,
@@ -213,6 +239,10 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // sticky query state for the embedding side of the search
+    let mut sticky_vector: Option<Vec<f32>> = None;
+    let mut sticky_mode = SearchMode::Keyword;
+    let mut sticky_alpha = 0.5f32;
     for line in std::io::stdin().lock().lines() {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
@@ -231,12 +261,89 @@ fn main() -> Result<()> {
                 index.num_segments(),
                 index.generation()
             ),
+            // ---- embedding controls ----
+            cmd if cmd.starts_with(":vec") => {
+                let arg = cmd[4..].trim();
+                if arg.is_empty() || arg == "off" || arg == "clear" {
+                    sticky_vector = None;
+                    eprintln!("[zap] query embedding cleared");
+                } else {
+                    let mut v = Vec::new();
+                    for part in arg.split(',') {
+                        let t = part.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        match t.parse::<f32>() {
+                            Ok(x) => v.push(x),
+                            Err(_) => {
+                                eprintln!("[zap] bad embedding element `{t}`");
+                                break;
+                            }
+                        }
+                    }
+                    if !v.is_empty() {
+                        sticky_vector = Some(v);
+                        eprintln!("[zap] query embedding set ({} dims)", sticky_vector.as_ref().map(|v| v.len()).unwrap_or(0));
+                    }
+                }
+            }
+            cmd if cmd.starts_with(":mode") => {
+                let arg = cmd[5..].trim();
+                sticky_mode = match arg {
+                    "keyword" => SearchMode::Keyword,
+                    "vector" => SearchMode::Vector,
+                    "hybrid" => SearchMode::Hybrid,
+                    "filter" => SearchMode::Filter,
+                    _ => {
+                        eprintln!("[zap] mode: keyword | vector | hybrid | filter");
+                        sticky_mode
+                    }
+                };
+                eprintln!("[zap] search mode: {:?}", sticky_mode);
+            }
+            cmd if cmd.starts_with(":alpha") => {
+                let arg = cmd[5..].trim();
+                match arg.parse::<f32>() {
+                    Ok(a) => {
+                        sticky_alpha = a.clamp(0.0, 1.0);
+                        eprintln!("[zap] alpha (keyword weight) = {}", sticky_alpha);
+                    }
+                    Err(_) => eprintln!("[zap] alpha: 0.0 .. 1.0"),
+                }
+            }
             q => {
-                let hits = match index.search(q, args.top_k) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("query error: {e}");
-                        continue;
+                // the embedding side is optional: with a sticky vector the
+                // query becomes vector / hybrid / filter (per :mode)
+                let use_vector = sticky_vector.is_some() && sticky_mode != SearchMode::Keyword;
+                let hits = match use_vector {
+                    false => match index.search(q, args.top_k) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("query error: {e}");
+                            continue;
+                        }
+                    },
+                    true => {
+                        let mut req = SearchRequest {
+                            text: Some(q.to_string()),
+                            vector: sticky_vector.clone(),
+                            field: None,
+                            k: args.top_k,
+                            mode: sticky_mode,
+                            alpha: sticky_alpha,
+                            fusion: Fusion::Weighted,
+                        };
+                        if sticky_mode == SearchMode::Vector {
+                            req.text = None;
+                        }
+                        match index.search_request(&req, index.pub_stats()) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                eprintln!("query error: {e}");
+                                continue;
+                            }
+                        }
                     }
                 };
                 let terms: Vec<String> = analyzer.tokenize_query(q).iter().map(|t| t.text.to_string()).collect();

@@ -543,7 +543,8 @@ impl SegmentReader {
                 p += 12;
                 let docid_bytes = nrows * 4;
                 let data_bytes = nrows * dim as usize * 4;
-                if bytes.len() < p + docid_bytes + data_bytes * 2 {
+                let norm_bytes = nrows * 4;
+                if bytes.len() < p + docid_bytes + data_bytes + norm_bytes {
                     return Err("segment truncated (vec data)".into());
                 }
                 let mut docids = Vec::with_capacity(nrows);
@@ -566,7 +567,7 @@ impl SegmentReader {
                         bytes[p + i * 4..p + i * 4 + 4].try_into().unwrap(),
                     ));
                 }
-                p += nrows * 4;
+                p += norm_bytes;
                 if fid < vectors.len() {
                     vectors[fid] = VectorColumn {
                         dim,

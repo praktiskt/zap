@@ -264,10 +264,12 @@ impl HitKey {
 
 impl Ord for HitKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        // reversed: the binary heap is a MIN-heap over (score, docid)
-        other
-            .score_bits
-            .cmp(&self.score_bits)
+        // ASCENDING by score: the BinaryHeap<Reverse<HitKey>> is then a
+        // MIN-heap over the score, so `peek()` is the worst kept hit (the one
+        // to evict). Ties break towards the LARGER docid, so on equal scores
+        // the smaller docid survives (same tie rule as the engine's TopK).
+        self.score_bits
+            .cmp(&other.score_bits)
             .then_with(|| other.docid.cmp(&self.docid))
     }
 }

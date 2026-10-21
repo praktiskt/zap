@@ -11,6 +11,7 @@ pub struct DocAddr {
     pub docid: u32,
 }
 
+#[derive(Debug, Clone)]
 pub struct SearchHit {
     pub addr: DocAddr,
     /// the score the ranking used (fused score in hybrid mode)

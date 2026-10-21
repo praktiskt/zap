@@ -1177,6 +1177,22 @@ impl Index {
                         row.insert(f.name.clone(), serde_json::Value::String(text));
                     }
                 }
+                // embeddings ride along: a shard move must carry the vectors
+                // (the receiving node re-ingests them as embedding fields)
+                for fid in self.schema.vector_field_ids() {
+                    let Some(f) = self.schema.field(fid) else {
+                        continue;
+                    };
+                    let Some(v) = seg.vector_of(docid, fid) else {
+                        continue;
+                    };
+                    row.insert(
+                        f.name.clone(),
+                        serde_json::Value::Array(
+                            v.iter().map(|x| serde_json::json!(x)).collect::<Vec<_>>(),
+                        ),
+                    );
+                }
                 out.push(serde_json::Value::Object(row));
                 cursor = Some(addr);
                 if out.len() >= limit {
@@ -1792,6 +1808,33 @@ impl Index {
 
     pub fn num_segments(&self) -> usize {
         self.snap.load().segments.len()
+    }
+
+    /// per-vector-field stats: (field name, dim, metric, live docs carrying a
+    /// vector). Used by the ops surface (/stats).
+    pub fn vector_field_stats(&self) -> Vec<(String, u32, crate::vector::Metric, usize)> {
+        let snap = self.snap.load();
+        let mut out = Vec::new();
+        for fid in self.schema.vector_field_ids() {
+            let Some(f) = self.schema.field(fid) else {
+                continue;
+            };
+            let Some((dim, metric)) = self.schema.vector_field(fid) else {
+                continue;
+            };
+            let mut live = 0usize;
+            for seg in &snap.segments {
+                let Some(col) = seg.vector_column(fid) else {
+                    continue;
+                };
+                live += match snap.deleted.get(&seg.segid) {
+                    Some(mask) => col.docids.iter().filter(|d| !mask.contains(**d)).count(),
+                    None => col.rows(),
+                };
+            }
+            out.push((f.name.clone(), dim, metric, live));
+        }
+        out
     }
 
     pub fn generation(&self) -> u64 {
