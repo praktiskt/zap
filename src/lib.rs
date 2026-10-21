@@ -8,3 +8,4 @@ pub mod schema;
 pub mod search;
 pub mod segment;
 pub mod server;
+pub mod vector;

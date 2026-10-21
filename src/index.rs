@@ -16,7 +16,7 @@ use crate::analyzer::Analyzer;
 use crate::posting::PostingData;
 use crate::schema::{Document, Schema, StoredDoc};
 use crate::search::exec::Stats;
-use crate::search::{Bm25Params, DocAddr, SearchHit, TopK};
+use crate::search::{Bm25Params, DocAddr, SearchHit, SearchMode, SearchRequest, TopK};
 use crate::segment::{SegmentBuilder, SegmentReader};
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +27,18 @@ pub enum IndexError {
     BadId(String),
     #[error("query error")]
     Query(String),
+    #[error("field `{0}` is a vector field: send it as an embedding, not as text")]
+    VectorFieldAsText(String),
+    #[error("field `{0}` is a text field: it cannot carry an embedding")]
+    TextFieldAsVector(String),
+    #[error("field `{field}` expects {expected} dimensions, got {got}")]
+    BadVector {
+        field: String,
+        expected: u32,
+        got: usize,
+    },
+    #[error("field `{0}` contains a non-finite value")]
+    NonFiniteVector(String),
 }
 
 /// when a commit pushes segments to this count, merge them all into one.
@@ -93,8 +105,14 @@ fn tier_overflow_bucket(segs: &[Arc<SegmentReader>]) -> Option<Vec<Arc<SegmentRe
 /// needs them tombstone-exact and the cache's all-doc sums never were.
 type StatsCache = (Arc<HashMap<u32, HashMap<String, u32>>>, u64);
 
-/// per-segment merge scan: (per-field norm slices, store blocks, external ids)
-type SegScan = (Vec<Vec<u16>>, Vec<Box<[u8]>>, Vec<Option<String>>);
+/// per-segment merge scan: (per-field norm slices, store blocks, external ids,
+/// per-field embedding columns)
+type SegScan = (
+    Vec<Vec<u16>>,
+    Vec<Box<[u8]>>,
+    Vec<Option<String>>,
+    Vec<crate::vector::VectorColumn>,
+);
 
 /// opt-in disk persistence: immutable segments under DIR/segments/, plus an
 /// atomically-rewritten MANIFEST.json (tmp file + fsync + rename). Boot:
@@ -597,13 +615,7 @@ impl Index {
     /// Submit-side is enqueue only: field validation here (so unknown-field
     /// errors keep the old sync contract), then one Add onto a lane worker.
     fn add_locked(&self, g: &mut IndexInner, doc: &Document) -> Result<(), IndexError> {
-        if let Some(name) = doc
-            .fields
-            .keys()
-            .find(|f| self.schema.field_id(f).is_none())
-        {
-            return Err(IndexError::UnknownField(name.clone()));
-        }
+        self.validate_doc(doc)?;
         if let Some(id) = &doc.id {
             if id.is_empty() {
                 return Err(IndexError::BadId(id.clone()));
@@ -619,6 +631,39 @@ impl Index {
             .map_err(|_| IndexError::Query("lane worker died".into()))?;
         if let Some(id) = &doc.id {
             g.hot_ids.insert(id.clone());
+        }
+        Ok(())
+    }
+
+    /// schema-gated validation of one document: field names, embedding
+    /// dimensions, finiteness. Runs submit-side so the errors stay
+    /// synchronous (the lane workers never see an invalid document).
+    fn validate_doc(&self, doc: &Document) -> Result<(), IndexError> {
+        for name in doc.fields.keys() {
+            let Some(fid) = self.schema.field_id(name) else {
+                return Err(IndexError::UnknownField(name.clone()));
+            };
+            if self.schema.vector_field(fid).is_some() {
+                return Err(IndexError::VectorFieldAsText(name.clone()));
+            }
+        }
+        for (name, v) in &doc.vectors {
+            let Some(fid) = self.schema.field_id(name) else {
+                return Err(IndexError::UnknownField(name.clone()));
+            };
+            let Some((dim, _)) = self.schema.vector_field(fid) else {
+                return Err(IndexError::TextFieldAsVector(name.clone()));
+            };
+            if v.len() != dim as usize {
+                return Err(IndexError::BadVector {
+                    field: name.clone(),
+                    expected: dim,
+                    got: v.len(),
+                });
+            }
+            if v.iter().any(|x| !x.is_finite()) {
+                return Err(IndexError::NonFiniteVector(name.clone()));
+            }
         }
         Ok(())
     }
@@ -667,12 +712,8 @@ impl Index {
                 let _w = self.writer.lock().unwrap();
             }
             let mut g = self.inner.lock().unwrap();
-            if let Some(name) = deduped
-                .iter()
-                .flat_map(|d| d.fields.keys())
-                .find(|f| self.schema.field_id(f).is_none())
-            {
-                return Err(IndexError::UnknownField(name.clone()));
+            for doc in &deduped {
+                self.validate_doc(doc)?;
             }
             for doc in &deduped {
                 if let Some(id) = &doc.id {
@@ -702,12 +743,8 @@ impl Index {
         // instead of blocking the writer.
         {
             let mut g = self.inner.lock().unwrap();
-            if let Some(name) = deduped
-                .iter()
-                .flat_map(|d| d.fields.keys())
-                .find(|f| self.schema.field_id(f).is_none())
-            {
-                return Err(IndexError::UnknownField(name.clone()));
+            for doc in &deduped {
+                self.validate_doc(doc)?;
             }
             let lanes = self.lane_count.max(1);
             let chunk = deduped.len().div_ceil(lanes).max(1);
@@ -1325,28 +1362,7 @@ impl Index {
         k: usize,
         stats: crate::search::exec::Stats,
     ) -> Result<Vec<SearchHit>, IndexError> {
-        // query plan resolved ONCE per distinct query string (parse + snowball
-        // stems): serving repeats hot query strings constantly, and the parse
-        // + stem work is ~us per otherwise-unique request. The plan is fully
-        // self-contained (owned node + Arc'd own stems), snapshot- and
-        // stats-independent — it never goes invalid as the engine mutates.
-        // Bounded by QUERY_CACHE_MAX with a coarse clear-on-overflow.
-        let plan: Arc<QueryPlan> = {
-            let mut g = self.inner.lock().unwrap();
-            if let Some(hit) = g.qcache.get(q) {
-                hit.clone()
-            } else {
-                let node =
-                    crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
-                let stems = crate::search::exec::stem_cache(&self.analyzer, &node);
-                let plan = Arc::new(QueryPlan { node, stems });
-                if g.qcache.len() >= QUERY_CACHE_MAX {
-                    g.qcache.clear(); // coarse reset: hot queries re-bucket next round
-                }
-                g.qcache.insert(q.to_string(), plan.clone());
-                plan
-            }
-        };
+        let plan = self.query_plan(q)?;
         let node = &plan.node;
         let stems = &plan.stems;
         let snap = self.snap.load();
@@ -1358,94 +1374,7 @@ impl Index {
             use rayon::prelude::*;
             snap.segments
                 .par_iter()
-                .map(|seg| {
-                    // complement bitmap is precomputed on the snapshot: when
-                    // tombstones exist this used to rebuild `(0..num_docs)-mask`
-                    // per segment per query; now it is an Arc clone (keyed by
-                    // the segment's stable id)
-                    let allowed: Option<&RoaringBitmap> = snap.allowed.get(&seg.segid);
-                    let mut collector = TopK::new(k);
-                    // WAND-lite fast path needs a ctx closure bound to this collector;
-                    // for non-Term nodes fall back to dense array evaluation
-                    match &node {
-                        Node::Term(_) => {
-                            // the closure holds a shared view of the collector: threshold live
-                            let col: *mut TopK = &mut collector as *mut TopK;
-                            let thr = move || unsafe { (*col).threshold() };
-                            let ctx = crate::search::exec::Ctx {
-                                schema: &self.schema,
-                                stats: &stats,
-                                params: &params,
-                                analyzer: &self.analyzer,
-                                threshold: &thr,
-                                stems,
-                            };
-                            crate::search::exec::eval_term_stream(
-                                node,
-                                None,
-                                seg,
-                                &ctx,
-                                allowed,
-                                &mut collector,
-                            );
-                        }
-                        _ => {
-                            // live threshold only for root-level phrase (the doc's score
-                            // IS the phrase score there, so a segment-level bound is
-                            // sound); nested phrases must evaluate unconditionally
-                            let phrase_root = matches!(&node, Node::Phrase { .. })
-                                || matches!(&node, Node::Field { node: inner, .. }
-                                    if matches!(**inner, Node::Phrase { .. }));
-                            let col: *mut TopK = &mut collector as *mut TopK;
-                            let thr: Box<dyn Fn() -> f32> = if phrase_root {
-                                // same shared-view contract as the Term path above:
-                                // col outlives every read because it only escapes
-                                // inside this scope
-                                Box::new(move || unsafe { (*col).threshold() })
-                            } else {
-                                Box::new(|| 0.0)
-                            };
-                            let ctx = crate::search::exec::Ctx {
-                                schema: &self.schema,
-                                stats: &stats,
-                                params: &params,
-                                analyzer: &self.analyzer,
-                                threshold: &thr,
-                                stems,
-                            };
-                            let ds =
-                                crate::search::exec::eval_allowed(node, None, seg, &ctx, allowed);
-                            for (i, doc) in ds.ids.iter().enumerate() {
-                                collector.push(
-                                    DocAddr {
-                                        segment: seg.segid,
-                                        docid: *doc,
-                                    },
-                                    ds.scores[i],
-                                );
-                            }
-                        }
-                    }
-                    // collectors push with the segment's own segid (payload lookups yes via snap.by_id)
-                    let out = collector.into_sorted();
-                    out.into_iter()
-                        .filter(|h| {
-                            // safety net for eval paths without an `allowed` probe
-                            // (phrase, fuzzy, prefix): drop tombstoned docs
-                            !snap
-                                .deleted
-                                .get(&seg.segid)
-                                .is_some_and(|m| m.contains(h.addr.docid))
-                        })
-                        .map(|h| SearchHit {
-                            addr: DocAddr {
-                                segment: seg.segid,
-                                ..h.addr
-                            },
-                            score: h.score,
-                        })
-                        .collect()
-                })
+                .map(|seg| self.eval_segment(node, seg, &snap, &stats, &params, stems, k))
                 .collect()
         };
         let mut merged = TopK::new(k);
@@ -1454,7 +1383,395 @@ impl Index {
                 merged.push(h.addr, h.score);
             }
         }
-        Ok(merged.into_sorted())
+        Ok(merged
+            .into_sorted()
+            .into_iter()
+            .map(|h| SearchHit {
+                kw: Some(h.score),
+                ..h
+            })
+            .collect())
+    }
+
+    /// resolved query plan (parse + stems), cached per query string
+    fn query_plan(&self, q: &str) -> Result<Arc<QueryPlan>, IndexError> {
+        // query plan resolved ONCE per distinct query string (parse + snowball
+        // stems): serving repeats hot query strings constantly, and the parse
+        // + stem work is ~us per otherwise-unique request. The plan is fully
+        // self-contained (owned node + Arc'd own stems), snapshot- and
+        // stats-independent — it never goes invalid as the engine mutates.
+        // Bounded by QUERY_CACHE_MAX with a coarse clear-on-overflow.
+        let mut g = self.inner.lock().unwrap();
+        if let Some(hit) = g.qcache.get(q) {
+            return Ok(hit.clone());
+        }
+        let node = crate::query::parse(q).map_err(|e| IndexError::Query(format!("{e:?}")))?;
+        let stems = crate::search::exec::stem_cache(&self.analyzer, &node);
+        let plan = Arc::new(QueryPlan { node, stems });
+        if g.qcache.len() >= QUERY_CACHE_MAX {
+            g.qcache.clear(); // coarse reset: hot queries re-bucket next round
+        }
+        g.qcache.insert(q.to_string(), plan.clone());
+        Ok(plan)
+    }
+
+    /// evaluate the keyword query against one segment: the top-`pool` hits.
+    /// `pool` is k for a plain search and larger for the fusion pools.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_segment(
+        &self,
+        node: &Node,
+        seg: &Arc<SegmentReader>,
+        snap: &IndexSnapshot,
+        stats: &crate::search::exec::Stats,
+        params: &Bm25Params,
+        stems: &HashMap<String, [Option<Arc<str>>; 2]>,
+        pool: usize,
+    ) -> Vec<SearchHit> {
+        // complement bitmap is precomputed on the snapshot: when
+        // tombstones exist this used to rebuild `(0..num_docs)-mask`
+        // per segment per query; now it is an Arc clone (keyed by
+        // the segment's stable id)
+        let allowed: Option<&RoaringBitmap> = snap.allowed.get(&seg.segid);
+        let mut collector = TopK::new(pool);
+        // WAND-lite fast path needs a ctx closure bound to this collector;
+        // for non-Term nodes fall back to dense array evaluation
+        match node {
+            Node::Term(_) => {
+                // the closure holds a shared view of the collector: threshold live
+                let col: *mut TopK = &mut collector as *mut TopK;
+                let thr = move || unsafe { (*col).threshold() };
+                let ctx = crate::search::exec::Ctx {
+                    schema: &self.schema,
+                    stats,
+                    params,
+                    analyzer: &self.analyzer,
+                    threshold: &thr,
+                    stems,
+                };
+                crate::search::exec::eval_term_stream(
+                    node,
+                    None,
+                    seg,
+                    &ctx,
+                    allowed,
+                    &mut collector,
+                );
+            }
+            _ => {
+                // live threshold only for root-level phrase (the doc's score
+                // IS the phrase score there, so a segment-level bound is
+                // sound); nested phrases must evaluate unconditionally
+                let phrase_root = matches!(node, Node::Phrase { .. })
+                    || matches!(node, Node::Field { node: inner, .. }
+                        if matches!(**inner, Node::Phrase { .. }));
+                let col: *mut TopK = &mut collector as *mut TopK;
+                let thr: Box<dyn Fn() -> f32> = if phrase_root {
+                    // same shared-view contract as the Term path above:
+                    // col outlives every read because it only escapes
+                    // inside this scope
+                    Box::new(move || unsafe { (*col).threshold() })
+                } else {
+                    Box::new(|| 0.0)
+                };
+                let ctx = crate::search::exec::Ctx {
+                    schema: &self.schema,
+                    stats,
+                    params,
+                    analyzer: &self.analyzer,
+                    threshold: &thr,
+                    stems,
+                };
+                let ds = crate::search::exec::eval_allowed(node, None, seg, &ctx, allowed);
+                for (i, doc) in ds.ids.iter().enumerate() {
+                    collector.push(
+                        DocAddr {
+                            segment: seg.segid,
+                            docid: *doc,
+                        },
+                        ds.scores[i],
+                    );
+                }
+            }
+        }
+        // collectors push with the segment's own segid (payload lookups yes via snap.by_id)
+        let out = collector.into_sorted();
+        out.into_iter()
+            .filter(|h| {
+                // safety net for eval paths without an `allowed` probe
+                // (phrase, fuzzy, prefix): drop tombstoned docs
+                !snap
+                    .deleted
+                    .get(&seg.segid)
+                    .is_some_and(|m| m.contains(h.addr.docid))
+            })
+            .map(|h| SearchHit {
+                addr: DocAddr {
+                    segment: seg.segid,
+                    ..h.addr
+                },
+                score: h.score,
+                kw: Some(h.score),
+                vec: None,
+            })
+            .collect()
+    }
+
+    /// resolve the vector field a request targets: (field id, dim, metric).
+    /// None when the request carries no embedding.
+    fn resolve_vector_field(
+        &self,
+        req: &SearchRequest,
+    ) -> Result<Option<(u32, u32, crate::vector::Metric)>, IndexError> {
+        let Some(vector) = req.vector.as_ref() else {
+            return Ok(None);
+        };
+        let (fid, dim, metric) = match &req.field {
+            Some(name) => self
+                .schema
+                .vector_field_by_name(name)
+                .ok_or_else(|| IndexError::Query(format!("`{name}` is not a vector field")))?,
+            None => {
+                let ids = self.schema.vector_field_ids();
+                let Some(&fid) = ids.first() else {
+                    return Err(IndexError::Query(
+                        "no vector field declared in the schema".into(),
+                    ));
+                };
+                let (dim, metric) = self
+                    .schema
+                    .vector_field(fid)
+                    .expect("id came from the vector field list");
+                (fid, dim, metric)
+            }
+        };
+        let name = self
+            .schema
+            .field(fid)
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        if vector.len() != dim as usize {
+            return Err(IndexError::BadVector {
+                field: name,
+                expected: dim,
+                got: vector.len(),
+            });
+        }
+        Ok(Some((fid, dim, metric)))
+    }
+
+    /// collect the per-modality candidates for a request: keyword hits and/or
+    /// embedding hits, each with its RAW score. The fusion step mixes them
+    /// (the cluster coordinator fuses the same candidates globally).
+    pub fn candidates(
+        &self,
+        req: &SearchRequest,
+        stats: crate::search::exec::Stats,
+        pool: usize,
+    ) -> Result<Vec<crate::search::fusion::Candidate>, IndexError> {
+        let snap = self.snap.load();
+        let vec_field = self.resolve_vector_field(req)?;
+        let mut out: Vec<crate::search::fusion::Candidate> = Vec::new();
+        // per-segment keyword docids; the filter mode needs the COMPLETE
+        // match set, so it cannot be truncated to a pool
+        let mut filter_docids: Vec<Vec<u32>> = Vec::new();
+
+        // ---- keyword side ----
+        if let Some(text) = &req.text {
+            let plan = self.query_plan(text)?;
+            let node = &plan.node;
+            let stems = &plan.stems;
+            let params = self.params();
+            if req.mode == SearchMode::Filter {
+                // the keyword side SELECTS the candidates: it must enumerate
+                // every match, so the dense evaluator runs (the WAND walk
+                // cannot produce a full posting list)
+                let per_seg: Vec<crate::search::DocScores> = {
+                    use rayon::prelude::*;
+                    snap.segments
+                        .par_iter()
+                        .map(|seg| {
+                            let allowed: Option<&RoaringBitmap> = snap.allowed.get(&seg.segid);
+                            let zero = || 0.0f32;
+                            let ctx = crate::search::exec::Ctx {
+                                schema: &self.schema,
+                                stats: &stats,
+                                params: &params,
+                                analyzer: &self.analyzer,
+                                threshold: &zero,
+                                stems,
+                            };
+                            crate::search::exec::eval_allowed(node, None, seg, &ctx, allowed)
+                        })
+                        .collect()
+                };
+                for (si, ds) in per_seg.into_iter().enumerate() {
+                    let segid = snap.segments[si].segid;
+                    let mut ids: Vec<u32> = Vec::with_capacity(ds.ids.len());
+                    for (i, doc) in ds.ids.iter().enumerate() {
+                        if snap.deleted.get(&segid).is_some_and(|m| m.contains(*doc)) {
+                            continue;
+                        }
+                        ids.push(*doc);
+                        out.push(crate::search::fusion::Candidate {
+                            addr: DocAddr {
+                                segment: segid,
+                                docid: *doc,
+                            },
+                            id: None,
+                            kw: Some(ds.scores[i]),
+                            vec: None,
+                        });
+                    }
+                    filter_docids.push(ids);
+                }
+            } else {
+                let per_seg: Vec<Vec<SearchHit>> = {
+                    use rayon::prelude::*;
+                    snap.segments
+                        .par_iter()
+                        .map(|seg| {
+                            self.eval_segment(node, seg, &snap, &stats, &params, stems, pool)
+                        })
+                        .collect()
+                };
+                for hits in per_seg {
+                    for h in hits {
+                        out.push(crate::search::fusion::Candidate {
+                            addr: h.addr,
+                            id: None,
+                            kw: Some(h.score),
+                            vec: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ---- vector side ----
+        if let (Some(query), Some((fid, _dim, metric))) = (req.vector.as_ref(), vec_field) {
+            // the candidate set must be COMPLETE in filter mode
+            let pool = if req.mode == SearchMode::Filter {
+                usize::MAX
+            } else {
+                pool
+            };
+            // one flat scan over (segment, row-range) chunks: the work list is
+            // flat, so a big segment cannot become the wall (the same lesson
+            // as the dense-AND split: the biggest unit must not own the pass)
+            const CHUNK: usize = 4096;
+            let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+            for (si, seg) in snap.segments.iter().enumerate() {
+                let Some(col) = seg.vector_column(fid) else {
+                    continue;
+                };
+                let rows = col.rows();
+                let mut from = 0usize;
+                while from < rows {
+                    let to = (from + CHUNK).min(rows);
+                    tasks.push((si, from, to));
+                    from = to;
+                }
+            }
+            let restrict: Option<&Vec<Vec<u32>>> = if req.mode == SearchMode::Filter {
+                Some(&filter_docids)
+            } else {
+                None
+            };
+            let results: Vec<Vec<crate::vector::VectorHit>> = {
+                use rayon::prelude::*;
+                tasks
+                    .par_iter()
+                    .map(|(si, from, to)| {
+                        let seg = &snap.segments[*si];
+                        let col = seg.vector_column(fid).expect("task built from a column");
+                        let mut idx = crate::vector::FlatVectorIndex::new(col, metric)
+                            .with_allowed(snap.allowed.get(&seg.segid));
+                        if let Some(rs) = restrict {
+                            idx = idx.with_restrict(Some(rs[*si].as_slice()));
+                        }
+                        idx.search_rows(query, pool, *from, *to)
+                    })
+                    .collect()
+            };
+            // merge the chunk results per segment, then keep the segment's
+            // best `pool` (the global top-k is a subset of the per-segment
+            // top-k, so this stays exact for the vector-only mode)
+            let mut per_seg: Vec<Vec<crate::vector::VectorHit>> =
+                vec![Vec::new(); snap.segments.len()];
+            for (task, hits) in tasks.iter().zip(results) {
+                per_seg[task.0].extend(hits);
+            }
+            for (si, mut hits) in per_seg.into_iter().enumerate() {
+                let segid = snap.segments[si].segid;
+                hits.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.docid.cmp(&b.docid))
+                });
+                hits.truncate(pool);
+                for h in hits {
+                    out.push(crate::search::fusion::Candidate {
+                        addr: DocAddr {
+                            segment: segid,
+                            docid: h.docid,
+                        },
+                        id: None,
+                        kw: None,
+                        vec: Some(h.score),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// unified search: keyword, embedding, or both.
+    ///
+    /// `Hybrid` mixes the BM25 and similarity scores (weighted or RRF),
+    /// `Filter` lets the keyword query select the candidates and the
+    /// embedding rank them.
+    pub fn search_request(
+        &self,
+        req: &SearchRequest,
+        stats: crate::search::exec::Stats,
+    ) -> Result<Vec<SearchHit>, IndexError> {
+        match req.mode {
+            SearchMode::Keyword => {
+                let Some(text) = req.text.as_ref() else {
+                    return Err(IndexError::Query("keyword search needs a query".into()));
+                };
+                if req.vector.is_some() {
+                    return Err(IndexError::Query(
+                        "keyword mode cannot take an embedding".into(),
+                    ));
+                }
+                return self.search_with_stats(text, req.k, stats);
+            }
+            SearchMode::Vector => {
+                if req.vector.is_none() {
+                    return Err(IndexError::Query("vector search needs an embedding".into()));
+                }
+            }
+            SearchMode::Hybrid | SearchMode::Filter => {
+                if req.text.is_none() || req.vector.is_none() {
+                    return Err(IndexError::Query(
+                        "hybrid search needs both a query and an embedding".into(),
+                    ));
+                }
+            }
+        }
+        let pool = match req.mode {
+            // the fusion pools need more than k candidates per modality:
+            // a document that is mid-ranked in both lists must still be able
+            // to reach the fused top-k
+            SearchMode::Hybrid => req.k.saturating_mul(4).max(64),
+            _ => req.k,
+        };
+        let cands = self.candidates(req, stats, pool)?;
+        Ok(crate::search::fusion::fuse(
+            cands, req.mode, req.alpha, req.fusion, req.k,
+        ))
     }
 
     pub fn num_docs(&self) -> usize {
@@ -1554,20 +1871,72 @@ pub(crate) fn merge_segments(
                     }
                     seg_ids.push(s.id_of(docid as u32).map(|x| x.to_owned()));
                 }
-                (norms, blocks, seg_ids)
+                // embeddings: rows follow the same docid remap (the norms are
+                // carried over verbatim — no re-normalization needed)
+                let mut seg_vecs: Vec<crate::vector::VectorColumn> = Vec::new();
+                for col in s.vectors.iter() {
+                    if col.is_empty() {
+                        seg_vecs.push(crate::vector::VectorColumn::default());
+                        continue;
+                    }
+                    let d = col.dim as usize;
+                    let mut docids = Vec::with_capacity(col.rows());
+                    let mut data = Vec::with_capacity(col.rows() * d);
+                    let mut norms = Vec::with_capacity(col.rows());
+                    for (r, &docid) in col.docids.iter().enumerate() {
+                        let nd = remap[docid as usize];
+                        if nd == u32::MAX {
+                            continue;
+                        }
+                        docids.push(nd);
+                        data.extend_from_slice(&col.data[r * d..(r + 1) * d]);
+                        norms.push(col.norms[r]);
+                    }
+                    seg_vecs.push(crate::vector::VectorColumn {
+                        dim: col.dim,
+                        docids: docids.into_boxed_slice(),
+                        data: data.into_boxed_slice(),
+                        norms: norms.into_boxed_slice(),
+                    });
+                }
+                (norms, blocks, seg_ids, seg_vecs)
             })
             .collect()
     };
     let mut field_norms: Vec<Vec<u16>> = (0..nf).map(|_| Vec::new()).collect();
     let mut store_blocks: Vec<Box<[u8]>> = Vec::new();
     let mut ids: Vec<Option<String>> = Vec::new();
-    for (seg_norms, blocks, seg_ids) in per_seg {
+    // embedding columns: concatenate the per-segment rows in segment order
+    // (docids stay ascending across the merge: segments are ordered and each
+    // segment's own docids ascend)
+    let mut vec_docids: Vec<Vec<u32>> = (0..nf).map(|_| Vec::new()).collect();
+    let mut vec_data: Vec<Vec<f32>> = (0..nf).map(|_| Vec::new()).collect();
+    let mut vec_norms: Vec<Vec<f32>> = (0..nf).map(|_| Vec::new()).collect();
+    let mut vec_dim: Vec<u32> = vec![0; nf];
+    for (seg_norms, blocks, seg_ids, seg_vecs) in per_seg {
         for (fid, n) in seg_norms.into_iter().enumerate() {
             field_norms[fid].extend(n);
         }
         store_blocks.extend(blocks);
         ids.extend(seg_ids);
+        for (fid, col) in seg_vecs.into_iter().enumerate() {
+            if col.is_empty() {
+                continue;
+            }
+            vec_dim[fid] = col.dim;
+            vec_docids[fid].extend_from_slice(&col.docids);
+            vec_data[fid].extend_from_slice(&col.data);
+            vec_norms[fid].extend_from_slice(&col.norms);
+        }
     }
+    let vectors: Vec<crate::vector::VectorColumn> = (0..nf)
+        .map(|fid| crate::vector::VectorColumn {
+            dim: vec_dim[fid],
+            docids: std::mem::take(&mut vec_docids[fid]).into_boxed_slice(),
+            data: std::mem::take(&mut vec_data[fid]).into_boxed_slice(),
+            norms: std::mem::take(&mut vec_norms[fid]).into_boxed_slice(),
+        })
+        .collect();
     let total = running;
     // per-field posting union. The field list alone saturates only multi-field
     // corpora (the common single-field case merges on ONE thread), so merge
@@ -1634,5 +2003,5 @@ pub(crate) fn merge_segments(
             })
             .collect::<Vec<_>>()
     };
-    crate::segment::freeze_parts(postings, field_norms, store_blocks, ids, total)
+    crate::segment::freeze_parts(postings, field_norms, store_blocks, ids, vectors, total)
 }

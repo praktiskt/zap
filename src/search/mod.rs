@@ -1,6 +1,7 @@
 //! scoring combinators: doc-materialized scores (BM25), boolean vector merges, phrase windows
 
 pub mod exec;
+pub mod fusion;
 pub mod phrase;
 pub mod term;
 
@@ -12,7 +13,108 @@ pub struct DocAddr {
 
 pub struct SearchHit {
     pub addr: DocAddr,
+    /// the score the ranking used (fused score in hybrid mode)
     pub score: f32,
+    /// BM25 component (None = the document did not match the keyword query)
+    pub kw: Option<f32>,
+    /// similarity component (None = the document carries no embedding)
+    pub vec: Option<f32>,
+}
+
+/// which modalities a search uses
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// BM25 only
+    Keyword,
+    /// embedding similarity only
+    Vector,
+    /// BM25 + embedding, fused into one score
+    Hybrid,
+    /// BM25 selects the candidates, the embedding ranks them
+    Filter,
+}
+
+/// how the two modalities are combined in `Hybrid` mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fusion {
+    /// alpha * normalized(BM25) + (1 - alpha) * normalized(similarity)
+    Weighted,
+    /// reciprocal rank fusion: sum of 1/(K + rank)
+    Rrf,
+}
+
+/// one search request: keyword text and/or an embedding
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    /// the keyword query (BM25 side)
+    pub text: Option<String>,
+    /// the query embedding (vector side)
+    pub vector: Option<Vec<f32>>,
+    /// which vector field to search (None = the schema's first vector field)
+    pub field: Option<String>,
+    /// number of results
+    pub k: usize,
+    pub mode: SearchMode,
+    /// keyword weight in `Weighted` fusion (0 = vector only, 1 = keyword only)
+    pub alpha: f32,
+    pub fusion: Fusion,
+}
+
+impl Default for SearchRequest {
+    fn default() -> Self {
+        Self {
+            text: None,
+            vector: None,
+            field: None,
+            k: 10,
+            mode: SearchMode::Keyword,
+            alpha: 0.5,
+            fusion: Fusion::Weighted,
+        }
+    }
+}
+
+impl SearchRequest {
+    /// keyword-only search
+    pub fn keyword(text: impl Into<String>, k: usize) -> Self {
+        Self {
+            text: Some(text.into()),
+            k,
+            ..Default::default()
+        }
+    }
+
+    /// embedding-only search
+    pub fn vector(vector: Vec<f32>, k: usize) -> Self {
+        Self {
+            vector: Some(vector),
+            k,
+            mode: SearchMode::Vector,
+            ..Default::default()
+        }
+    }
+
+    /// keyword + embedding, fused
+    pub fn hybrid(text: impl Into<String>, vector: Vec<f32>, k: usize) -> Self {
+        Self {
+            text: Some(text.into()),
+            vector: Some(vector),
+            k,
+            mode: SearchMode::Hybrid,
+            ..Default::default()
+        }
+    }
+
+    /// keyword selects the candidates, the embedding ranks them
+    pub fn filter(text: impl Into<String>, vector: Vec<f32>, k: usize) -> Self {
+        Self {
+            text: Some(text.into()),
+            vector: Some(vector),
+            k,
+            mode: SearchMode::Filter,
+            ..Default::default()
+        }
+    }
 }
 
 pub struct Bm25Params {
@@ -203,6 +305,8 @@ impl TopK {
                 } else {
                     h.score_bits ^ 0x8000_0000
                 }),
+                kw: None,
+                vec: None,
             })
             .collect();
         hits.sort_by(|a, b| {
