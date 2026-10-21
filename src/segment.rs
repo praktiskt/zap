@@ -11,7 +11,8 @@ use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 use crate::analyzer::Analyzer;
 use crate::posting::{PostingData, PostingReader, TermInfo};
-use crate::schema::{Document, Schema, StoredDoc};
+use crate::schema::{Document, FieldKind, Schema, StoredDoc};
+use crate::vector::{VectorBuilder, VectorColumn};
 use std::sync::Arc;
 
 /// doc-store size gate: below this, store raw instead of lz4 (frequent tiny docs)
@@ -73,6 +74,8 @@ pub struct SegmentBuilder {
     store_blocks: Vec<Box<[u8]>>,
     /// per-doc external id (None = implicit internal id only)
     ids: Vec<Option<String>>,
+    /// field_id -> embedding rows (only vector fields carry rows)
+    vectors: Vec<VectorBuilder>,
 }
 
 impl SegmentBuilder {
@@ -80,9 +83,14 @@ impl SegmentBuilder {
         let nf = schema.num_fields();
         let mut postings = Vec::with_capacity(nf);
         let mut field_norms = Vec::with_capacity(nf);
-        for _ in 0..nf {
+        let mut vectors = Vec::with_capacity(nf);
+        for f in schema.fields() {
             postings.push(HashMap::new());
             field_norms.push(Vec::new());
+            vectors.push(match f.kind {
+                FieldKind::Vector { dim, .. } => VectorBuilder::new(dim),
+                FieldKind::Text => VectorBuilder::new(0),
+            });
         }
         Self {
             schema,
@@ -92,6 +100,7 @@ impl SegmentBuilder {
             field_norms,
             store_blocks: Vec::new(),
             ids: Vec::new(),
+            vectors,
         }
     }
 
@@ -99,11 +108,19 @@ impl SegmentBuilder {
     pub fn add_document(&mut self, doc: &Document) -> Result<u32, String> {
         let docid = self.num_docs;
         let block = encode_store(doc, &self.schema)?;
+        let nf = self.schema.num_fields();
+        // per-field token counts; EVERY field gets exactly one norm row per
+        // doc (a doc that omits a field pushes 0) so each field's norm array
+        // stays aligned with the docid space
+        let mut counts = vec![0u16; nf];
         for (name, val) in &doc.fields {
             let fid = self
                 .schema
                 .field_id(name)
                 .ok_or_else(|| format!("unknown field `{name}`"))?;
+            if self.schema.vector_field(fid).is_some() {
+                return Err(format!("field `{name}` is a vector field"));
+            }
             let mut pos = 0u32;
             for tok in self.analyzer.tokenize(val) {
                 // R21: get-mut-first dict probe — token allocation only when the
@@ -128,7 +145,32 @@ impl SegmentBuilder {
                 }
                 pos += 1;
             }
-            self.field_norms[fid as usize].push(pos as u16);
+            counts[fid as usize] = pos as u16;
+        }
+        // embeddings: schema-gated (declared vector field, exact dimension,
+        // finite values only)
+        for (name, v) in &doc.vectors {
+            let fid = self
+                .schema
+                .field_id(name)
+                .ok_or_else(|| format!("unknown field `{name}`"))?;
+            let (dim, _) = self
+                .schema
+                .vector_field(fid)
+                .ok_or_else(|| format!("field `{name}` is a text field"))?;
+            if v.len() != dim as usize {
+                return Err(format!(
+                    "field `{name}` expects {dim} dimensions, got {}",
+                    v.len()
+                ));
+            }
+            if v.iter().any(|x| !x.is_finite()) {
+                return Err(format!("field `{name}` contains a non-finite value"));
+            }
+            self.vectors[fid as usize].push(docid, v);
+        }
+        for (fid, count) in counts.iter().enumerate() {
+            self.field_norms[fid].push(*count);
         }
         // small docs stay raw (marker 0x00) to skip lz4 costs; big docs compress (0x01)
         let stored: Box<[u8]> = if block.len() <= RAW_STORE_THRESHOLD {
@@ -149,11 +191,17 @@ impl SegmentBuilder {
     }
 
     pub fn freeze(self) -> SegmentReader {
+        let vectors = self
+            .vectors
+            .into_iter()
+            .map(|b| b.freeze())
+            .collect::<Vec<VectorColumn>>();
         freeze_parts(
             self.postings,
             self.field_norms,
             self.store_blocks,
             self.ids,
+            vectors,
             self.num_docs,
         )
     }
@@ -181,6 +229,8 @@ pub struct SegmentReader {
     ids: Vec<Option<String>>,
     /// docids sorted by their id (binary-search forward index); empty iff ids is empty
     id_fwd: Vec<u32>,
+    /// per-field embedding columns (only vector fields carry rows)
+    pub vectors: Vec<VectorColumn>,
 }
 
 impl SegmentReader {
@@ -200,6 +250,7 @@ impl SegmentReader {
             store_blocks: self.store_blocks.clone(),
             ids: self.ids.clone(),
             id_fwd: self.id_fwd.clone(),
+            vectors: self.vectors.clone(),
         }
     }
 }
@@ -209,6 +260,10 @@ impl SegmentReader {
 const SEG_MAGIC: &[u8; 8] = b"zapseg2\0";
 /// v1 kept bootable: 5 info ranges (the vestigial always-empty tf section)
 const SEG_MAGIC_V1: &[u8; 8] = b"zapseg1\0";
+/// v3: adds the embedding columns (per field id: dim, docids, data, norms).
+/// v2 (stable segid, no vectors) stays bootable: old segments simply have no
+/// embeddings.
+const SEG_MAGIC_V3: &[u8; 8] = b"zapseg3\0";
 
 impl SegmentReader {
     /// full on-disk serialization (little-endian sections; immutable snapshot).
@@ -216,6 +271,7 @@ impl SegmentReader {
     /// [n_infos u32] per-info 36B [df u32 + 4 ranges x (start,end)]
     /// [blob len u32][blob] per fid [norm len u32][u16*n]
     /// [n_store u32]([len u32][bytes]) [n_ids u32]([has u8][len u32][bytes])
+    /// [n_vec u32] per vec [fid u32][dim u32][nrows u32][docids][data][norms]
     pub fn to_bytes(&self) -> Vec<u8> {
         fn push_u32(out: &mut Vec<u8>, v: u32) {
             out.extend_from_slice(&v.to_le_bytes());
@@ -231,7 +287,7 @@ impl SegmentReader {
             }
         }
         let mut out = Vec::new();
-        out.extend_from_slice(SEG_MAGIC);
+        out.extend_from_slice(SEG_MAGIC_V3);
         // v3: stable segment identity survives disk round-trips (subset tier
         // merges must not renumber live segments; tombstones/id addresses key on it)
         push_u32(&mut out, self.segid);
@@ -266,6 +322,28 @@ impl SegmentReader {
         for id in &self.ids {
             push_opt_string(&mut out, id.as_deref());
         }
+        // embedding columns (only the non-empty ones: text fields carry none)
+        let cols: Vec<(usize, &VectorColumn)> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
+        push_u32(&mut out, cols.len() as u32);
+        for (fid, c) in cols {
+            push_u32(&mut out, fid as u32);
+            push_u32(&mut out, c.dim);
+            push_u32(&mut out, c.docids.len() as u32);
+            for d in c.docids.iter() {
+                push_u32(&mut out, *d);
+            }
+            for v in c.data.iter() {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in c.norms.iter() {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         self.content_hash.set(crate::cluster::fnv64a(&out)).ok();
         out
     }
@@ -285,13 +363,20 @@ impl SegmentReader {
     /// mirror image of `to_bytes`; id_fwd is rebuilt on load
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut p = 0usize;
-        if bytes.len() < 8 || &bytes[..8] != SEG_MAGIC {
+        if bytes.len() < 8 {
+            return Err("segment truncated (magic)".into());
+        }
+        let magic = &bytes[..8];
+        // v3 = embeddings, v2 = stable segid, v1 = legacy (no segid)
+        let has_segid = magic == SEG_MAGIC_V3 || magic == SEG_MAGIC;
+        let is_v1 = magic == SEG_MAGIC_V1;
+        let has_vectors = magic == SEG_MAGIC_V3;
+        if !has_segid && !is_v1 {
             return Err("bad segment magic".into());
         }
         p += 8;
-        let is_v3 = &bytes[..8] == SEG_MAGIC;
         let mut segid = 0u32;
-        if is_v3 {
+        if has_segid {
             if bytes.len() < p + 4 {
                 return Err("segment truncated (segid)".into());
             }
@@ -336,7 +421,7 @@ impl SegmentReader {
             }
             let df = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
             p += 4;
-            let nranges = if &bytes[..8] == SEG_MAGIC_V1 { 5 } else { 4 };
+            let nranges = if is_v1 { 5 } else { 4 };
             let mut starts = [0u32; 5];
             let mut ends = [0u32; 5];
             for s in 0..nranges {
@@ -349,7 +434,7 @@ impl SegmentReader {
             }
             // v1 index 1 is the vestigial empty tf-stream range: skipped
             let sh = |k: usize| -> usize {
-                if &bytes[..8] == SEG_MAGIC_V1 && k >= 1 {
+                if is_v1 && k >= 1 {
                     k + 1
                 } else {
                     k
@@ -440,6 +525,58 @@ impl SegmentReader {
                 ids.push(None);
             }
         }
+        // embedding columns (v3+): per column [fid][dim][nrows][docids][data][norms]
+        let mut vectors: Vec<VectorColumn> = (0..nf).map(|_| VectorColumn::default()).collect();
+        if has_vectors {
+            if bytes.len() < p + 4 {
+                return Err("segment truncated (n_vec)".into());
+            }
+            let n_vec = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            for _ in 0..n_vec {
+                if bytes.len() < p + 12 {
+                    return Err("segment truncated (vec header)".into());
+                }
+                let fid = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+                let dim = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
+                let nrows = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as usize;
+                p += 12;
+                let docid_bytes = nrows * 4;
+                let data_bytes = nrows * dim as usize * 4;
+                if bytes.len() < p + docid_bytes + data_bytes * 2 {
+                    return Err("segment truncated (vec data)".into());
+                }
+                let mut docids = Vec::with_capacity(nrows);
+                for i in 0..nrows {
+                    docids.push(u32::from_le_bytes(
+                        bytes[p + i * 4..p + i * 4 + 4].try_into().unwrap(),
+                    ));
+                }
+                p += docid_bytes;
+                let mut data = Vec::with_capacity(nrows * dim as usize);
+                for i in 0..nrows * dim as usize {
+                    data.push(f32::from_le_bytes(
+                        bytes[p + i * 4..p + i * 4 + 4].try_into().unwrap(),
+                    ));
+                }
+                p += data_bytes;
+                let mut norms = Vec::with_capacity(nrows);
+                for i in 0..nrows {
+                    norms.push(f32::from_le_bytes(
+                        bytes[p + i * 4..p + i * 4 + 4].try_into().unwrap(),
+                    ));
+                }
+                p += nrows * 4;
+                if fid < vectors.len() {
+                    vectors[fid] = VectorColumn {
+                        dim,
+                        docids: docids.into_boxed_slice(),
+                        data: data.into_boxed_slice(),
+                        norms: norms.into_boxed_slice(),
+                    };
+                }
+            }
+        }
         let mut reader = SegmentReader {
             segid,
             num_docs,
@@ -451,6 +588,7 @@ impl SegmentReader {
             store_blocks,
             ids,
             id_fwd: Vec::new(),
+            vectors,
             content_hash: std::sync::OnceLock::new(),
         };
         let fwd = rebuild_id_fwd(&reader.ids, reader.num_docs);
@@ -487,6 +625,7 @@ pub fn freeze_parts(
     field_norms: Vec<Vec<u16>>,
     store_blocks: Vec<Box<[u8]>>,
     ids: Vec<Option<String>>,
+    vectors: Vec<VectorColumn>,
     num_docs: u32,
 ) -> SegmentReader {
     let mut blob: Vec<u8> = Vec::new();
@@ -561,6 +700,7 @@ pub fn freeze_parts(
         store_blocks,
         ids,
         id_fwd,
+        vectors,
         content_hash: std::sync::OnceLock::new(),
     }
 }
@@ -681,6 +821,16 @@ impl SegmentReader {
 
     pub fn norms(&self, fid: u32) -> Option<&[u16]> {
         self.field_norms.get(fid as usize).map(|v| v.as_ref())
+    }
+
+    /// the embedding column of a field (empty for text fields)
+    pub fn vector_column(&self, fid: u32) -> Option<&VectorColumn> {
+        self.vectors.get(fid as usize)
+    }
+
+    /// embedding of one doc in a vector field (None = the doc has none there)
+    pub fn vector_of(&self, docid: u32, fid: u32) -> Option<&[f32]> {
+        self.vectors.get(fid as usize)?.vector_of(docid)
     }
 
     pub fn sum_field_len(&self, fid: u32) -> u64 {

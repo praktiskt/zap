@@ -81,26 +81,35 @@ examples/big.rs   1M-doc probe   example: wand.rs: skew probe   example: smoke.r
 
 ## Distributed mode
 
-Three+ replicas can form a slot ring (1024 slots, `id → slot % N`): search
-fans out to every shard and merges top-k (scores stay comparable because each
-replica gossips its BM25 stats deltas at commit); ingest ring-routes each doc
-by hash of its external id (unid'd docs: content hash), and
-`GET/DELETE /doc/{id}` route to the owning shard. Ids stay unique +
-replaceable; replicas are plain shards (no replication factor).
+Three+ shards can form a **token ring** (every member owns 1024 virtual
+tokens; a key lands on the first token at or above its hash). Search fans out
+to every shard and merges top-k (scores stay comparable because each shard
+gossips its BM25 stats deltas at commit); ingest ring-routes each doc by hash
+of its external id (unid'd docs: content hash), and `GET/DELETE /doc/{id}`
+route to the owning shard. Ids stay unique + replaceable. Every doc lives on
+the slot owner **plus one ring successor** (`REPLICA_FACTOR = 2`), so one
+shard may die without losing the doc.
 
 ```sh
 zap serve --bind 127.0.0.1:3279 --announce 127.0.0.1:3279 --peers addr1:3279,addr2:3279
 ```
 
-Membership: a booting node announces itself to its configured peers
-(join merge, idempotent), and boots `--resync` to pull its ring share via
-paginated handoff when it starts empty. Ring repartition of pre-existing
-nodes: `POST /__zap/peers {"peers":"a,b"}` per node (or `{"join":"ip:port"}`
-to widen one member). `GET /__zap/handoff?after=<seg>:<docid>` streams a
-shard's live docs for movement/recovery. Shards can persist state with
-`--disk DIR` (segments + MANIFEST.json; uncommitted hot lanes are lost on a
-crash). A lost disk-backed shard reboots onto its PV; a lost RAM-only shard
-loses its copy unless another node holds its range.
+Membership: a booting node announces itself to its configured peers (join
+merge, idempotent) and boots `--resync` to survey its holder share: it pulls
+the rows it owns from the peers' paginated handoff streams and tells the
+sources to drop the copies they no longer hold — a scale-out **moves** the
+documents, it does not copy them. Adding a member re-homes ~1/(N+1) of the
+keyspace (the joiner's share), not the whole corpus. A delete is tombstoned
+on every member, so a stale copy can never resurrect it.
+
+Ring repartition of pre-existing nodes: `POST /__zap/peers {"peers":"a,b"}`
+per node (or `{"join":"ip:port"}` to widen one member). `GET
+/__zap/handoff?after=<seg>:<docid>` streams a shard's live docs for
+movement/recovery; `POST /__zap/resync` re-runs the survey by hand. Shards
+can persist state with `--disk DIR` (segments + MANIFEST.json; uncommitted
+hot lanes are lost on a crash). A lost disk-backed shard reboots onto its
+PV; a lost RAM-only shard loses its copy unless another node holds its
+range.
 
 Any node acts as the query coordinator (`/search` fan-out); a dead peer shows
 up as `"degraded": true`. Cluster-internal routes live under `/__zap/…`

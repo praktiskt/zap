@@ -155,14 +155,20 @@ fn served_maps(
                 // can survey our owned range. The survey is unconditional:
                 // rows may already have arrived via ring-routed ingest AND
                 // rows from before the join may sit on a pre-join owner's
-                // stale copy; pull_own_range replaces owned rows (no-op) and
-                // ack-deletes the stale source copies
+                // stale copy; pull_own_range fills the gaps and purges the
+                // stale source copies it took over
                 std::thread::sleep(std::time::Duration::from_millis(600));
-                let n = pull_own_range(&idx2, &scar, true);
-                if n > 0 {
-                    eprintln!("[handoff] boot resync moved {n} docs");
+                let rep = pull_own_range(&idx2, &scar, true);
+                if rep.busy {
+                    eprintln!("[handoff] boot resync skipped: a survey was already running");
                 } else {
-                    eprintln!("[handoff] boot resync: nothing to move");
+                    eprintln!(
+                        "[handoff] boot resync moved {} docs, purged {} stale copies",
+                        rep.moved, rep.purged
+                    );
+                    if !rep.failed.is_empty() {
+                        eprintln!("[handoff] boot resync incomplete: {:?}", rep.failed);
+                    }
                 }
             }
         });
@@ -195,26 +201,54 @@ fn served_maps(
     addr
 }
 
+/// outcome of one handoff survey
+#[derive(Debug, Default, Clone)]
+pub struct SurveyReport {
+    /// rows re-ingested into this shard
+    pub moved: usize,
+    /// stale copies dropped on their sources (rows the source no longer holds)
+    pub purged: usize,
+    /// peers whose stream could not be read (the survey is incomplete for them)
+    pub failed: Vec<SocketAddr>,
+    /// another survey was already running (this one did nothing)
+    pub busy: bool,
+}
+
 /// pull this shard's SEGMENT of the ring back from the peers: pages through
-/// each peer's `/__zap/handoff` stream, re-ingests rows this node holds
-/// (owner OR replica slots) and ack-deletes the id-carrying ones on the
-/// source ONLY when this node owns the row outright (the replica copy must
-/// stay at the source: replication requires R holders, the ack is a MOVE).
-/// For shard movement / empty-node recovery; unid rows re-ingest without ack.
-pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> usize {
+/// each peer's `/__zap/handoff` stream and re-ingests the rows this node
+/// HOLDS (owner OR replica slot).
+///
+/// Rows the node already has are NOT re-ingested: updates only ever reach the
+/// current holders, so the local copy is the fresh one and re-ingesting would
+/// clobber it with the source's older version.
+///
+/// A source row the source no longer holds (the source is not in the holder
+/// set any more) is STALE: this node now holds the row, so the source drops
+/// its copy — a MOVE, not a COPY. The purge runs AFTER the local commit, so
+/// the row is durable here before the source lets go of it.
+pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> SurveyReport {
     // one survey at a time per node: overlapping membership-change pulls and
     // boot surveys would double-commit their batches AND storm the peers'
     // single-threaded tiny_http accept loop (that storm showed as transient
     // connection refusals on the receiving shards during repartitions)
     static SURVEYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut report = SurveyReport::default();
     if SURVEYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return 0;
+        report.busy = true;
+        return report;
     }
     let peers = cluster.cache.lock().unwrap().peers();
     let ring = cluster.cache.lock().unwrap().ring();
     let self_addr = cluster.cache.lock().unwrap().self_addr();
-    let self_idx = ring.iter().position(|r| r == &self_addr);
-    let mut moved = 0usize;
+    let self_idx = ring.index_of(&self_addr);
+    // stale rows to drop on their source (per peer)
+    let mut stale: std::collections::HashMap<SocketAddr, Vec<String>> =
+        std::collections::HashMap::new();
+    // unid'd rows have no id to look up: the same row arrives once per
+    // holder, so dedupe them by their content key inside one survey
+    let mut seen_unid: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // id'd rows: dedupe inside one survey too (a row lives on R holders)
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for peer in peers {
         let mut cursor: Option<String> = None;
         loop {
@@ -222,13 +256,15 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
                 Some(c) => format!("/__zap/handoff?after={c}&limit=200"),
                 None => "/__zap/handoff?limit=200".to_string(),
             };
-            let Some((_, body)) = http_get(peer, &path) else {
+            let Some((_, body)) = http_get_retry(peer, &path) else {
                 if verbose {
                     eprintln!("[handoff] peer {peer} unreachable, stopping this source");
                 }
+                report.failed.push(peer);
                 break;
             };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                report.failed.push(peer);
                 break;
             };
             let docs: Vec<serde_json::Value> = v
@@ -246,21 +282,49 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
             let mut batch: Vec<Document> = Vec::with_capacity(docs.len());
             for d in docs {
                 // re-home rows this node holds: owner slot OR replica slot
-                // (slot+k rotation). NO ACK-DELETE here: with replication the
-                // source copy may be the legitimate replica (R holders stay),
-                // not a dup-purge-safety stale copy; stale rows left behind by
-                // membership moves are removed by the search's id-dedup and
-                // the /doc holder-first routing until an explicit purge pass
-                // (search + /doc both resolve correctly regardless)
                 match serde_json::from_value::<Document>(d.clone()) {
                     Ok(doc) => {
                         let key = doc.id.clone().unwrap_or_else(|| {
                             let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
                             format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
                         });
-                        let holders = crate::cluster::ring_holder_indices(&ring, &key);
+                        let holders = ring.holders_of_id(&key);
                         let holds = self_idx.is_some_and(|si| holders.contains(&si));
                         if !holds {
+                            continue;
+                        }
+                        // do we already have the row? (locally: the local copy
+                        // is the current one, since updates only reach the
+                        // current holders; or earlier in THIS survey: the row
+                        // lives on R holders, so it arrives once per holder)
+                        let local = doc.id.as_ref().is_some_and(|id| index.get(id).is_some());
+                        let dup = match &doc.id {
+                            Some(id) => !seen_ids.insert(id.clone()),
+                            None => !seen_unid.insert(key.clone()),
+                        };
+                        // the source's copy is stale when the source is not a
+                        // holder any more: this node holds the row now, so
+                        // the source may drop it.
+                        //
+                        // A row we hold is the source's own version (every
+                        // holder gets the same version) -> the source's copy
+                        // is redundant. A row we ALREADY had before the
+                        // survey is only purged when we are the OWNER (the
+                        // write authority: every write went through it, so
+                        // our copy is the authoritative one and the source's
+                        // frozen copy is redundant). A replica must not
+                        // purge: its copy may lag the owner's.
+                        let source_holds =
+                            ring.index_of(&peer).is_some_and(|si| holders.contains(&si));
+                        if !source_holds {
+                            let authoritative =
+                                self_idx.is_some_and(|si| holders.first() == Some(&si));
+                            if (!local || authoritative) && doc.id.is_some() {
+                                let id = doc.id.clone().expect("checked");
+                                stale.entry(peer).or_default().push(id);
+                            }
+                        }
+                        if local || dup {
                             continue;
                         }
                         batch.push(doc);
@@ -283,11 +347,11 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
                 if index.add_documents(chunk_slice.to_vec()).is_err() {
                     SURVEYING.store(false, std::sync::atomic::Ordering::SeqCst);
                     crate::bus::notify_stats();
-                    return moved;
+                    return report;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            moved += pulled;
+            report.moved += pulled;
             if verbose {
                 eprintln!("[handoff] pulled {pulled} docs from {peer}");
             }
@@ -302,9 +366,47 @@ pub fn pull_own_range(index: &Index, cluster: &LocalCluster, verbose: bool) -> u
     // add_documents contention blocked the single-threaded accept loop long
     // enough for connection refusals on the receiving shards
     index.commit();
+    // the rows are durable HERE now: the sources may drop their stale copies
+    for (peer, mut ids) in stale {
+        ids.sort();
+        ids.dedup();
+        for chunk in ids.chunks(500) {
+            let body = serde_json::json!({ "ids": chunk }).to_string();
+            match http_post(peer, "/__zap/handoff_delete", &body) {
+                Some((200, _)) => report.purged += chunk.len(),
+                Some((code, resp)) => {
+                    if verbose {
+                        eprintln!("[handoff] purge on {peer} rejected: {code} {resp}");
+                    }
+                    report.failed.push(peer);
+                }
+                None => {
+                    if verbose {
+                        eprintln!("[handoff] purge on {peer} unreachable");
+                    }
+                    report.failed.push(peer);
+                }
+            }
+        }
+    }
     SURVEYING.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::bus::notify_stats();
-    moved
+    report
+}
+
+/// GET with bounded retries: a peer's accept loop can transiently refuse
+/// under load (pull storms, ingest fan-outs) — the survey must not abandon a
+/// whole source on one refusal.
+fn http_get_retry(addr: SocketAddr, path: &str) -> Option<(u16, String)> {
+    let mut attempt = http_get(addr, path);
+    for _ in 0..2 {
+        if attempt.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        attempt = http_get(addr, path);
+    }
+    attempt
 }
 
 fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
@@ -587,8 +689,11 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
                 let handle = std::thread::Builder::new()
                     .name("handoff-resync".into())
                     .spawn(move || {
-                        let n = pull_own_range(&idx, &cl, true);
-                        eprintln!("[handoff] resync moved {n} docs");
+                        let rep = pull_own_range(&idx, &cl, true);
+                        eprintln!(
+                            "[handoff] resync moved {} docs, purged {} stale copies",
+                            rep.moved, rep.purged
+                        );
                     });
                 if handle.is_err() {
                     reply(req, 500, r#"{"error":"thread spawn failed"}"#);
@@ -678,9 +783,12 @@ fn handle(mut req: Request, index: &Arc<Index>, cluster: ClusterRef<'_>) {
                             .name("membership-resync".into())
                             .spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_millis(1000));
-                                let n = pull_own_range(&idx, &cl2, false);
-                                if n > 0 {
-                                    eprintln!("[handoff] membership change pulled {n} docs");
+                                let rep = pull_own_range(&idx, &cl2, false);
+                                if rep.moved > 0 || rep.purged > 0 {
+                                    eprintln!(
+                                        "[handoff] membership change pulled {} docs, purged {} stale copies",
+                                        rep.moved, rep.purged
+                                    );
                                 }
                             });
                     }
@@ -973,8 +1081,8 @@ fn ingest(req: &mut Request, index: &Index, cluster: ClusterRef<'_>) -> Result<u
             let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
             format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
         });
-        let slot = crate::cluster::ring_owner(&ring, &key).unwrap_or(0);
-        buckets.entry(ring[slot]).or_default().push(doc);
+        let slot = ring.owner_of_id(&key).unwrap_or(0);
+        buckets.entry(ring.members()[slot]).or_default().push(doc);
     }
     // split: this shard's docs commit locally (in-thread), remote owner
     // batches ingest concurrently so wall time = slowest peer + local commit
@@ -1053,9 +1161,9 @@ fn owner_commit_and_replicate(
                 let text = doc.fields.get("text").map(|t| t.as_str()).unwrap_or("");
                 format!("text:{}", crate::cluster::fnv64a(text.as_bytes()))
             });
-            let holders = crate::cluster::ring_holder_indices(&ring, &key);
+            let holders = ring.holders_of_id(&key);
             for (k, idx) in holders.iter().enumerate() {
-                let holder = ring[*idx];
+                let holder = ring.members()[*idx];
                 if k > 0 && holder != self_addr {
                     reps.entry(holder).or_default().push(doc.clone());
                 }
@@ -1163,10 +1271,10 @@ fn doc_get_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &str,
     }
     let ring = cl.cache.lock().unwrap().ring();
     let self_addr = cl.cache.lock().unwrap().self_addr();
-    let holders = crate::cluster::ring_holder_indices(&ring, id);
+    let holders = ring.holders_of_id(id);
     let path = format!("/doc/{}?hop={}", url_escape(id), hop + 1);
     for idx in holders {
-        let addr = ring[idx];
+        let addr = ring.members()[idx];
         if addr == self_addr {
             let exists = index.get(id).is_some();
             if exists {
@@ -1220,11 +1328,11 @@ fn doc_delete_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &s
     // to the replicas (id carries the whole list, so every copy hides)
     let ring = cl.cache.lock().unwrap().ring();
     let self_addr = cl.cache.lock().unwrap().self_addr();
-    let holders = crate::cluster::ring_holder_indices(&ring, id);
+    let holders = ring.holders_of_id(id);
     let Some(&first) = holders.first() else {
         return reply(req, 400, r#"{"error":"empty ring"}"#);
     };
-    let owner = ring[first];
+    let owner = ring.members()[first];
     if owner != self_addr {
         let path = format!("/doc/{}", url_escape(id));
         let mut attempt = http_delete(owner, &path);
@@ -1247,20 +1355,21 @@ fn doc_delete_reply(req: Request, index: &Index, cluster: ClusterRef<'_>, id: &s
 
 fn doc_delete(req: Request, index: &Index, id: &str, cluster: ClusterRef<'_>) {
     let res = index.delete(id);
-    // the owner propagates the tombstone to the replica holders; the same
-    // holder-set derivation keeps every copy in lockstep
+    // the owner propagates the tombstone to EVERY ring member, not only to
+    // the current holders: a member that lost the slot (a scale-out) still
+    // holds a stale copy of the row, and without the tombstone it keeps
+    // serving it — the delete "resurrects" in the next search fan-out or
+    // handoff survey. Same holder-set derivation as the GET path.
     if let Ok(true) = res {
         if let Some(cl) = cluster {
             let ring = cl.cache.lock().unwrap().ring();
             let self_addr = cl.cache.lock().unwrap().self_addr();
-            let holders = crate::cluster::ring_holder_indices(&ring, id);
-            let mut reps: Vec<SocketAddr> = Vec::new();
-            for (k, idx) in holders.iter().enumerate() {
-                let addr = ring[*idx];
-                if k > 0 && addr != self_addr {
-                    reps.push(addr);
-                }
-            }
+            let reps: Vec<SocketAddr> = ring
+                .members()
+                .iter()
+                .copied()
+                .filter(|a| *a != self_addr)
+                .collect();
             if !reps.is_empty() {
                 let body = serde_json::json!({ "ids": [id] }).to_string();
                 // wait for the tombstone pushes: read-your-deletes across the
