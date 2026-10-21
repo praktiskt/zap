@@ -16,42 +16,145 @@ pub fn fnv64a(data: &[u8]) -> u64 {
     h
 }
 
-/// consistent-hash ring slot count: ids map to slots via fnv64a, slots map
-/// to nodes via `slot % N` (stepped virtual-node layout). Adding a member
-/// claims exactly SLOTS/N slots (every Nth), so repartition churn stays
-/// ~SLOTS/N ids per membership change instead of re-homing everything.
-pub const SLOTS: u64 = 1024;
+/// virtual nodes per member: the token ring gives every member VNODES
+/// tokens, so the token space is N*VNODES wide and a membership change moves
+/// only the keys whose range the new member claims (~1/(N+1) of the
+/// keyspace). The OLD layout (`slot % N`, SLOTS=1024) re-homed ~N/(N+1) of
+/// the keys on every N -> N+1 change — see `token_ring_churn` below.
+///
+/// VNODES also bounds the placement skew: a member owns a random set of
+/// intervals, so its share deviates by ~1/sqrt(VNODES) (1024 vnodes -> a few
+/// percent; 256 vnodes -> ~6%).
+pub const VNODES: usize = 1024;
 
 /// replication factor: every doc lives on the slot owner + (REPLICA_FACTOR-1)
 /// ring successors, so R-1 members may die without losing that doc's copy.
 /// R=1 = no replication; R=2 = one backup per doc.
 pub const REPLICA_FACTOR: usize = 2;
 
-/// placement for a ring slot: [owner, replica...]: owner = ring[slot % N],
-/// replica k = ring[(slot + k) % N] — the next R-1 ring members in rotation
-pub fn replica_slots(slot: u64, ring_len: usize) -> Vec<usize> {
-    let r = REPLICA_FACTOR.min(ring_len).max(1);
-    (0..r).map(|k| ((slot as usize) + k) % ring_len).collect()
+/// golden-ratio odd constant: spreads the vnode indices of one member over
+/// the token space (multiplication by an odd constant is a bijection)
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// splitmix64 finalizer. FNV-1a alone mixes WEAKLY into the low bits (a
+/// difference in the last input byte only shows up in the high bits), and a
+/// token ring needs tokens AND keys spread uniformly over the whole 64-bit
+/// space — otherwise every member's vnodes cluster in one region and the ring
+/// degenerates into a list.
+#[inline]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
-/// ring slot of the node owning `id`: nodes sorted by address,
-/// slot = fnv64a(id) % SLOTS, owner = ring[slot % ring.len()]
-/// `ring`: the sorted [self, peers...] list of announcements.
-pub fn ring_owner(ring: &[SocketAddr], id: &str) -> Option<usize> {
-    if ring.is_empty() {
-        return None;
-    }
-    let slot = fnv64a(id.as_bytes()) % SLOTS;
-    Some((slot % ring.len() as u64) as usize)
+/// placement hash of a routing key (an external id, or "text:<content-hash>"
+/// for unid'd docs): fnv64a (the stable identity hash used by the wire
+/// formats) + the mixer (uniform spread)
+pub fn key_hash(id: &str) -> u64 {
+    mix64(fnv64a(id.as_bytes()))
 }
 
-/// the router set for `id`: [owner, replicas...] as ring INDICES
-pub fn ring_holder_indices(ring: &[SocketAddr], id: &str) -> Vec<usize> {
-    if ring.is_empty() {
-        return Vec::new();
+/// the ring view: the member list plus its virtual-token table.
+///
+/// Placement: a key hashes to `key_hash(key)` and lands on the FIRST token
+/// at or above that hash (wrapping to the lowest token). Replicas are the
+/// next distinct members in token order (successor replication), so a
+/// member that dies does not take the doc with it.
+#[derive(Clone, Debug, Default)]
+pub struct Ring {
+    /// members sorted by address (ring order)
+    members: Vec<SocketAddr>,
+    /// (token, member index) ascending by token
+    tokens: Vec<(u64, usize)>,
+}
+
+impl Ring {
+    /// build the token table for `members` (sorted + deduped)
+    pub fn new(members: Vec<SocketAddr>) -> Self {
+        let mut members = members;
+        members.sort();
+        members.dedup();
+        let mut tokens = Vec::with_capacity(members.len() * VNODES);
+        for (i, addr) in members.iter().enumerate() {
+            let base = fnv64a(addr.to_string().as_bytes());
+            for v in 0..VNODES {
+                tokens.push((mix64(base ^ (v as u64).wrapping_mul(GOLDEN)), i));
+            }
+        }
+        tokens.sort_unstable();
+        Self { members, tokens }
     }
-    let slot = fnv64a(id.as_bytes()) % SLOTS;
-    replica_slots(slot, ring.len())
+
+    pub fn members(&self) -> &[SocketAddr] {
+        &self.members
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// the member index of `addr` in this view
+    pub fn index_of(&self, addr: &SocketAddr) -> Option<usize> {
+        self.members.iter().position(|m| m == addr)
+    }
+
+    /// index of the token that owns the key hash `h`: the first token >= h,
+    /// wrapping around to the lowest token
+    fn token_pos(&self, h: u64) -> usize {
+        match self.tokens.binary_search_by(|(t, _)| t.cmp(&h)) {
+            Ok(i) => i,
+            Err(i) => {
+                if i == self.tokens.len() {
+                    0
+                } else {
+                    i
+                }
+            }
+        }
+    }
+
+    /// the member index owning the key hash `h`
+    pub fn owner_index(&self, h: u64) -> Option<usize> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(self.tokens[self.token_pos(h)].1)
+    }
+
+    /// the holder set for the key hash `h`: the owner plus the next distinct
+    /// members in token order
+    pub fn holder_indices(&self, h: u64) -> Vec<usize> {
+        if self.tokens.is_empty() {
+            return Vec::new();
+        }
+        let r = REPLICA_FACTOR.min(self.members.len()).max(1);
+        let start = self.token_pos(h);
+        let mut out = vec![self.tokens[start].1];
+        let mut i = 1usize;
+        while out.len() < r && i < self.tokens.len() {
+            let m = self.tokens[(start + i) % self.tokens.len()].1;
+            if !out.contains(&m) {
+                out.push(m);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// the owner member index of a routing key
+    pub fn owner_of_id(&self, id: &str) -> Option<usize> {
+        self.owner_index(key_hash(id))
+    }
+
+    /// the holder member indices of a routing key
+    pub fn holders_of_id(&self, id: &str) -> Vec<usize> {
+        self.holder_indices(key_hash(id))
+    }
 }
 
 /// parsed peer configuration
@@ -131,6 +234,8 @@ pub struct PeerCache {
     config: PeerConfig,
     cached: Vec<SocketAddr>,
     cached_at: Instant,
+    /// the ring view (member list + token table) for the current membership
+    ring: Arc<Ring>,
 }
 
 const LIST_TTL: Duration = Duration::from_secs(2);
@@ -141,31 +246,58 @@ impl PeerCache {
             config,
             cached: Vec::new(),
             cached_at: Instant::now() - LIST_TTL,
+            // built on the first refresh (the TTL starts backdated)
+            ring: Arc::new(Ring::default()),
         }
+    }
+
+    /// re-resolve the peers and rebuild the ring view (token table) — the
+    /// token table is rebuilt only when the MEMBERSHIP actually changed
+    fn refresh(&mut self) {
+        self.cached = self.config.resolve();
+        self.cached_at = Instant::now();
+        let m = self.members();
+        if self.ring.members() != m.as_slice() {
+            self.ring = Arc::new(Ring::new(m));
+        }
+    }
+
+    /// the member list (self + resolved peers), sorted by address
+    fn members(&self) -> Vec<SocketAddr> {
+        let mut m = self.cached.clone();
+        m.push(self.config.announce);
+        m.sort();
+        m.dedup();
+        m
     }
 
     /// peer socket list (cloned; self not included)
     pub fn peers(&mut self) -> Vec<SocketAddr> {
         if self.cached_at.elapsed() >= LIST_TTL {
-            self.cached = self.config.resolve();
-            self.cached_at = Instant::now();
+            self.refresh();
         }
         self.cached.clone()
     }
 
-    /// [self, peers...] sorted ring; (slot, socket) owning `id`
+    /// the ring view: members + token table. Rebuilt when the membership
+    /// changes (join/set_peers invalidate) or the peer list is re-resolved.
+    pub fn ring(&mut self) -> Arc<Ring> {
+        if self.cached_at.elapsed() >= LIST_TTL {
+            self.refresh();
+        }
+        self.ring.clone()
+    }
+
+    /// the ring member owning `id` (index + address)
     pub fn owner_of(&mut self, id: &str) -> (usize, SocketAddr) {
-        let ring = self.config.ring();
-        let slot = ring_owner(&ring, id).expect("ring cannot be empty: self is always a member");
-        (slot, ring[slot])
+        let ring = self.ring();
+        let idx = ring
+            .owner_of_id(id)
+            .expect("ring cannot be empty: self is always a member");
+        (idx, ring.members()[idx])
     }
 
-    /// [self, peers...] sorted ring
-    pub fn ring(&mut self) -> Vec<SocketAddr> {
-        self.config.ring()
-    }
-
-    /// (slot, socket) owning an unid'd doc by its content
+    /// the ring member owning an unid'd doc by its content
     pub fn owner_of_text(&mut self, text: &str) -> (usize, SocketAddr) {
         self.owner_of(&format!("content:{}", fnv64a(text.as_bytes())))
     }
@@ -459,33 +591,108 @@ pub fn build_peer_config(
 mod tests {
     use super::*;
 
-    /// slot%N layout: adding/removing a member shifts only SLOTS/N slots;
-    /// membership N -> N+1 keeps every id whose slot % (N+1) != N
+    fn members(n: u16) -> Vec<SocketAddr> {
+        (0..n)
+            .map(|i| SocketAddr::from(([10, 0, 0, i as u8], 8080)))
+            .collect()
+    }
+
+    fn owners(ring: &Ring, h: u64) -> Vec<SocketAddr> {
+        ring.holder_indices(h)
+            .iter()
+            .map(|&i| ring.members()[i])
+            .collect()
+    }
+
+    /// the keyspace moves when a member JOINS: the new member claims
+    /// ~1/(N+1) of the keys and the REST keep their owner. The old
+    /// `slot % N` layout re-homed ~N/(N+1) of the keys on every N -> N+1
+    /// change (a near-full reshuffle: 67% at 2->3, 75% at 3->4).
     #[test]
-    fn slot_ring_repartition_churn() {
-        let n = SLOTS * 100; // ids spread far past one full slot cycle
-        let mut churn_1_to_2 = 0usize;
-        for i in 0..n {
-            let id = format!("doc-{i}");
-            let s = fnv64a(id.as_bytes()) % SLOTS;
-            if s % 2 == 1 {
-                churn_1_to_2 += 1;
+    fn token_ring_churn() {
+        let n_ids = 20_000;
+        for n in 1..=6u16 {
+            let before = Ring::new(members(n));
+            let after = Ring::new(members(n + 1));
+            let mut moved = 0usize;
+            let mut holder_moved = 0usize;
+            for i in 0..n_ids {
+                let h = key_hash(&format!("doc-{i}"));
+                let ob = before.owner_index(h).expect("ring not empty");
+                let oa = after.owner_index(h).expect("ring not empty");
+                if before.members()[ob] != after.members()[oa] {
+                    moved += 1;
+                }
+                if owners(&before, h) != owners(&after, h) {
+                    holder_moved += 1;
+                }
             }
-        }
-        // N: 1 -> 2 re-homes exactly the odd slots = half the keyspace
-        assert_eq!(churn_1_to_2, (n / 2) as usize);
-        // skew sanity: per-slot shares within +-2% across a larger cycle
-        let mut per2 = [0usize; 2];
-        for i in 0..n {
-            let id = format!("doc-{i}");
-            let s = fnv64a(id.as_bytes()) % SLOTS;
-            per2[(s % 2) as usize] += 1;
-        }
-        for c in per2 {
+            let churn = moved as f64 / n_ids as f64;
+            // the new member's share is the FLOOR of the churn: the ring must
+            // not move anything else
+            let bound = 1.0 / (n as f64 + 1.0) + 0.10;
             assert!(
-                (c as i64 - (n / 2) as i64).abs() < ((n as f64) * 0.02) as i64,
-                "skew {per2:?}"
+                churn < bound,
+                "N={n} -> {}: owner churn {churn:.3} exceeds {bound:.3}",
+                n + 1
+            );
+            // replicas are successors: their churn is the owner's plus the
+            // new member's share as a successor — still far below the old
+            // layout's ~N/(N+1)
+            let hbound = 2.0 / (n as f64 + 1.0) + 0.16;
+            let hchurn = holder_moved as f64 / n_ids as f64;
+            assert!(
+                hchurn < hbound,
+                "N={n} -> {}: holder churn {hchurn:.3} exceeds {hbound:.3}",
+                n + 1
             );
         }
+    }
+
+    /// every member owns ~1/N of the keyspace (no hot member, no dead member).
+    /// The placement skew is bounded by the vnode count (~1/sqrt(VNODES)).
+    #[test]
+    fn token_ring_balance() {
+        let n = 5u16;
+        let ring = Ring::new(members(n));
+        let n_ids = 50_000;
+        let mut counts = vec![0usize; n as usize];
+        for i in 0..n_ids {
+            let h = key_hash(&format!("doc-{i}"));
+            counts[ring.owner_index(h).expect("ring not empty")] += 1;
+        }
+        let expect = n_ids as f64 / n as f64;
+        for c in &counts {
+            assert!(
+                (*c as f64 - expect).abs() < expect * 0.10,
+                "skew: {counts:?} (expected ~{expect:.0})"
+            );
+        }
+    }
+
+    /// the same membership always places a key the same way (the ring view
+    /// must agree across nodes, or the copies scatter)
+    #[test]
+    fn token_ring_deterministic() {
+        let a = Ring::new(members(4));
+        let b = Ring::new(members(4));
+        for i in 0..1000 {
+            let id = format!("doc-{i}");
+            assert_eq!(a.owner_of_id(&id), b.owner_of_id(&id));
+            assert_eq!(a.holders_of_id(&id), b.holders_of_id(&id));
+        }
+    }
+
+    /// R=2 replication: a 2-member ring holds every doc on BOTH members, a
+    /// 1-member ring holds it on the single member
+    #[test]
+    fn token_ring_replication() {
+        let one = Ring::new(members(1));
+        let two = Ring::new(members(2));
+        let h = key_hash("doc-1");
+        assert_eq!(one.holder_indices(h).len(), 1);
+        assert_eq!(two.holder_indices(h).len(), 2);
+        let three = Ring::new(members(3));
+        assert_eq!(three.holder_indices(h).len(), 2);
     }
 }
