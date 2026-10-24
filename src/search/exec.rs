@@ -132,15 +132,22 @@ pub fn stem_cache(analyzer: &Analyzer, node: &Node) -> HashMap<String, [Option<A
 }
 
 /// raw term -> [stemmed, raw] variants; raw is None when the stem is identical
-/// (at most 1 alloc per call)
+/// (at most 1 alloc per call). The RAW word goes through the doc pipeline
+/// first: the postings carry charabia's NORMALIZED lemmas, so a query for
+/// "hembränt" has to hit the indexed term "hembrant" the way a doc would.
 fn stem_pair_raw(analyzer: &Analyzer, t: &str) -> (String, [Option<String>; 2]) {
-    let stem = analyzer.stem_word(t);
-    let pair = if stem == t {
+    let raw = analyzer
+        .tokenize_query(t)
+        .first()
+        .map(|tok| tok.text.clone().into_owned())
+        .unwrap_or_else(|| t.to_string());
+    let stem = analyzer.stem_word(&raw);
+    let pair = if stem == raw {
         [Some(stem), None]
     } else {
-        [Some(stem), Some(t.to_string())]
+        [Some(stem), Some(raw.clone())]
     };
-    (t.to_string(), pair)
+    (raw, pair)
 }
 
 /// per-segment stem lookup: cache hit = Rc refcount bump, miss = live stemming

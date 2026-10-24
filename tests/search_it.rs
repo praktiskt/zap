@@ -54,6 +54,33 @@ fn boolean_ops() {
     assert!(not.iter().all(|t| !t.contains("forest")));
 }
 
+/// the DOC pipeline normalizes (charabia folds the accents: "café" -> "cafe"),
+/// so the QUERY term has to be normalized the same way — otherwise a query
+/// for "café" misses the indexed term "cafe" (caught by the real-data run:
+/// "hembränt" matched nothing while "hembrant" hit the same documents)
+#[test]
+fn query_terms_are_normalized_like_docs() {
+    let index = mk_index();
+    index
+        .add_documents(vec![
+            Document::new().text("text", "café latte i Stockholm"),
+            Document::new().text("text", "naïve approach to hembränt"),
+            Document::new().text("text", "unrelated plain text"),
+        ])
+        .unwrap();
+    index.commit();
+    for q in ["café", "cafe", "CAFÉ", "naïve", "hembränt", "hembrant"] {
+        let hits = texts(&index, q);
+        assert!(!hits.is_empty(), "query {q} matched nothing: {hits:?}");
+    }
+    // the folded form and the accented form find the SAME documents
+    assert_eq!(
+        texts(&index, "hembränt"),
+        texts(&index, "hembrant"),
+        "accented and folded queries must agree"
+    );
+}
+
 #[test]
 fn phrase_tests() {
     let index = mk_index();
