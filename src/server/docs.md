@@ -107,6 +107,10 @@ curl -X POST localhost:3279/search \
 Result rows carry the components: `score` (the fused score), `keyword_score`
 and `vector_score` (null when that side did not produce the document).
 
+Note on `weighted`: each side is min-max normalized over the candidate
+pool, so with few matches a small keyword difference is amplified to the
+full range. `rrf` is scale-free and does not have that property.
+
 ## documents — `GET /doc/{id}`, `DELETE /doc/{id}`
 
 Fetch or delete by external id (cluster-aware: routed to the owning

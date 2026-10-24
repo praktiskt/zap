@@ -101,6 +101,12 @@ curl -X POST localhost:3279/search \
 The mode defaults to `hybrid` when a query **and** an embedding are present. Result
 rows carry the components: `score` (the fused score), `keyword_score`, `vector_score`.
 
+> **Weighted fusion caveat**: each modality is min-max normalized over the candidate
+> pool, so with a *small* pool a tiny keyword difference is amplified to the full
+> range — a document whose embedding is 0.87 can outrank the exact match (1.00) when
+> the keyword side differs by a hair. `fusion: "rrf"` is scale-free and has no such
+> property; raise `alpha` to lean on the keyword side.
+
 - **Validation is schema-gated**: an unknown field, a wrong dimension or a non-finite
   value is rejected at ingest (400).
 - **Storage**: the embeddings live in the segment next to the postings (merge and the
