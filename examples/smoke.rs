@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
-use zap::schema::{Document, Schema};
+use zap::schema::{Document, Metric, Schema};
+use zap::search::SearchRequest;
 
 const N: usize = 10_000;
 
@@ -146,6 +147,75 @@ fn main() {
     time_q("get-by-id d5001", 20000, || {
         let _ = index.get("d5001").unwrap();
     });
+
+    println!("== embedding search (flat scan) ==");
+    {
+        let mut schema = Schema::default();
+        schema.add_text("text", 1.0);
+        schema.add_vector("emb", 768, Metric::Cosine);
+        let index = Index::with_lanes(schema, Analyzer::new(AnalyzerConf::default()), 1.2, 0.75, 8);
+        let mut state = 0x2545F491_4F6CDD1Du64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let docs: Vec<Document> = (0..N)
+            .map(|i| {
+                let v: Vec<f32> = (0..768)
+                    .map(|_| ((rnd() % 2000) as f32 / 2000.0) - 0.5)
+                    .collect();
+                Document::new()
+                    .id(format!("d{i}"))
+                    .text("text", "embedding corpus")
+                    .vector("emb", v)
+            })
+            .collect();
+        index.add_documents(docs).unwrap();
+        index.commit();
+        let q: Vec<f32> = (0..768)
+            .map(|_| ((rnd() % 2000) as f32 / 2000.0) - 0.5)
+            .collect();
+        // kernel-level: the AVX2/FMA dot vs the scalar reference over 768 dims
+        let a: Vec<f32> = (0..768)
+            .map(|_| ((rnd() % 2000) as f32 / 2000.0) - 0.5)
+            .collect();
+        let mut sink = 0.0f32;
+        let iters = 200_000;
+        let q768 = std::hint::black_box(&q);
+        let a768 = std::hint::black_box(&a);
+        let t = Instant::now();
+        for _ in 0..iters {
+            // the accumulator flows through a black box: without it LLVM
+            // folds the whole loop and the timing reads 0.1ns
+            sink = std::hint::black_box(sink) + zap::vector::kernels::dot(a768, q768);
+        }
+        let avx = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            sink = std::hint::black_box(sink) + zap::vector::kernels::dot_scalar(a768, q768);
+        }
+        let scalar = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        std::hint::black_box(sink);
+        println!(
+            "{:>38}: dot {avx:.3} us | scalar {scalar:.3} us (768 dims)",
+            "similarity kernel"
+        );
+        time_q("vector top-10 (10k x 768)", 50, || {
+            let _ = index
+                .search_request(&SearchRequest::vector(q.clone(), 10), index.pub_stats())
+                .unwrap();
+        });
+        time_q("hybrid top-10 (10k x 768)", 50, || {
+            let _ = index
+                .search_request(
+                    &SearchRequest::hybrid("fox", q.clone(), 10),
+                    index.pub_stats(),
+                )
+                .unwrap();
+        });
+    }
 
     println!("total wall: {:.1}s", t0.elapsed().as_secs_f64());
 }

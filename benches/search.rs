@@ -17,7 +17,8 @@ fn cfg_quick(g: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>
 use std::sync::Arc;
 use zap::analyzer::{Analyzer, AnalyzerConf};
 use zap::index::Index;
-use zap::schema::{Document, Schema};
+use zap::schema::{Document, Metric, Schema};
+use zap::search::SearchRequest;
 
 /// synthetic english-ish corpus: `lorem`-ish words with zipf skew
 fn corpus(n_docs: usize, words_per_doc: usize) -> Vec<String> {
@@ -248,12 +249,93 @@ fn doc_length(c: &mut Criterion) {
     g.finish();
 }
 
+/// embedding search: the flat scan cost is O(rows x dim) — this is the
+/// number that decides when the HNSW round behind the `VectorIndex` seam
+/// becomes mandatory.
+fn embedding_scan(c: &mut Criterion) {
+    let dim = 768usize;
+    // deterministic pseudo-random embeddings
+    let mut state = 0x2545F491_4F6CDD1Du64;
+    let mut rnd = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut build = |n: usize| -> (Arc<Index>, Vec<f32>) {
+        let mut schema = Schema::default();
+        schema.add_text("text", 1.0);
+        schema.add_vector("emb", dim as u32, Metric::Cosine);
+        let analyzer = Analyzer::new(AnalyzerConf::default());
+        let index = Index::with_lanes(schema, analyzer, 1.2, 0.75, 8);
+        let mut chunk: Vec<Document> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim)
+                .map(|_| ((rnd() % 2000) as f32 / 2000.0) - 0.5)
+                .collect();
+            chunk.push(
+                Document::new()
+                    .id(format!("d{i}"))
+                    .text("text", "embedding corpus")
+                    .vector("emb", v),
+            );
+        }
+        index.add_documents(chunk).unwrap();
+        index.commit();
+        let query: Vec<f32> = (0..dim)
+            .map(|_| ((rnd() % 2000) as f32 / 2000.0) - 0.5)
+            .collect();
+        (index, query)
+    };
+
+    let quick = std::env::var("ZAP_BENCH_QUICK").is_ok();
+    let tiers: Vec<usize> = if quick {
+        vec![10_000]
+    } else {
+        vec![10_000, 100_000]
+    };
+    for n in tiers {
+        let (index, query) = build(n);
+        let mut g = c.benchmark_group("vector");
+        cfg_quick(&mut g);
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_with_input(
+            BenchmarkId::new("scan", format!("{n}x{dim}")),
+            &query,
+            |b, q| {
+                b.iter(|| {
+                    index
+                        .search_request(&SearchRequest::vector(q.clone(), 10), index.pub_stats())
+                        .unwrap()
+                })
+            },
+        );
+        // the hybrid path: the keyword side plus the embedding side, fused
+        g.bench_with_input(
+            BenchmarkId::new("hybrid", format!("{n}x{dim}")),
+            &query,
+            |b, q| {
+                b.iter(|| {
+                    index
+                        .search_request(
+                            &SearchRequest::hybrid("fox", q.clone(), 10),
+                            index.pub_stats(),
+                        )
+                        .unwrap()
+                })
+            },
+        );
+        g.finish();
+    }
+}
+
 criterion_group!(
     benches,
     ingest_lanes,
     queries,
     topk_collect,
     query_scale,
-    doc_length
+    doc_length,
+    embedding_scan
 );
 criterion_main!(benches);

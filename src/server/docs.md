@@ -35,6 +35,9 @@ Document shape — `text` is required, `id` and `metadata` optional:
 Re-ingesting an existing `id` **replaces** the document. Unknown fields
 are rejected with 400.
 
+Extra keys: a **string** is another text field, an **array of numbers** is an
+embedding (see "embedding search" below).
+
 ## search — `GET /search?q=...&k=10` or `POST /search`
 
 ```bash
@@ -61,6 +64,48 @@ only when the document carries them.
 | `f?x`, `br*n` | wildcard (`?` = 1 char) |
 | `fox~` / `fox~2` | fuzzy (auto distance 1, or explicit) |
 | `title:fox` | restrict to one field |
+
+## embedding search
+
+zap stores and searches the embeddings **you** compute — the model stays on
+your side. Declare the vector field when the node boots:
+
+```bash
+zap serve --bind 0.0.0.0:3279 --vector emb:768          # cosine (default)
+zap serve --bind 0.0.0.0:3279 --vector emb:768:dot      # or l2
+```
+
+Ingest: an array of numbers is the embedding (the dimension must match the
+declared one — otherwise 400).
+
+```bash
+curl -X POST localhost:3279/ingest \
+  -d '{"id":"doc-1","text":"the quick brown fox","emb":[0.012,-0.44, ...]}'
+```
+
+Search: send the query embedding.
+
+```bash
+# embedding only
+curl -X POST localhost:3279/search -d '{"vector":[0.012,-0.44, ...],"k":5}'
+# keyword AND embedding, fused
+curl -X POST localhost:3279/search \
+  -d '{"q":"quick brown","vector":[0.012,-0.44, ...],"mode":"hybrid","alpha":0.5}'
+# the keyword selects the candidates, the embedding ranks them
+curl -X POST localhost:3279/search \
+  -d '{"q":"quick brown","vector":[0.012,-0.44, ...],"mode":"filter"}'
+```
+
+| parameter | meaning |
+|---|---|
+| `vector` | the query embedding (array of numbers; on GET: comma separated) |
+| `field` | which vector field to search (default: the first one) |
+| `mode` | `keyword` \| `vector` \| `hybrid` \| `filter` (default: hybrid when both `q` and `vector` are given) |
+| `alpha` | keyword weight in the weighted fusion (0 = embedding only, 1 = keyword only) |
+| `fusion` | `weighted` (default) or `rrf` (reciprocal rank fusion) |
+
+Result rows carry the components: `score` (the fused score), `keyword_score`
+and `vector_score` (null when that side did not produce the document).
 
 ## documents — `GET /doc/{id}`, `DELETE /doc/{id}`
 
@@ -101,10 +146,13 @@ answered by the local shard).
 
 ```bash
 zap --help                 # global flags: --lanes, --top-k, --k1, --b,
-                           #   --no-stem, --disk DIR, --commit-every
+                           #   --no-stem, --disk DIR, --commit-every,
+                           #   --vector NAME:DIM[:METRIC]
 zap corpus/                # index files, then search interactively
 zap serve [inputs...]      # index inputs, then serve
 ```
 
-Interactive commands: `:help`, `:stats`, `:quit`. Snippet width, plain
+Interactive commands: `:help`, `:stats`, `:quit`, and for the embedding
+side `:vec <csv>` (set the query embedding), `:vec off`, `:mode
+keyword|vector|hybrid|filter`, `:alpha <0..1>`. Snippet width, plain
 output and stemming are CLI flags, not query parameters.

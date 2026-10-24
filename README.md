@@ -13,6 +13,8 @@ ingest: 10k × 200w docs in 320 ms  •  1M × 50w docs in 16 s (60k docs/s)
 
 ## What's inside
 - **BM25 ranking** (Lucene-style idf) + phrase-window bonus + per-field boosts
+- **Embedding search**: schema-gated vector fields, exact flat scan (AVX2/FMA), and
+  hybrid fusion of keyword + embedding (weighted or RRF) — you supply the embeddings
 - **External doc ids + metadata**: user-assigned unique string ids (duplicate ingest
   replaces), arbitrary stored-only JSON metadata, get/delete-by-id over lock-free
   snapshots; tombstones mask deleted docs and are physically purged by merge
@@ -61,6 +63,55 @@ Input docs: files/dirs (`.txt .md .rst .json .toml .csv .log .xml`; unknown exte
 as text); `--stdin` = whole stdin is one doc; `--stdin-lines` = one doc per line until a
 blank line. Common flags: `-k N`, `--lanes N`, `--no-stem`, `--plain`, `--snippet N`,
 `--commit-every N`, `--disk DIR`.
+
+## Embedding search
+
+zap stores and searches **embeddings you compute**. The model stays on your side: you
+embed the text, zap takes the numbers. Declare a vector field, send the vector with
+the document, send the query vector with the search.
+
+```sh
+# declare the field: name:dim[:metric] (metric = cosine | dot | l2, default cosine)
+zap serve --bind 127.0.0.1:3279 --vector emb:768
+
+# ingest: a number array is an embedding (a string is a text field)
+curl -X POST localhost:3279/ingest \
+  -d '{"id":"doc-1","text":"the quick brown fox","emb":[0.012, -0.44, ...]}'
+
+# search by embedding only
+curl -X POST localhost:3279/search \
+  -d '{"vector":[0.012, -0.44, ...], "k":5}'
+
+# hybrid: keyword AND embedding, fused (alpha = keyword weight)
+curl -X POST localhost:3279/search \
+  -d '{"q":"quick brown","vector":[0.012, -0.44, ...], "k":5, "mode":"hybrid", "alpha":0.5}'
+
+# rank the keyword matches by the embedding (the keyword selects, the vector ranks)
+curl -X POST localhost:3279/search \
+  -d '{"q":"quick brown","vector":[0.012, -0.44, ...], "mode":"filter"}'
+```
+
+| mode | meaning | fusion |
+|---|---|---|
+| `keyword` | BM25 only (the default when there is no embedding) | — |
+| `vector` | embedding similarity only (cosine/dot/L2 per the field) | — |
+| `hybrid` | both, mixed into one score | `weighted` (default): `alpha*bm25 + (1-alpha)*cosine` after min-max normalization; `rrf`: reciprocal rank fusion |
+| `filter` | the keyword picks the candidates, the embedding ranks them | — |
+
+The mode defaults to `hybrid` when a query **and** an embedding are present. Result
+rows carry the components: `score` (the fused score), `keyword_score`, `vector_score`.
+
+- **Validation is schema-gated**: an unknown field, a wrong dimension or a non-finite
+  value is rejected at ingest (400).
+- **Storage**: the embeddings live in the segment next to the postings (merge and the
+  disk format carry them), 768 dims = 3 KB/doc as f32 — zap stores exactly what you
+  send, no quantization layer.
+- **Cluster mode**: the shards return candidate rows with their raw per-modality
+  scores and the coordinator fuses them globally — a hybrid search ranks identically
+  on one node and on a ring.
+- **Cost**: the scan is a flat exact pass over the corpus (10k docs x 768 dims =
+  ~0.5 ms, 100k x 768 = ~8 ms). The `VectorIndex` trait is the seam for an HNSW
+  index when the corpus outgrows the flat scan.
 
 ## Repo
 
@@ -147,6 +198,7 @@ zap serve --bind 127.0.0.1:3279 --stdin-lines   # empty index, ingest via HTTP
 | `/stats` | GET | live docs / segments / generation + per-shard chips |
 | `/search?q=..&k=N` | GET | query string search (percent-encoded) |
 | `/search` | POST | `{"q":"..","k":N}` body search |
+| `/search` | POST | `{"vector":[..],"k":N}` embedding search (`mode`, `field`, `alpha`, `fusion` optional) |
 | `/dashboard` | GET | live stats page |
 | `/ingest` | POST | NDJSON `{"text":..}` lines or a JSON array of them (auto-commit) |
 | `/commit` | POST | explicit segment commit |
@@ -181,6 +233,10 @@ Doc-length sweep (1k docs/photo): rare-term query flat ~5 µs regardless of doc 
 (100 w → 20 kw / 100k chars); phrase scales with doc length (23 µs @100w → 2.2 ms @20kw).
 Ingest: 10k × 200w in 320 ms; 1M × 50w (8 lanes) in ~16 s.
 
+Embedding search (flat scan, 768 dims, cosine, 8 lanes):
+- 10k docs: **0.50 ms** vector-only, 0.57 ms hybrid
+- 100k docs: **8.3 ms** vector-only, 8.9 ms hybrid
+
 ## Correctness
 
 57-test suite: `cargo test`
@@ -199,5 +255,6 @@ Quick iteration: `cargo run --release --example smoke` (~1 s wall, coarse timing
 
 ## Roadmap
 
-- Embedding search: schema-gated vector fields + flat SIMD scan → HNSW via `VectorIndex` seam
+- Embedding search: the flat SIMD scan + hybrid fusion shipped — next round is HNSW
+  behind the `VectorIndex` trait seam and a quantized (f16) column as the memory lever
 - Per-field bitpacked postings (128-doc blocks à la tantivy) if profiling shows decode-bound

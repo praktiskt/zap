@@ -15,14 +15,51 @@ Single binary, everything lives in the process; no mmap, no persistence, no serv
 - distributed mode (cluster.rs): consistent-hash TOKEN ring (VNODES=1024 virtual tokens per member, token = mix64(fnv64a(addr) ^ v*GOLDEN), key = mix64(fnv64a(key)), owner = first token >= key hash, replicas = next distinct members in token order; ring list = [self+peers...] sorted by addr, cached in PeerCache and rebuilt only on a membership change). A membership change re-homes ~1/(N+1) of the keyspace (the joiner's share) — the OLD `slot % N` layout re-homed ~N/(N+1) (67% at 2->3, 75% at 3->4); placement skew is bounded by ~1/sqrt(VNODES). coordinator-less scatter-gather (any pod fans out /search via /__zap/shard_search), BM25-stats gossip (per-peer ABSOLUTE df envelopes pushed as deltas at commit; first contact = full envelope + resync pull), ring-routed ingest and /doc/{id}; empty --peers = zero-overhead single-node path (engine untouched; scores need the global view via Index::search_with_stats)
 - shard movement / recovery (handoff): GET /__zap/handoff = paginated live-doc stream of a shard (Index::docs_page cursor "seg:docid", tombstoned skipped); pull_own_range() pages every peer's stream and re-ingests the rows this node HOLDS (owner OR replica slot; id key, unid = content-hash key) — rows it already has are NEVER re-ingested (the local copy is the current one: re-ingesting would clobber it with the source's older version), and the source's STALE copy (source not in the holder set any more) is purged via POST /__zap/handoff_delete AFTER the local commit (a scale-out MOVES rows, it does not copy them; a replica only purges when it is the OWNER, whose copy is authoritative); deletes are tombstoned on EVERY member (not just the holders) so a stale copy cannot resurrect a deleted doc. triggers: boot --resync (unconditional — NOT gated on an empty index), membership change via POST /__zap/peers, or POST /__zap/resync; POST /__zap/peers replaces a node's peer list IN PLACE (ring repartition — every node must apply the same membership or views diverge), {"join":"ip:port"} = idempotent membership merge and every joining node auto-announces to its configured peers at boot (800ms after serve, then the pull at 1.8s) — move procedure = singleton ingest -> joiner --resync (announce widens both views automatically) -> /doc/{id} routes ring-correct everywhere; RAM-only shards CANNOT rehydrate lost ranges (nothing holds a copy) — this moves docs, it does not replicate them; scripts/handoff-probe.sh = live manual probe, tests/handoff.rs + tests/rebalance.rs = integration (scale-out moves + purges, delete does not resurrect); chart: cluster.disk.enabled renders a StatefulSet (stable ordinals, serviceName peersService, PVC zap-data mounted -disk /zap-data) so rebooted pods reload their own state
 - multilingual tokenization via charabia (+ snowball stemming on latin tokens)
+- embedding search (client-supplied vectors): schema-gated vector fields
+  (`Schema::add_vector(name, dim, metric)`, metric = cosine/dot/l2), a per-segment
+  `VectorColumn` (sparse: rows only for docs that carry the field; ascending docids +
+  row-major f32 data + per-row L2 norm), a flat exact scan (`src/vector/`, AVX2+FMA
+  kernels chosen at RUNTIME), and hybrid fusion of BM25 + similarity (weighted with
+  alpha, or RRF). The caller owns the embedding model: zap never embeds text.
 
-Future extension is pre-plumbed: `schema.rs` declares `vector` fields (dim + metric) with
-validation gates, so embedding search can be added without re-shaping the documents model.
+## Embedding search — design notes
+- model ownership: the CLIENT sends the embedding (`{"emb": [...]}` on ingest, the query
+  vector on /search). zap stores exactly what it gets (f32, no quantization layer).
+- `src/vector/` is the search core and imports NO `crate::` types (only std + roaring
+  for the tombstone mask): `Metric`, `VectorColumn`/`VectorBuilder`, the `VectorIndex`
+  trait (the seam an HNSW implementation plugs into) and `FlatVectorIndex` (exact
+  brute-force scan). `src/search/fusion.rs` holds the modality fusion (it is a SEARCH
+  concern: it mixes BM25 with similarity, and the cluster coordinator imports the same
+  fn as the engine so a hybrid ranks identically on one node and on a ring).
+- storage: the column lives inside the segment (merge carries the rows through the
+  existing docid remap; the disk format is `zapseg3` = zapseg2 + an embedding section;
+  zapseg1/zapseg2 stay bootable). A vector field has NO postings and a ZERO norm row
+  (one row per doc per field, so every field's norm array stays aligned with the docid
+  space).
+- wire rule (schema-independent): a JSON string is a text field, a JSON number array is
+  an embedding; the SCHEMA decides which is which (a text field fed an array is
+  rejected at add time). Validation gates: unknown field, wrong dimension, non-finite
+  value -> typed IndexError -> 400.
+- search modes: `keyword` (BM25 only, the unchanged hot path), `vector` (similarity
+  only), `hybrid` (both, fused), `filter` (the keyword selects the candidates — it
+  needs the COMPLETE match set, so it uses the dense evaluator, not the WAND walk —
+  and the embedding ranks them). Fusion: `weighted` (min-max normalize each modality
+  over the candidate pool, then `alpha*kw + (1-alpha)*vec`) or `rrf` (scale-free).
+- candidate pools: the keyword side keeps a per-segment top-pool (hybrid: 4k, min 64 —
+  a document that is mid-ranked in both lists must still be able to reach the fused
+  top-k); the embedding side is a flat scan over a flat (segment, row-chunk) task
+  list, so a big segment cannot own the pass (the R26 lesson).
+- cluster: the shards answer `/__zap/shard_search` with CANDIDATE rows (the RAW
+  per-modality scores) and the coordinator fuses them globally. A peer's rows are
+  identified by the ROW INDEX (docids restart per segment, so (shard, docid) is not
+  unique). The handoff stream carries the embedding arrays, so a shard move keeps them.
 
 ## Repo layout
 - `src/lib.rs` crate; `src/main.rs` CLI (interactive + `serve` subcommand)
 - core modules: `analyzer/`, `index.rs` (writer/snapshots/merge), `query.rs` (AST+parser),
-  `search/` (term/phrase/exec: scorers + WAND), `segment.rs`, `posting.rs`, `schema.rs`, `server.rs`
+  `search/` (term/phrase/exec: scorers + WAND, `fusion.rs`: modality fusion),
+  `segment.rs`, `posting.rs`, `schema.rs`, `server.rs`, `vector/` (embedding core: metric,
+  column, kernels, VectorIndex trait + flat scan)
 - `tests/`: property + integration tests; `benches/search.rs`: criterion matrix;
   `examples/`: scale probes (`big.rs` 1M-doc, `wand.rs` skew probe, `postprobe.rs` decode A/B, `smoke.rs` quick timings, `doclen_probe.rs` doc-length phases)
 - packaging: `Dockerfile` (rust:alpine musl static -> FROM scratch, non-root), `Makefile`
@@ -40,7 +77,7 @@ validation gates, so embedding search can be added without re-shaping the docume
 ## Non-perf rules
 - always cargo fmt + clippy clean before commit
 - integration tests in `tests/`; crate tests in `src/`
-- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10), `ids.rs` (T11: external ids/metadata/replace/delete), `serve.rs` (HTTP incl. /doc/{id} lifecycle), `cluster.rs` (3-process ring roundtrip), `handoff.rs` (singleton -> --resync joiner ring-share move + /__zap/peers repartition), `rebalance.rs` (N -> N+1 scale-out: the joiner takes over its holder share, the old owners PURGE their stale copies (cluster rows settle at docs x R), a delete after the scale-out does not resurrect), `search_it.rs` (boolean/phrase integration)
+- test suite map: `properties.rs` (T1-T4: skip/WAND/merge equivalence props), `longdoc.rs` (T5), `edges.rs` (T6), `docstore_fuzz.rs` (T9), `concurrent.rs` (T7), `wand_canary.rs` (T8), `cli.rs` (T10), `ids.rs` (T11: external ids/metadata/replace/delete), `serve.rs` (HTTP incl. /doc/{id} lifecycle), `cluster.rs` (3-process ring roundtrip), `handoff.rs` (singleton -> --resync joiner ring-share move + /__zap/peers repartition), `rebalance.rs` (N -> N+1 scale-out: the joiner takes over its holder share, the old owners PURGE their stale copies (cluster rows settle at docs x R), a delete after the scale-out does not resurrect), `search_it.rs` (boolean/phrase integration), `vector.rs` (embedding engine: ranking, schema gates, hybrid/rrf/filter fusion, delete/replace/merge, disk roundtrip, brute-force equivalence), `vector_serve.rs` (embedding over HTTP + the CLI disk reboot), `vector_cluster.rs` (embedding over a 3-shard ring: global fusion, handoff carries the embeddings)
 - torture scenarios (chaos): `tests/torture/mod.rs` harness (Shard spawn with per-shard stderr logs under /tmp/zap-torture, kill_hard SIGKILL, respawn same-announce, corrupt- disk helpers: flip/delete .zap files; bounded-socket test client with 5s read+write timeouts so wedged shards surface as fast partial responses instead of frozen deadlocks); `torture_kill.rs` (kill-during-ingest RAM mode: legal loss + functional ring; disk mode: quiet-period committed docs survive the reboot expect(50..=60)); `torture_churn.rs` (kill B + C mid-traffic: degraded stats, survivor afloat, revive via join fan-out + post-revive survey; RAM loss at any owner is legal); `torture_state.rs` (flipped-byte / missing-segment boot: EITHER serves within budget or exits with a controlled disk/manifest error — never wedges); `torture_repartition.rs` (ring repartitioning under a /search hammer: rounds must either return 200 or return a degraded result); `scripts/torture.sh` chaos loop (REPEATS=N, ONLY=one scene). invariants only, no exact-data asserts: boot-pull survey ALWAYS runs (never gated on emptiness) because ring-routed ingests can land rows before the survey while pre-join rows sit on the old owner; stale copies of moved rows are purged by the holder that took them over (POST /__zap/handoff_delete, after its own commit)
 - benchmarking: use `examples/smoke.rs` (`cargo run --release --example smoke`, ~1 s) for iteration feedback; run rigorous criterion benches (`cargo bench --bench search -- --noplot <filter>`) sparsely — at meaningful checkpoints only, not per change
 - do not use ad-hoc sed/python for edits unless trivial; prefer dedicated tools when editing files
@@ -63,8 +100,9 @@ validation gates, so embedding search can be added without re-shaping the docume
 - external ids: snapshot `ids` map (persistent im::HashMap behind Arc) + per-segment `id_fwd` rebuilt incrementally at segment change: commit extends the map via O(1) clone + O(log n) update per appended doc (`segs.extend` appends so old addresses stay valid), merge/boot reset to a full O(live) rescan; delete/replace rewrite the shared map in place (O(log n)); deletes keep this O(1)-per-publish via cached Arc'd df stats; deleting from hot lanes commits first — do NOT add hot-lane deletion machinery
 - doc store v2: [tag][len][flags][n][TLV fields][id][metadata]; merge copies blocks verbatim (ids/metadata survive free); purge at merge uses per-segment docid remap (u32::MAX = purged)
 - disk persistence (opt-in --disk DIR): SegmentReader::to_bytes/from_bytes (binary: magic zapseg1, FST raw bytes via the fst_raw shadow field populated at freeze — fst::Map cannot expose them post-construction), content-addressed seg-<fnv64>.zap files, atomically-rewritten MANIFEST.json (tmp+fsync+rename) incl. tombstone bitmaps; boot = with_lanes_disk loads synchronously; hooks on commit_locked + index.delete; UNCOMMITTED hot lanes are lost on crash (bounded by commit-every, HTTP /ingest auto-commits per request)
+- embedding scan: the flat scan is O(rows x dim) per query — 10k docs x 768 dims is ~7.7M FMA (~3 ms single-thread, ~0.4 ms on 8 threads); 1M x 768 is ~300 ms single / ~40 ms parallel, so the ANNUAL COST grows linearly with the corpus: the `VectorIndex` trait is the seam (HNSW behind it) and a quantized column (f16) is the memory lever (768 dims = 3 KB/doc as f32). The scan is parallelized over a FLAT (segment, row-chunk) task list (chunk 4096 rows) — a per-segment split would let one big segment own the wall (the R26 lesson); the top-k heap inside the scan must order ASCENDING by score (the binary heap is a MIN-heap over the score: a reversed comparator silently keeps the WORST k — the brute-force equivalence test is the guard)
 
 ## Future rounds, if we resume WAND/general top-k work
 - WAND fan-out into AND/OR walkers (R20, perf-reject): classic pivot WAND-OR (static-max bound, docid-gap seeking, live per-segment collector threshold via direct pushes) + AND driver block skipping both implemented and LOSE: uniform 10k-corpus OR +8% (139.0 vs 128.71us), skew 200k 'fox OR dog' +23% (4.68 vs 3.81ms, env-gated same-binary A/B); per-iteration pivot refresh (docs+order+sort) outweighs threshold pruning because dense union is already efficient and uniform score distributions keep thresholds low; dense AND gained nothing either (102.6 vs 102.1us) — reattempt only with block-max-refined pivot bounds AND push-free cursor granularity; reverted to dense-union OR + return-based galloping AND
 - per-field postings bitpack (128-doc blocks à la tantivy) if profiling shows decode-bound
-- embedding search: flat SIMD scan first; HNSW (hnsw_rs / instant-distance) behind the `VectorIndex` trait seam
+- embedding search: the flat SIMD scan SHIPPED (src/vector/, AVX2+FMA at runtime); next round = HNSW (hnsw_rs / instant-distance) behind the `VectorIndex` trait seam, and a quantized (f16) column as the memory lever
