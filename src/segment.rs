@@ -264,6 +264,9 @@ const SEG_MAGIC_V1: &[u8; 8] = b"zapseg1\0";
 /// v2 (stable segid, no vectors) stays bootable: old segments simply have no
 /// embeddings.
 const SEG_MAGIC_V3: &[u8; 8] = b"zapseg3\0";
+/// v4: SIMD-bitpacked posting planes (zapseg3 + packed docid/tf blocks).
+/// zapseg1/2/3 stay bootable; their postings are varint.
+const SEG_MAGIC_V4: &[u8; 8] = b"zapseg4\0";
 
 impl SegmentReader {
     /// full on-disk serialization (little-endian sections; immutable snapshot).
@@ -287,7 +290,7 @@ impl SegmentReader {
             }
         }
         let mut out = Vec::new();
-        out.extend_from_slice(SEG_MAGIC_V3);
+        out.extend_from_slice(SEG_MAGIC_V4);
         // v3: stable segment identity survives disk round-trips (subset tier
         // merges must not renumber live segments; tombstones/id addresses key on it)
         push_u32(&mut out, self.segid);
@@ -368,9 +371,9 @@ impl SegmentReader {
         }
         let magic = &bytes[..8];
         // v3 = embeddings, v2 = stable segid, v1 = legacy (no segid)
-        let has_segid = magic == SEG_MAGIC_V3 || magic == SEG_MAGIC;
+        let has_segid = magic == SEG_MAGIC_V4 || magic == SEG_MAGIC_V3 || magic == SEG_MAGIC;
         let is_v1 = magic == SEG_MAGIC_V1;
-        let has_vectors = magic == SEG_MAGIC_V3;
+        let has_vectors = magic == SEG_MAGIC_V4 || magic == SEG_MAGIC_V3;
         if !has_segid && !is_v1 {
             return Err("bad segment magic".into());
         }
@@ -446,6 +449,7 @@ impl SegmentReader {
                 pos: starts[sh(1)]..ends[sh(1)],
                 pos_offsets: starts[sh(2)]..ends[sh(2)],
                 skips: starts[sh(3)]..ends[sh(3)],
+                packed: magic == SEG_MAGIC_V4,
             });
         }
         if bytes.len() < p + 4 {

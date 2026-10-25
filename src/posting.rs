@@ -57,23 +57,56 @@ impl PostingData {
     }
 
     pub fn freeze(&self, norms: Option<&[u16]>) -> FrozenPosting {
-        // R16: interleaved [delta_i][tf_i] per doc, one cursor.
-        // WAND: anchors carry per-block max tf + min doc len for score-bound pruning.
+        // SIMD bitpacked planes (zapseg4): per 128-doc block, docid deltas and
+        // tfs each get their own bitpacked plane (BitPacker4x, real SIMD
+        // kernels). Positions stay varint (not the hot path). Anchors keep the
+        // block-max WAND stats and now also the block length.
+        use bitpacking::{BitPacker, BitPacker4x};
         let n = self.docids.len();
-        let mut docids = Vec::with_capacity(n * 6);
-        let mut byte_offs: Vec<u32> = Vec::with_capacity(n + 1); // doc cursor byte offsets
-        let mut prev = 0u32;
-        for (docidx, &d) in self.docids.iter().enumerate() {
-            byte_offs.push(docids.len() as u32);
-            let delta = d - prev;
-            prev = d;
-            write_varint(&mut docids, delta);
-            write_varint(&mut docids, self.tfs[docidx]);
+        let packer = BitPacker4x::new();
+        let mut docids = Vec::new();
+        // byte_offs[bstart] = offset of that block's header in `docids`
+        let mut byte_offs = vec![0u32; n + 1];
+        for bstart in (0..n).step_by(SKIP_STEP) {
+            let bend = (bstart + SKIP_STEP).min(n);
+            let block_len = bend - bstart;
+            byte_offs[bstart] = docids.len() as u32;
+            // deltas are relative to the previous docid (global), tfs raw
+            let mut deltas = [0u32; SKIP_STEP];
+            let mut tfs_block = [0u32; SKIP_STEP];
+            let mut prev = if bstart == 0 {
+                0u32
+            } else {
+                self.docids[bstart - 1]
+            };
+            for i in bstart..bend {
+                deltas[i - bstart] = self.docids[i] - prev;
+                prev = self.docids[i];
+                tfs_block[i - bstart] = self.tfs[i];
+            }
+            let bd = packer.num_bits(&deltas);
+            let bt = packer.num_bits(&tfs_block);
+            // block header: n_docs, bits_delta, bits_tf, pad
+            docids.push(block_len as u8);
+            docids.push(bd);
+            docids.push(bt);
+            docids.push(0);
+            if bd > 0 {
+                let mut buf = vec![0u8; SKIP_STEP * bd as usize / 8];
+                packer.compress(&deltas, &mut buf, bd);
+                docids.extend_from_slice(&buf);
+            }
+            if bt > 0 {
+                let mut buf = vec![0u8; SKIP_STEP * bt as usize / 8];
+                packer.compress(&tfs_block, &mut buf, bt);
+                docids.extend_from_slice(&buf);
+            }
         }
         // skip anchors: per 128 docs, block [bstart, bend) stats
         let mut skips = Vec::new();
         for bstart in (0..n).step_by(SKIP_STEP) {
             let bend = (bstart + SKIP_STEP).min(n);
+            let block_len = bend - bstart;
             let prev_docid = if bstart == 0 {
                 0u32
             } else {
@@ -102,6 +135,8 @@ impl PostingData {
             skips.extend_from_slice(&byte_offs[bstart].to_le_bytes());
             skips.extend_from_slice(&tf_max.to_le_bytes());
             skips.extend_from_slice(&len_min.to_le_bytes());
+            skips.push(block_len as u8);
+            skips.extend_from_slice(&[0u8; 7]);
         }
         let mut pos = Vec::new();
         let mut pos_offsets = Vec::with_capacity(self.docids.len() + 1);
@@ -127,7 +162,8 @@ impl PostingData {
 /// docs between skip anchors
 const SKIP_STEP: usize = 128;
 /// anchors store u32 prev_docid + u32 cursor_off + u32 block_max_tf + u32 block_min_len
-const SKIP_ENTRY_BYTES: usize = 16;
+/// + u8 block_len + 7 bytes padding = 24 (packed format needs the block length)
+const SKIP_ENTRY_BYTES: usize = 24;
 
 /// serialized form of one posting list
 pub struct FrozenPosting {
@@ -160,6 +196,7 @@ impl FrozenPosting {
             pos,
             pos_offsets,
             skips,
+            packed: true,
         }
     }
 }
@@ -179,6 +216,8 @@ pub struct TermInfo {
     pub pos_offsets: Range<u32>,
     /// skip anchors: every SKIP_STEP docs -> (docid, delta-blob byte, tf byte), u32 LE
     pub skips: Range<u32>,
+    /// true when the docids section uses SIMD bitpacked planes (zapseg4)
+    pub packed: bool,
 }
 
 /// reader over a frozen posting list: sequential doc iteration, galloping seeks, positions
@@ -200,6 +239,13 @@ pub struct PostingReader<'a> {
     prev_docid: u32,
     /// decoded but not yet handed out by advance()
     peeked: Option<(u32, u32)>,
+    /// packed (zapseg4) posting format
+    packed: bool,
+    /// current 128-doc block's decoded deltas/tfs (packed format only)
+    block_buf_doc: [u32; SKIP_STEP],
+    block_buf_tf: [u32; SKIP_STEP],
+    block_len: usize,
+    block_pos: usize,
 }
 
 impl<'a> PostingReader<'a> {
@@ -219,6 +265,11 @@ impl<'a> PostingReader<'a> {
             docidx: 0,
             prev_docid: 0,
             peeked: None,
+            packed: info.packed,
+            block_buf_doc: [0; SKIP_STEP],
+            block_buf_tf: [0; SKIP_STEP],
+            block_len: 0,
+            block_pos: 0,
         }
     }
 
@@ -226,7 +277,7 @@ impl<'a> PostingReader<'a> {
     /// returns (tf_max, len_min); None when no anchors
     pub fn block_bounds(&self) -> Option<(u32, u32)> {
         let skips = &self.blob[self.skips_start..self.skips_end];
-        let n = skips.len() / 16;
+        let n = skips.len() / SKIP_ENTRY_BYTES;
         if n == 0 {
             return None;
         }
@@ -234,7 +285,7 @@ impl<'a> PostingReader<'a> {
         let b = b.min(n - 1);
         let row = |field: usize| {
             u32::from_le_bytes(
-                skips[b * 16 + field * 4..b * 16 + field * 4 + 4]
+                skips[b * SKIP_ENTRY_BYTES + field * 4..b * SKIP_ENTRY_BYTES + field * 4 + 4]
                     .try_into()
                     .unwrap(),
             )
@@ -253,8 +304,11 @@ impl<'a> PostingReader<'a> {
         let n = skips.len() / SKIP_ENTRY_BYTES;
         let b = (self.docidx / SKIP_STEP).min(n.saturating_sub(1));
         if b + 1 < n {
-            let next_row =
-                u32::from_le_bytes(skips[(b + 1) * 16..(b + 1) * 16 + 4].try_into().unwrap());
+            let next_row = u32::from_le_bytes(
+                skips[(b + 1) * SKIP_ENTRY_BYTES..(b + 1) * SKIP_ENTRY_BYTES + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             Some(next_row + 1)
         } else {
             None
@@ -322,7 +376,13 @@ impl<'a> PostingReader<'a> {
             return;
         }
         // binary search: last anchor index with anchor docid <= target; forward-only hint
-        let anchor = |i: usize| u32::from_le_bytes(skips[i * 16..i * 16 + 4].try_into().unwrap());
+        let anchor = |i: usize| {
+            u32::from_le_bytes(
+                skips[i * SKIP_ENTRY_BYTES..i * SKIP_ENTRY_BYTES + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
         let (mut lo, mut hi) = (self.anchor_lo.min(n.saturating_sub(1)), n);
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
@@ -338,30 +398,83 @@ impl<'a> PostingReader<'a> {
         }
         // anchor stores absolute byte offsets within each section (measured from section start)
         let a_docid = anchor(lo);
-        let a_docid_off =
-            u32::from_le_bytes(skips[lo * 16 + 4..lo * 16 + 8].try_into().unwrap()) as usize;
-        let a_tf_off =
-            u32::from_le_bytes(skips[lo * 16 + 8..lo * 16 + 12].try_into().unwrap()) as usize;
+        let a_docid_off = u32::from_le_bytes(
+            skips[lo * SKIP_ENTRY_BYTES + 4..lo * SKIP_ENTRY_BYTES + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let a_tf_off = u32::from_le_bytes(
+            skips[lo * SKIP_ENTRY_BYTES + 8..lo * SKIP_ENTRY_BYTES + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         // rebuild cursor offsets from the section bases stored in ctor
         self.docid_c = self.docids_base + a_docid_off;
         let _ = a_tf_off; // single interleaved cursor; tf offset folds into docid cursor
         self.docidx = lo * SKIP_STEP;
         self.prev_docid = a_docid;
+        self.block_len = 0;
+        self.block_pos = 0;
         self.anchor_lo = lo;
     }
 
     /// collect all matching docids (used by filter-style evaluation); skips inline tf varints
     pub fn docids(&self) -> RoaringBitmap {
         let mut rb = RoaringBitmap::new();
-        let mut prev = 0u32;
-        let mut c = self.docids_base;
-        while c < self.docids_end {
-            let (delta, n) = read_varint(self.blob, c);
-            c += n;
-            let (_, n2) = read_varint(self.blob, c);
-            c += n2;
-            prev += delta;
-            rb.insert(prev);
+        if self.packed {
+            use bitpacking::{BitPacker, BitPacker4x};
+            let packer = BitPacker4x::new();
+            let mut docid_c = self.docids_base;
+            let mut docidx = 0usize;
+            let mut prev = 0u32;
+            let mut block_len = 0usize;
+            let mut block_pos = 0usize;
+            let mut buf = [0u32; SKIP_STEP];
+            while docidx < self.doc_count {
+                if block_pos >= block_len {
+                    if docid_c >= self.docids_end {
+                        break;
+                    }
+                    let n = self.blob[docid_c] as usize;
+                    if n == 0 {
+                        break;
+                    }
+                    let bd = self.blob[docid_c + 1];
+                    let bt = self.blob[docid_c + 2];
+                    docid_c += 4;
+                    let delta_bytes = SKIP_STEP * bd as usize / 8;
+                    if bd > 0 {
+                        packer.decompress(&self.blob[docid_c..docid_c + delta_bytes], &mut buf, bd);
+                    } else {
+                        buf.fill(0);
+                    }
+                    docid_c += delta_bytes;
+                    // skip tf plane
+                    let tf_bytes = SKIP_STEP * bt as usize / 8;
+                    docid_c += tf_bytes;
+                    block_len = n;
+                    block_pos = 0;
+                }
+                if block_pos >= block_len {
+                    break;
+                }
+                let delta = buf[block_pos];
+                prev += delta;
+                rb.insert(prev);
+                docidx += 1;
+                block_pos += 1;
+            }
+        } else {
+            let mut prev = 0u32;
+            let mut c = self.docids_base;
+            while c < self.docids_end {
+                let (delta, n) = read_varint(self.blob, c);
+                c += n;
+                let (_, n2) = read_varint(self.blob, c);
+                c += n2;
+                prev += delta;
+                rb.insert(prev);
+            }
         }
         rb
     }
@@ -370,23 +483,120 @@ impl<'a> PostingReader<'a> {
     /// overhead); caller intersects sorted vecs directly for large-df phrases
     pub fn docid_vec(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.doc_count);
-        let mut prev = 0u32;
-        let mut c = self.docids_base;
-        while c < self.docids_end {
-            let (delta, n) = read_varint(self.blob, c);
-            c += n;
-            let (_, n2) = read_varint(self.blob, c);
-            c += n2;
-            prev += delta;
-            out.push(prev);
+        if self.packed {
+            use bitpacking::{BitPacker, BitPacker4x};
+            let packer = BitPacker4x::new();
+            let mut docid_c = self.docids_base;
+            let mut docidx = 0usize;
+            let mut prev = 0u32;
+            let mut block_len = 0usize;
+            let mut block_pos = 0usize;
+            let mut buf = [0u32; SKIP_STEP];
+            while docidx < self.doc_count {
+                if block_pos >= block_len {
+                    if docid_c >= self.docids_end {
+                        break;
+                    }
+                    let n = self.blob[docid_c] as usize;
+                    if n == 0 {
+                        break;
+                    }
+                    let bd = self.blob[docid_c + 1];
+                    let bt = self.blob[docid_c + 2];
+                    docid_c += 4;
+                    let delta_bytes = SKIP_STEP * bd as usize / 8;
+                    if bd > 0 {
+                        packer.decompress(&self.blob[docid_c..docid_c + delta_bytes], &mut buf, bd);
+                    } else {
+                        buf.fill(0);
+                    }
+                    docid_c += delta_bytes;
+                    let tf_bytes = SKIP_STEP * bt as usize / 8;
+                    docid_c += tf_bytes;
+                    block_len = n;
+                    block_pos = 0;
+                }
+                if block_pos >= block_len {
+                    break;
+                }
+                let delta = buf[block_pos];
+                prev += delta;
+                out.push(prev);
+                docidx += 1;
+                block_pos += 1;
+            }
+        } else {
+            let mut prev = 0u32;
+            let mut c = self.docids_base;
+            while c < self.docids_end {
+                let (delta, n) = read_varint(self.blob, c);
+                c += n;
+                let (_, n2) = read_varint(self.blob, c);
+                c += n2;
+                prev += delta;
+                out.push(prev);
+            }
         }
         out
     }
 
     /// decode next interleaved [delta][tf] pair; caches into `peeked`
+    #[inline(always)]
     fn decode_next(&mut self) -> Option<(u32, u32)> {
         if self.docidx >= self.doc_count {
             return None;
+        }
+        if self.packed {
+            if self.block_pos >= self.block_len {
+                if self.docid_c >= self.docids_end {
+                    return None;
+                }
+                use bitpacking::{BitPacker, BitPacker4x};
+                let packer = BitPacker4x::new();
+                let n = self.blob[self.docid_c] as usize;
+                if n == 0 {
+                    return None;
+                }
+                let bd = self.blob[self.docid_c + 1];
+                let bt = self.blob[self.docid_c + 2];
+                self.docid_c += 4;
+                let delta_bytes = SKIP_STEP * bd as usize / 8;
+                let tf_bytes = SKIP_STEP * bt as usize / 8;
+                if bd > 0 {
+                    packer.decompress(
+                        &self.blob[self.docid_c..self.docid_c + delta_bytes],
+                        &mut self.block_buf_doc,
+                        bd,
+                    );
+                } else {
+                    self.block_buf_doc.fill(0);
+                }
+                self.docid_c += delta_bytes;
+                if bt > 0 {
+                    packer.decompress(
+                        &self.blob[self.docid_c..self.docid_c + tf_bytes],
+                        &mut self.block_buf_tf,
+                        bt,
+                    );
+                } else {
+                    self.block_buf_tf.fill(0);
+                }
+                self.docid_c += tf_bytes;
+                self.block_len = n;
+                self.block_pos = 0;
+            }
+            if self.block_pos >= self.block_len {
+                return None;
+            }
+            // SAFETY: block_pos < block_len <= SKIP_STEP, and both buffers
+            // are [u32; SKIP_STEP], so the index is in bounds.
+            let delta = unsafe { *self.block_buf_doc.get_unchecked(self.block_pos) };
+            let tf = unsafe { *self.block_buf_tf.get_unchecked(self.block_pos) };
+            self.prev_docid += delta;
+            self.docidx += 1;
+            self.block_pos += 1;
+            self.peeked = Some((self.prev_docid, tf));
+            return self.peeked;
         }
         let (delta, n) = read_varint(self.blob, self.docid_c);
         self.docid_c += n;
@@ -422,6 +632,7 @@ impl<'a> PostingReader<'a> {
     /// advance without the peek prefetch: one row decode per call. For pure
     /// docid/tf walks (term scoring, AND gallop drivers) that never touch
     /// peek()/peek_positions_into; phrase cursors keep advance().
+    #[inline(always)]
     pub fn advance_lazy(&mut self) -> Option<(u32, u32)> {
         if self.peeked.is_none() {
             if self.docidx >= self.doc_count {
